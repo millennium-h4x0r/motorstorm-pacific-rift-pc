@@ -422,6 +422,19 @@ int main(int argc, char** argv)
 
     printf("=== ps3recomp game runner ===\n");
 
+    /* The MultiStream SPU core copies its DSP plugins (and flashMP3.pic) into
+     * local store at addresses it picks at run time and calls them there.
+     * Nothing can be lifted for those, so they have to run on the
+     * interpreter; without this the toolkit ends the core's task on the first
+     * plugin call ("branched into unlifted LS 0x38790 ... ending the job"),
+     * the PPU update thread then waits on the core's event flag for good, and
+     * cellAudio port 0 -- all menu music and race sound -- stays silent. */
+#ifdef _WIN32
+    if (!getenv("SPU_INTERP_UNLIFTED")) _putenv_s("SPU_INTERP_UNLIFTED", "1");
+#else
+    setenv("SPU_INTERP_UNLIFTED", "1", 0);
+#endif
+
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
         return 1;

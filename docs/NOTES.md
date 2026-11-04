@@ -110,3 +110,26 @@ Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `wor
 ## Performance
 
 - The lifted SPU sources must be built with `-msse4.1` (work/port/CMakeLists.txt). Without it, `spu_helpers.h` falls back to the byte-loop `spu_shufb` called out of line. That was the top hotspot of the Bink decode threads and made the FMV stutter.
+
+## Audio (2026-11-04)
+
+- **Port 0 (MultiStream) was silent**: the MultiStream core (lifted taskset task,
+  SPURS instance "Multistream") calls its DSP plugins at LS addresses it picks
+  at run time. The toolkit ended the task on the first such call ("branched into
+  unlifted LS 0x38790 ... ending the job"), so the PPU update thread waited on
+  the core's event flag forever after the first ~32 updates. main.cpp now sets
+  `SPU_INTERP_UNLIFTED=1` (`=0` restores the stop), and the interpreter stops at
+  the call's link register so the lifted caller does not run its own code twice.
+- **Speed**: interpreted, the plugins ran MultiStream at about 20% of real time.
+  work/tools/lift_ms_dsp.py (run by lift_spu.py) lifts mstream_dsp_filter
+  (LS 0x38700), mstream_dsp_i3dl2 (0x35E80) and dev_flash flashMP3.pic (0x19780)
+  at those bases. They are registered with `spu_overlay_register_pinned` and
+  dispatched only when local store holds the same .text bytes. A plugin loaded
+  anywhere else is interpreted (the race loads one at 0x37080; it is cold).
+  Port 0 now gets 1.53 MB/s, which is real time.
+- The Linux mix loop is paced like the Windows one: device room via SDL (4
+  blocks queued), CLOCK_MONOTONIC without a device. A peak limiter sits ahead
+  of the clip, because the 7.1 fold-down overshoots full scale. `AUDIO_LIMITER=0` turns it off.
+- Diagnostics: `AUDIO_PEAK=1`, `AUDIO_RATE=1`, `AUDIO_WAV=<file>` (raw f32le
+  stereo 48 kHz), `PS3_MUTE=1`, `SPU_DMA_RANGE=58000000-58200000` (port 0
+  PUT bytes per second, total and non-zero), `SPU_INTERP_STATS=<s>`.

@@ -13,7 +13,7 @@ index 3bbabf62..0e855fef 100644
  
  Without a GPU, Mesa's lavapipe runs every check, e.g.
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 02b751b2..5a61e90a 100644
+index 02b751b2..d51cfd8b 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -204,6 +204,12 @@ static void audio_backend_shutdown(void)
@@ -42,7 +42,45 @@ index 02b751b2..5a61e90a 100644
                  char map[36]; u32 b;
                  for (b = 0; b < nblock && b < 32; b++) {
                      const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
-@@ -559,8 +567,62 @@ static void audio_notify_event_queues(void)
+@@ -533,6 +541,37 @@ static void audio_mix_one_block(void)
+ 
+     mutex_unlock(&s_audio_mutex);
+ 
++    /* Peak limiter ahead of the clip. The 7.1 fold-down above sums up to six
++     * channels into each side (gain up to 3), and a loud 8-channel mix (a
++     * MultiStream title's music under the race) went over full scale for a
++     * few thousand samples every few seconds -- hard clipping, heard as
++     * crackle. Drop the gain at once for a block that would clip, and let it
++     * recover over ~100 ms (20 blocks); a mix that stays in range is left
++     * untouched. AUDIO_LIMITER=0 turns it off. */
++    { static int on = -1; if (on < 0) { const char* e = getenv("AUDIO_LIMITER"); on = !(e && !strcmp(e, "0")); }
++      static float gain = 1.0f;
++      if (on) {
++          float pk = 0.0f;
++          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
++              const float a = fabsf(s_mix_buffer[i]); if (a > pk) pk = a; }
++          const float ceiling = 0.98f, limit = pk > ceiling ? ceiling / pk : 1.0f;
++          const float from = gain;
++          gain = limit < gain ? limit : gain + (1.0f - gain) * 0.05f;
++          if (gain > limit) gain = limit;
++          if (gain > 0.9999f && from > 0.9999f) gain = 1.0f;
++          else {
++              /* Step down at once (the block must not clip); ramp up across the
++               * block when releasing, so the recovery has no zipper steps. */
++              const float g0 = gain < from ? gain : from;
++              const float dg = (gain - g0) / (float)CELL_AUDIO_BLOCK_SAMPLES;
++              for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
++                  const float g = g0 + dg * (float)s;
++                  s_mix_buffer[s * 2 + 0] *= g;
++                  s_mix_buffer[s * 2 + 1] *= g;
++              }
++          }
++      } }
++
+     /* Clip to [-1.0, 1.0] */
+     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+@@ -559,8 +598,62 @@ static void audio_notify_event_queues(void)
      }
  }
  
@@ -106,7 +144,7 @@ index 02b751b2..5a61e90a 100644
  static unsigned __stdcall audio_mix_thread_func(void* arg)
  {
      (void)arg;
-@@ -608,40 +670,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -608,40 +701,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                      (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
          }
          blocks++;
@@ -149,7 +187,7 @@ index 02b751b2..5a61e90a 100644
          audio_notify_event_queues();
      }
  
-@@ -654,17 +686,46 @@ static void* audio_mix_thread_func(void* arg)
+@@ -654,17 +717,46 @@ static void* audio_mix_thread_func(void* arg)
      (void)arg;
      printf("[cellAudio] Mixing thread started\n");
  
@@ -3553,6 +3591,228 @@ index 9cb50400..5ab346aa 100644
      /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
       * sys_net NID LBP imports so none fall to the unresolved-NID default. */
      ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc50208..17d028f2 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1842,7 +1842,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+  * marks that overlay resident in the streaming context; dispatch retries a
+  * primary-image miss against the resident overlay's registry. */
+ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
+-                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
++                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
++                 int pinned; } spu_ovl_src;
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+  * the same job code buffer at LS 0x4000, dispatched by content signature). */
+ #define SPU_OVL_SRC_MAX 128
+@@ -2151,6 +2152,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+     if (size < 512 && !spu_ovl_ea_known(ea)) return;
+     for (int i = 0; i < nsrc; i++) {
+         const spu_ovl_src* o = &s_ovl_src[i];
++        if (o->pinned) continue;   /* found by address, see spu_overlay_install_pinned */
+         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+                              : (o->src_ea == ea);
+         if (hit) {
+@@ -2186,6 +2188,78 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+     }
+ }
+ 
++/* Pinned overlays: lifted code for an image the SPU program copies into local
++ * store from a buffer whose EA is not known in advance (a heap copy), at an
++ * address it picks itself -- the MultiStream core's DSP plugins. Nothing
++ * identifies the load by its DMA, so the entry is found by address instead:
++ * on a branch into unlifted local store, spu_overlay_install_pinned looks for
++ * a pinned image covering the target, compares its code bytes against local
++ * store, and makes it resident in a free code slot. Any later GET into the
++ * span clears the slot (the fake source EA never matches), so a different
++ * image loaded at the same address goes back to the interpreter after one
++ * compare. The lift is valid at load_lsa only; a load elsewhere stays
++ * interpreted. */
++int spu_overlay_register_pinned(uint32_t load_lsa, uint32_t span, int image_id,
++    const spu_overlay_code_segment* code, unsigned count)
++{
++    /* An EA no transfer uses: pinned entries are skipped by note_get, and
++     * a slot holding one is cleared by any GET into its span. */
++    const uint32_t fake_ea = 0xFFFFF000u + ((uint32_t)s_ovl_src_count << 4);
++    if (!spu_overlay_register_verified_region(fake_ea, load_lsa, span, image_id, code, count))
++        return 0;
++    s_ovl_src[s_ovl_src_count - 1].pinned = 1;
++    return 1;
++}
++
++int spu_overlay_install_pinned(spu_context* ctx, uint32_t lsa)
++{
++    const int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
++    lsa &= SPU_LS_MASK;
++    for (int i = 0; i < nsrc; i++) {
++        const spu_ovl_src* o = &s_ovl_src[i];
++        if (!o->pinned || lsa < o->load_lsa || lsa - o->load_lsa >= o->span) continue;
++        /* Already resident (verified, or rejected until the next GET into
++         * the span): the miss is an entry the lift lacks, or other code. */
++        int free_slot = -1, stale = -1, done = 0;
++        for (int k = 0; k < 4; ++k) {
++            const uint32_t b = ctx->resident_code[k].lsa, e = b + ctx->resident_code[k].size;
++            if (!ctx->resident_code[k].image_id) { if (free_slot < 0) free_slot = k; continue; }
++            if (ctx->resident_code[k].source_index == i) { done = 1; break; }
++            if (o->load_lsa < e && o->load_lsa + o->span > b) stale = k;   /* overlaps: replaced */
++        }
++        if (done) continue;
++        const int slot = stale >= 0 ? stale : free_slot;
++        const spu_overlay_code_segment* c0 = &o->code[0];
++        if (memcmp(ctx->ls + c0->lsa, c0->bytes, c0->size < 16 ? c0->size : 16)) continue;
++        if (slot < 0) {
++            static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
++                fprintf(stderr, "[spu-ovl] no free resident code span for pinned image %d\n", o->image_id);
++            return 0;
++        }
++        ctx->resident_code[slot].lsa = o->load_lsa;
++        ctx->resident_code[slot].size = o->span;
++        ctx->resident_code[slot].source_ea = o->src_ea;
++        ctx->resident_code[slot].image_id = o->image_id;
++        ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
++        ctx->resident_code[slot].source_index = i;
++        spu_dcache_residency_changed(ctx);
++        const int ok = spu_overlay_resident_verified(ctx, slot);
++        { static int _ok = 0, _bad = 0;
++          if (ok ? PS3_LOG_FIRST(_ok, 8) : PS3_LOG_FIRST(_bad, 8)) {
++            uint32_t at = 0;
++            if (!ok)
++                for (uint32_t q = 0; q < c0->size; ++q)
++                    if (ctx->ls[c0->lsa + q] != c0->bytes[q]) { at = c0->lsa + q; break; }
++            fprintf(stderr, "[spu-ovl] img=%d pinned image %d at LS 0x%05X (0x%X bytes) %s",
++                    ctx->image_id, o->image_id, o->load_lsa, o->span,
++                    ok ? "resident" : "rejected: different bytes from LS");
++            if (!ok) fprintf(stderr, " 0x%05X", at);
++            fprintf(stderr, " (branch to 0x%05X)\n", lsa); } }
++        if (ok) return 1;
++    }
++    return 0;
++}
++
+ /* Match a 16-byte module header against the registered content signatures.
+  * Returns the overlay image id, or 0 if none. Used by the WWS job-code dispatch
+  * path: the job manager streams a module into the code buffer via a DMA LIST
+@@ -2768,6 +2842,10 @@ void spu_indirect_branch(spu_context* ctx)
+     }
+     /* Use the same ownership order as the interpreter's rejoin probe. */
+     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
++    /* Runtime-placed code with a pinned lift (DSP plugins): make it resident. */
++    if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE &&
++        spu_overlay_install_pinned(ctx, ctx->pc))
++        fn = spu_lifted_lookup(ctx, ctx->pc);
+     /* The job returned through the link register we planted: it is finished.
+      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
+      * return landed on LS 0, which is the job's OWN entry, and it ran a second
+@@ -2825,14 +2903,17 @@ void spu_indirect_branch(spu_context* ctx)
+     }
+ 
+     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
++        static int s_iu = -1;
++        if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e && strcmp(e, "0") ? 1 : 0; }
+         static uint32_t seen[16]; static int n_seen = 0;
+         int known = 0;
+         for (int i = 0; i < n_seen; i++) if (seen[i] == ctx->pc) { known = 1; break; }
+         if (!known && n_seen < 16) {
+             seen[n_seen++] = ctx->pc;
+             fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
+-                    "(lr=0x%05X) -- ending the job\n",
+-                    ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
++                    "(lr=0x%05X) -- %s\n",
++                    ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
++                    s_iu ? "interpreting it if code is there" : "ending the job");
+             { fprintf(stderr, "      last dispatched PCs (oldest first):");
+               for (unsigned q = 0; q < 8; q++) {
+                   unsigned idx = (g_spu_pch_n + q) & 7u;
+@@ -2864,14 +2945,31 @@ void spu_indirect_branch(spu_context* ctx)
+         { uint32_t p = ctx->pc & SPU_LS_MASK;
+           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
+                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
+-          static int s_iu = -1;
+-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
+           if (s_iu && w0) {
+               static int _n = 0;
+               if (PS3_LOG_FIRST(_n, 8))
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
+-              spu_interp_run(ctx, p);
++              /* Stop where the branch returns to. A call's return point is
++               * the link register the bisl left (a tail branch's, the caller's
++               * own return), and the lifted frame that issued the branch
++               * resumes there once this returns. The interpreter used to stop
++               * only at a lifted function entry; a return point is mid-function
++               * and usually none, so it ran on through the caller's code and
++               * the lifted frame then ran that code again (the MultiStream
++               * core's DSP plugin calls: "drain-resume return_pc=0x03CF8 at
++               * lifted entry 0x03E98"). A RETURN that lands in the loaded
++               * code (pc == link: a lifted callee going back to it) has no
++               * return point of its own; stop at the waiting drain's. */
++              uint32_t ret = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++              if (ret == p) ret = ctx->drain_ret_pc & SPU_LS_MASK;
++              spu_interp_run_until(ctx, p, ret);
++              /* Stopped on some other lifted entry (runtime-loaded code calling
++               * back into the image): let the enclosing drain dispatch it, as
++               * the microstep hand-off above does. */
++              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
++                  (ctx->pc & SPU_LS_MASK) != ret && spu_lifted_lookup(ctx, ctx->pc))
++                  g_spu_trampoline_fn = spu_indirect_branch;
+               return;
+           } }
+         spu_halt(ctx);
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 8c4ccaa8..f9bc7867 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -231,15 +231,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+               fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
+-          { static volatile long long s_put, s_get; static unsigned long long s_t0;
++          { static volatile long long s_put, s_get, s_putnz; static unsigned long long s_t0;
+             extern unsigned long long ps3_ms_now(void);
+-            if ((cmd & 0xF0) == 0x20) s_put += size; else if ((cmd & 0xF0) == 0x40) s_get += size;
++            if ((cmd & 0xF0) == 0x20) {
++                s_put += size;
++                /* ...and how much of what was PUT is non-zero (an audio ring
++                 * filled with silence vs one never written). */
++                for (uint32_t i = 0; i < size; i += 4) {
++                    uint32_t w; memcpy(&w, &spu->ls[(lsa + i) & SPU_LS_MASK], 4);
++                    if (w) s_putnz += 4; }
++            } else if ((cmd & 0xF0) == 0x40) s_get += size;
+             unsigned long long now = ps3_ms_now();
+             if (!s_t0) s_t0 = now;
+             if (now - s_t0 >= 5000) {
+-                fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
+-                        s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
+-                s_put = s_get = 0; s_t0 = now; } } } }
++                fprintf(stderr, "[dma-range] %.0f B/s put (%.0f B/s non-zero), %.0f B/s get\n",
++                        s_put * 1000.0 / (now - s_t0), s_putnz * 1000.0 / (now - s_t0),
++                        s_get * 1000.0 / (now - s_t0));
++                s_put = s_get = s_putnz = 0; s_t0 = now; } } } }
+     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
+      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
+      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
+diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
+index 08af5b11..351e88bc 100644
+--- a/runtime/spu/spu_overlay_residency.h
++++ b/runtime/spu/spu_overlay_residency.h
+@@ -29,6 +29,17 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     uint32_t span, int image_id, const spu_overlay_code_segment* code,
+     unsigned count);
+ 
++/* Register lifted code for an image the SPU program places in local store
++ * itself, from a buffer whose EA is not known in advance (MultiStream copies
++ * its DSP plugins out of a heap buffer to an LS address it picks). There is no
++ * DMA to key residency on, so a branch into unlifted local store inside
++ * [load_lsa, load_lsa + span) compares the code segments against local store
++ * and, on a match, makes the image resident in a free code slot. The lift is
++ * only valid at load_lsa; a load elsewhere stays interpreted. The segments are
++ * copied. Returns 1 on success. */
++int spu_overlay_register_pinned(uint32_t load_lsa, uint32_t span, int image_id,
++    const spu_overlay_code_segment* code, unsigned count);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
 index 3ce8d0d6..04b29c92 100644
 --- a/runtime/spu/spu_workload.c

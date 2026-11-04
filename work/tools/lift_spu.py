@@ -349,6 +349,10 @@ __attribute__((constructor)) static void port_wws_pm_register_ctor(void)
         ms_dsp_handled=[dict(ea=hex(e["ea"]), note=e["note"], sha256=e["sha256"]) for e in dsps])
     (spu / "spu_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     shutil.rmtree(stage)
+
+    # ---- 4. MultiStream DSP plugins at their run-time LS bases (pinned lifts) -------
+    run([py, ROOT / "work/tools/lift_ms_dsp.py", "--eboot", args.eboot, "--toolkit", args.toolkit,
+         "--spu-dir", spu])
     n = len([d for d in spu.iterdir() if (d / "spu_recomp.c").exists()])
     print(f"[lift_spu] {n} lifted image(s) in {spu}: 1 PM, {len(jm)} job modules, "
           f"{len(elfs) - len(dsps)} ELFs ({len(dsps)} DSP plugins left to the interpreter)")
