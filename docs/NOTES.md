@@ -14,3 +14,40 @@
 
 Generated files: `work/out/EBOOT.{functions,image,loader,imports}.json`,
 `work/out/spu/`. Regenerate any time; they are not committed.
+
+## Boot bring-up log (2026-11-04)
+
+Each step below was a hard stop at boot, in order. Toolkit fixes live in
+`work/patches/ps3recomp.patch` (regenerate with `scripts/make_patch.sh`).
+
+1. **Audio output check** — "CAN'T FIND A SUPPORTED AUDIO RESOLUTION". The
+   toolkit's `CellAudioOutSoundMode` was 4 bytes (real: 8, ends in a u32
+   speaker layout), `CellAudioOutDeviceInfo` lacked its u16 latency, and
+   `CellAudioOutState.soundMode` sat at +8 (real: +12). Fixed in
+   `libs/misc/cellAvconfExt.[ch]`; GetState/GetConfiguration now report the
+   mode the game configured (it configures 7.1 and then checks).
+2. **malloc fails -> exit(1)** — fast-path HLE imports (lwmutex lock/unlock)
+   returned before the import-stub TOC save to `0x28(r1)`; the caller's
+   `ld r2,0x28(r1)` then loaded 0 and the CRT heap init read through a null
+   TOC. Fixed in `runtime/ppu/ppu_hle.cpp` (save before the fast form).
+3. **`/ms2.psarc` missing** — the dump split it into `ms2.psarc.666xx`;
+   join them (docs/REQUIRED_FILES.md).
+4. **FIOS loader deadlock** — `_cellSpursLFQueuePushBody` was not
+   implemented, so the PPU's decompression requests never reached the SPU
+   zlib task. Ported the Apocalypse port's LFQueue push + layout.
+5. **Second deadlock, same queue** — the push woke the wrong taskset (every
+   taskset had workload id 0; waiter ids are `(wid << 8) | task`). Each
+   taskset now gets its own wid (8 + index per SPURS instance) written to
+   the taskset and to the task's LS `0x1DC` (wklCurrentId).
+6. **WWS policy module** at EA `0xFFCC80` (0x2D00 bytes, fp
+   `0x093FC7EE6C9F7E84`) lifted as image 2 (work/tools/lift_spu.sh).
+
+Now: Vulkan frames show the loading spinner; the main thread then loops
+forever inside `func_00584C20` (under investigation). cellFont is missing
+GetCharGlyphMetrics / GetKerning / InitLibraryFreeTypeWithRevision.
+
+Useful switches: `PS3_HLE_TRACE=<n>`, `PS3_HLE_TOP=<secs>`, `PS3_SCTRACE=1`,
+`SPURS_LFQ_LOG=1`, `PS3RECOMP_VK_DUMP=<file.ppm>` + `PS3RECOMP_VK_DUMP_EVERY=<n>`.
+gdb: `gdb -p $(pgrep -x PacificRiftReco)`; lifted functions take the
+`ppu_context*` in `$rdi`, `gpr[i] = ((unsigned long*)$rdi)[i]`, guest memory
+at `(*(unsigned char**)&vm_base)+ea`.
