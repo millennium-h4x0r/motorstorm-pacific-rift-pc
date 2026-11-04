@@ -10,6 +10,7 @@
 #   work/inst/<name>/pad.txt      PAD_FILE  (drive with INST=<name> work/tools/pad.sh)
 #   work/inst/<name>/frame.ppm    PS3RECOMP_VK_DUMP, every PS3RECOMP_VK_DUMP_EVERY (default 30) frames
 #   work/inst/<name>/hdd0         private copy of hdd0 (saves), seeded from hdd0 on first use
+#   work/inst/<name>/user         settings.ini written by the in-game menu (windowed runs)
 #   BIN defaults to work/port/build-<name>/PacificRiftRecomp when that exists.
 #   Audio goes to SDL's dummy driver unless INST_AUDIO=1.
 set -uo pipefail
@@ -23,6 +24,7 @@ if [ -n "$INST" ]; then
     [ -x "$ROOT/work/port/build-$INST/PacificRiftRecomp" ] && BIN="${BIN:-$ROOT/work/port/build-$INST/PacificRiftRecomp}"
     export PS3_HDD0_ROOT="${PS3_HDD0_ROOT:-$I/hdd0}"
     export PAD_FILE="${PAD_FILE:-$I/pad.txt}"
+    export PS3_USER_DIR="${PS3_USER_DIR:-$I/user}"   # settings.ini of the in-game menu
     export PS3RECOMP_VK_DUMP="${PS3RECOMP_VK_DUMP:-$I/frame.ppm}"
     export PS3RECOMP_VK_DUMP_EVERY="${PS3RECOMP_VK_DUMP_EVERY:-30}"
     [ "${INST_AUDIO:-0}" = 1 ] || export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"

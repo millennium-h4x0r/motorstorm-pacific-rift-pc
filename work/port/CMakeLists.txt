@@ -174,6 +174,8 @@ endif()
 
 add_executable(${PROJECT_NAME}
     main.cpp
+    settings.cpp
+    ui.cpp
     stubs.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -198,14 +200,39 @@ if(SPU_SOURCES)
         # only under __SSE4_1__ (the runtime target already builds with it);
         # without it the lifted SPU code ran the byte-loop shufb out of line,
         # pinning a core per Bink decode thread and stuttering the FMV.
+        # PORT_SPU_ARCH (default x86-64-v3, i.e. AVX2/FMA/BMI2): spu_helpers.h
+        # has AVX2 forms of fa/fs/fm/fma/fms/fnms, the float estimates and the
+        # variable shifts. Without __AVX2__ they are per-lane scalar loops called
+        # out of line (spu_fa/spu_fs/spu_fm/spu__fma_any were ~7% of the Bink
+        # video thread and most of the Bink audio thread). Set it empty for a
+        # host without AVX2. -ffp-contract=off: the scalar exact fallbacks must
+        # not be fused once FMA is available.
+        set(PORT_SPU_ARCH "x86-64-v3" CACHE STRING "-march for the lifted SPU sources (empty: SSE4.1 only)")
+        set(PORT_SPU_OPT "-O2" CACHE STRING "optimisation level for the lifted SPU sources")
         include(CheckCCompilerFlag)
         check_c_compiler_flag(-msse4.1 PORT_HAS_MSSE41)
-        if(PORT_HAS_MSSE41)
+        if(PORT_SPU_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS
+                "${PORT_SPU_OPT};-march=${PORT_SPU_ARCH};-ffp-contract=off")
+        elseif(PORT_HAS_MSSE41)
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1")
         else()
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
         endif()
     endif()
+endif()
+
+# The in-game menu (ui.cpp) draws with the toolkit's rsx_ui and Dear ImGui when
+# the toolkit built them (PS3RECOMP_UI_ACTIVE: the Vulkan backend, the ImGui
+# checkout, -DPS3RECOMP_UI not OFF). The define and the include directory go on
+# ui.cpp alone: on the whole target they would rebuild every lifted TU.
+if(PS3RECOMP_UI_ACTIVE)
+    set_source_files_properties(ui.cpp PROPERTIES
+        COMPILE_DEFINITIONS PS3RECOMP_UI
+        INCLUDE_DIRECTORIES "${PS3RECOMP_IMGUI_DIR}")
+    message(STATUS "In-game menu:    on (F1, F10)")
+else()
+    message(STATUS "In-game menu:    off")
 endif()
 
 # app.rc carries the icon, the version block and the manifest, and needs a

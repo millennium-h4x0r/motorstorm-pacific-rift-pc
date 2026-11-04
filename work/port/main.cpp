@@ -38,10 +38,14 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
+#include "settings.h"   /* user/settings.ini, for a windowed run */
+#include "ui.h"         /* the in-game menu (F1) and FPS counter (F10) */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>     /* clock_gettime: PS3RECOMP_FLIPLOG */
 
 #ifndef _WIN32
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
@@ -191,9 +195,27 @@ extern "C" unsigned ppu_boot_frames_presented(void)
     return (unsigned)g_frames_presented;
 }
 
+/* PS3RECOMP_FLIPLOG=<file>: one line per guest frame presented, the host
+ * monotonic time in microseconds when present() returned. work/tools/fliplog.py
+ * turns it into frame-interval percentiles (FMV/race pacing). */
+static void fliplog_note(void)
+{
+    static FILE* f = (FILE*)1;
+    if (f == (FILE*)1) {
+        const char* e = getenv("PS3RECOMP_FLIPLOG");
+        f = (e && *e) ? fopen(e, "w") : nullptr;
+    }
+    if (!f) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "%llu\n", (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)(ts.tv_nsec / 1000));
+    fflush(f);
+}
+
 static void present_guest_frame(void)
 {
     rsx_backend_present();
+    fliplog_note();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
@@ -209,11 +231,37 @@ static DWORD WINAPI frame_clock(LPVOID)
             rsx_ok ? "OK -- window open" : "FAILED");
 
     unsigned  last_flip = 0;
-    ULONGLONG next_tick = GetTickCount64();
+    /* Vblank period and loop cadence, in nanoseconds. The tick used to be a
+     * whole 16 ms (62.5 Hz) on a millisecond clock with a Sleep(4) loop: a
+     * 29.97 fps Bink movie paced on two vblanks then gained a frame every
+     * ~0.8 s and showed one for three vblanks (a visible hitch), presents
+     * landed on a 4 ms grid, and every RSX fence the guest waited on cost up
+     * to 4 ms before the drain below wrote it. Now 59.94 Hz on the monotonic
+     * clock, sleeping to the next tick but at most PS3RECOMP_CLOCK_POLL_US
+     * (default 1000) so the drain/present keep up.
+     * PS3RECOMP_VBLANK_HZ overrides the rate (e.g. 60, 50). */
+    const double hz_env = getenv("PS3RECOMP_VBLANK_HZ") ? atof(getenv("PS3RECOMP_VBLANK_HZ")) : 0.0;
+    const unsigned long long period_ns = hz_env > 1.0 ? (unsigned long long)(1e9 / hz_env)
+                                                      : 1001000000ull / 60ull;   /* 59.94 Hz */
+    const char* poll_env = getenv("PS3RECOMP_CLOCK_POLL_US");
+    const unsigned long long poll_ns = (poll_env && atoi(poll_env) > 0 ? (unsigned long long)atoi(poll_env) : 1000ull) * 1000ull;
+    auto mono_ns = []() -> unsigned long long {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+    };
+    unsigned long long next_tick = mono_ns();
 
     for (;;) {
-        Sleep(4);
-        ULONGLONG now = GetTickCount64();
+        {   /* sleep to the next vblank, or one poll interval, whichever is sooner */
+            unsigned long long now0 = mono_ns();
+            unsigned long long wake = now0 + poll_ns;
+            if (next_tick > now0 && next_tick < wake) wake = next_tick;
+            if (wake > now0) {
+                struct timespec d = { (time_t)(wake / 1000000000ull), (long)(wake % 1000000000ull) };
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
+            }
+        }
+        unsigned long long now = mono_ns();
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
@@ -232,7 +280,7 @@ static DWORD WINAPI frame_clock(LPVOID)
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;             /* ~60 Hz */
+            next_tick += period_ns;      /* 59.94 Hz */
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
@@ -459,6 +507,20 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
+
+    /* A windowed run: the player's settings (user/settings.ini) become the
+     * environment the backend reads, below anything already set, and the
+     * menu hooks into the window. Offscreen runs skip both. */
+    { const char* w = getenv("PS3RECOMP_VK_WINDOW");
+      if (w && w[0] && w[0] != '0') {
+          port_settings* ps = port_settings_get();
+          const int had = port_settings_load(ps, port_settings_path());
+          port_settings_export(ps);
+          printf("[settings] %s %s: fullscreen %d, FPS counter %d\n", had ? "read" : "defaults, no",
+                 port_settings_path(), ps->fullscreen, ps->fps_counter);
+          port_ui_init();
+      } }
+
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",

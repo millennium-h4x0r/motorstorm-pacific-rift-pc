@@ -1,3 +1,59 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 250d8d2c..bb962cd8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,6 +48,8 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+ # It loads libvulkan at run time, so building needs only the Vulkan headers --
+ # no target-architecture libvulkan, which keeps cross-compiling simple.
+ option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
++option(PS3RECOMP_UI "Draw the port's menu over the Vulkan window (Dear ImGui)" ON)
++set(PS3RECOMP_UI_ACTIVE OFF)
+ list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+ if(PS3RECOMP_RSX_VULKAN)
+     if(WIN32 OR APPLE)
+@@ -62,8 +64,25 @@ if(PS3RECOMP_RSX_VULKAN)
+     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
+     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
++    # The port's in-game menu and FPS counter (libs/video/rsx_ui.cpp) draw with
++    # Dear ImGui (MIT), which scripts/setup.sh clones into libs/thirdparty/imgui.
++    # Without it, or with -DPS3RECOMP_UI=OFF, the window has no UI.
++    set(PS3RECOMP_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/thirdparty/imgui")
++    if(PS3RECOMP_UI AND EXISTS "${PS3RECOMP_IMGUI_DIR}/imgui.cpp")
++        set(PS3RECOMP_UI_ACTIVE ON)
++        list(APPEND HLE_SOURCES
++            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_ui.cpp"
++            "${PS3RECOMP_IMGUI_DIR}/imgui.cpp" "${PS3RECOMP_IMGUI_DIR}/imgui_draw.cpp"
++            "${PS3RECOMP_IMGUI_DIR}/imgui_tables.cpp" "${PS3RECOMP_IMGUI_DIR}/imgui_widgets.cpp"
++            "${PS3RECOMP_IMGUI_DIR}/backends/imgui_impl_sdl2.cpp"
++            "${PS3RECOMP_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp")
++    endif()
+ endif()
+ 
++# For the port's own UI source (the parent project reads these).
++set(PS3RECOMP_UI_ACTIVE "${PS3RECOMP_UI_ACTIVE}" CACHE INTERNAL "rsx_ui.cpp is built")
++set(PS3RECOMP_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/thirdparty/imgui" CACHE INTERNAL "Dear ImGui")
++
+ # The Metal backend is Objective-C and Apple-only, so it is added explicitly
+ # rather than globbed. It needs no platform #ifdef of its own as a result.
+ if(APPLE)
+@@ -179,6 +198,16 @@ if(PS3RECOMP_RSX_VULKAN)
+     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+     # PUBLIC: ps3recomp_host selects its backend on this definition.
+     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
++    if(PS3RECOMP_UI_ACTIVE)
++        # PRIVATE on purpose: a PUBLIC definition reaches the game target and
++        # changes the compile line of every lifted TU (a full rebuild). The port
++        # sets these on its own UI source alone.
++        target_include_directories(ps3recomp_runtime PRIVATE
++            "${PS3RECOMP_IMGUI_DIR}" "${PS3RECOMP_IMGUI_DIR}/backends")
++        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_UI
++            IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
++        message(STATUS "  UI:           Dear ImGui in ${PS3RECOMP_IMGUI_DIR}")
++    endif()
+     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+ endif()
 diff --git a/docs/BUILDING.md b/docs/BUILDING.md
 index 3bbabf62..0e855fef 100644
 --- a/docs/BUILDING.md
@@ -2385,6 +2441,38 @@ index 9ef5a4e0..00000000
 -    printf("test_font_initialize_with_revision: all passed\n");
 -    return 0;
 -}
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index afdd93de..fef1613c 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -786,6 +786,9 @@ void cellPad_poll(void)
+  * were fixed.) These used to be redeclared here with a 64-bit address
+  * parameter, which conflicts with the header now that it is included. */
+ 
++/* Set by the port's in-game menu (libs/video/rsx_ui.cpp) while it is open. */
++volatile int g_pad_ui_capture = 0;
++
+ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
+ {
+     { static int _once = 0;
+@@ -1092,6 +1095,17 @@ skip_inject: ;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+     }
++    /* The port's in-game menu is open (libs/video/rsx_ui.cpp): the game gets a
++     * pad with nothing pressed and the sticks centred, so navigating the menu
++     * does not drive the car. */
++    if (g_pad_ui_capture) {
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = 0;
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0;
++        for (int k = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X; k <= CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y; k++)
++            data->button[k] = 128;
++        for (int k = CELL_PAD_BTN_OFFSET_PRESS_RIGHT; k <= CELL_PAD_BTN_OFFSET_PRESS_R2; k++)
++            data->button[k] = 0;
++    }
+     }  /* end connected block */
+ 
+ emit:
 diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
 index 2ab88b8e..cad0afb9 100644
 --- a/libs/misc/cellAvconfExt.c
@@ -2940,7 +3028,7 @@ index 298ee7de..24ac166b 100644
      /* The guest struct is two 4-byte EAs, not two host pointers. */
      vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff6011..fa6f7205 100644
+index 8dff6011..a25dbe2e 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -106,9 +106,13 @@ typedef struct {
@@ -2973,7 +3061,7 @@ index 8dff6011..fa6f7205 100644
      }
  }
  
-@@ -2465,6 +2471,34 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+@@ -2465,6 +2471,37 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
      return ENG_INVALID;
  }
  
@@ -2989,7 +3077,10 @@ index 8dff6011..fa6f7205 100644
 + * since, or 0 to view the whole target as before. */
 +static u32 eng_surface_corner(eng_surface* s, const rsx_dsp_texture* t)
 +{
-+    if (!g.be->color_snapshot_rect || !(t->format & RSX_TEX_FMT_LINEAR) ||
++    /* PS3RECOMP_ENG_CORNER=0: view the whole target, as before. */
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_CORNER"); on = !(e && *e == '0'); }
++    if (!on || !g.be->color_snapshot_rect || !(t->format & RSX_TEX_FMT_LINEAR) ||
 +        t->cubemap || t->dimension == 3 || t->pitch != s->pitch ||
 +        !t->width || !t->height || t->width > s->w || t->height > s->h ||
 +        (t->width == s->w && t->height == s->h))
@@ -3008,7 +3099,7 @@ index 8dff6011..fa6f7205 100644
  static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                u32 current_zslot, u32 tex_used,
                                u32 textures[RSX_BE_MAX_TEXTURES],
-@@ -2575,11 +2609,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2575,11 +2612,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              continue;
          }
          if (sampled >= 0) {
@@ -3024,7 +3115,7 @@ index 8dff6011..fa6f7205 100644
              continue;
          }
          if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
-@@ -2672,6 +2707,7 @@ static int pd_open_index(void)
+@@ -2672,6 +2710,7 @@ static int pd_open_index(void)
      }
      s_pd.state = 2;
      s_pd.open = 0;
@@ -3032,7 +3123,7 @@ index 8dff6011..fa6f7205 100644
      return 1;
  }
  
-@@ -2691,6 +2727,22 @@ static int pd_capturing(void)
+@@ -2691,6 +2730,22 @@ static int pd_capturing(void)
      if (s_pd.state == 1 && s_pd.after_s &&
          difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
          fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
@@ -3055,7 +3146,7 @@ index 8dff6011..fa6f7205 100644
      return s_pd.state == 2;
  }
  
-@@ -2829,6 +2881,10 @@ static void pd_close_pass(void)
+@@ -2829,6 +2884,10 @@ static void pd_close_pass(void)
          s_pd.state = 3;
          fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
                  s_pd.pass, s_pd.dir);
@@ -3066,7 +3157,7 @@ index 8dff6011..fa6f7205 100644
      }
  }
  
-@@ -2941,7 +2997,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2941,7 +3000,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
  static void pd_present(u32 presented)
  {
      if (s_pd.state == 0) pd_capturing();
@@ -3076,7 +3167,7 @@ index 8dff6011..fa6f7205 100644
          if (pd_open_index())
              fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                      g.frames + 1, g.guest_draws);
-@@ -3022,14 +3079,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+@@ -3022,14 +3082,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                  what, rc[0], rc[1], rc[2], rc[3], w, h);
  }
  
@@ -3111,7 +3202,7 @@ index 8dff6011..fa6f7205 100644
  
      const u32 prim = g.rsx.current_primitive;
      /* Everything that becomes triangles -- lists, strips, fans, quads, quad
-@@ -3044,33 +3119,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3044,33 +3122,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
      int scratch = 0;
      const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
      if (!rebuild) {
@@ -3151,7 +3242,7 @@ index 8dff6011..fa6f7205 100644
      const u32 target = targets[0];
  
      rsx_dsp_surface sf;
-@@ -3091,8 +3166,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3091,8 +3169,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                            eng_surface_format(sf.color_format),
                                            n_targets, &pipeline_is_fixed, &tex_used,
                                            &fp_hash);
@@ -3162,7 +3253,7 @@ index 8dff6011..fa6f7205 100644
  
      /* Textures before any pipeline or target binding: a cache refresh can
       * replace a resource, and the backend is free to submit while doing it. */
-@@ -3106,12 +3181,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3106,12 +3184,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
      memset(vsamplers, 0, sizeof vsamplers);
      const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                              textures, samplers);
@@ -3177,7 +3268,7 @@ index 8dff6011..fa6f7205 100644
          rsx_draw_engine_write_topology_indices(
              prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
              dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
-@@ -3145,7 +3220,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3145,7 +3223,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      const u32 fp_bytes = (nslots + 1u) * 16u;
      if (g.fp_cb_cap < fp_bytes) {
          u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
@@ -3186,7 +3277,7 @@ index 8dff6011..fa6f7205 100644
          g.fp_cb = n;
          g.fp_cb_cap = fp_bytes;
      }
-@@ -3231,6 +3306,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3231,6 +3309,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
       * the test hook means: a draw through the built-in pair is a draw, not
       * evidence that the decompile-translate-compile path worked. */
      if (!pipeline_is_fixed) g.guest_draws++;
@@ -3194,7 +3285,7 @@ index 8dff6011..fa6f7205 100644
  
      if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
      if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-@@ -3360,6 +3436,40 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -3360,6 +3439,40 @@ static u32 eng_present_surface(u32 buffer_id)
      return eng_current_surface();
  }
  
@@ -3235,7 +3326,7 @@ index 8dff6011..fa6f7205 100644
  static void eng_present(u32 buffer_id)
  {
      if (!g.ready) return;
-@@ -3376,9 +3486,11 @@ static void eng_present(u32 buffer_id)
+@@ -3376,9 +3489,11 @@ static void eng_present(u32 buffer_id)
                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
      }
      pd_present(target);
@@ -3247,7 +3338,7 @@ index 8dff6011..fa6f7205 100644
      g.last_guest_draws = g.guest_draws;
      g.guest_draws = 0;
  }
-@@ -3466,6 +3578,7 @@ void rsx_draw_engine_shutdown(void)
+@@ -3466,6 +3581,7 @@ void rsx_draw_engine_shutdown(void)
          if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
      for (u32 i = 0; i < g.n_surfaces; i++) {
          if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
@@ -3275,10 +3366,50 @@ index a25ecc29..7b192b9e 100644
  
  /* ---- the engine --------------------------------------------------------- */
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index cfb9685b..4cd6af2c 100644
+index cfb9685b..77bc8cea 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
-@@ -398,6 +398,98 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
+@@ -44,6 +44,7 @@
+ #define FP_SRC_NEGATE       (1u << 17)
+ #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
+ #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
++#define FP_SRC2_ABS         (1u << 18) /* in DWORD3 (RPCS3 SRC2.abs) */
+ #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
+ 
+ /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
+@@ -361,7 +362,7 @@ static const char* input_expr(u32 input_src)
+ 
+ /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
+ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
+-                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
++                     int buffered, u32 constant_slot, u32 prec_mod, char* buf, u32 bufsz)
+ {
+     char base[96];
+     if (s->type == FP_REG_TYPE_TEMP) {
+@@ -388,8 +389,21 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
+             snprintf(base, sizeof(base), "float4(0,0,0,0)");
+     }
+ 
+-    char swz[160];
++    char swz[200];
+     snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
++    /* SRC1 [19:21]/[22:24]/[25:27] are the src0/src1/src2 precision
++     * modifiers (RPCS3 SRC1 src{0,1,2}_prec_mod, ClampValue): the read is
++     * clamped to fp16 range, fx12 [-2,2], fx9 [-1,1] or [0,1] before
++     * abs/negate. MotorStorm PR's loading screen fades with
++     * mix(image, black, saturate(tc1.w)) and relies on it: tc1.w = 1 - t/2
++     * keeps falling, and unclamped the picture blows out to white. */
++    if (prec_mod >= 1 && prec_mod <= 4) {
++        static const char* lim[5] = { "", "-65504.0, 65504.0", "-2.0, 2.0",
++                                      "-1.0, 1.0", "0.0, 1.0" };
++        char t[200];
++        snprintf(t, sizeof(t), "clamp(%s, %s)", swz, lim[prec_mod]);
++        memcpy(swz, t, sizeof(t));
++    }
+ 
+     const char* pre = "";
+     const char* post = "";
+@@ -398,6 +412,98 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
      else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
  }
  
@@ -3377,7 +3508,7 @@ index cfb9685b..4cd6af2c 100644
  /* Dest write-mask letters from OPDEST bits 9..12 (X..W). */
  static void dest_mask(u32 op0, char* m)
  {
-@@ -666,6 +758,8 @@ static int rsx_fp_decompile_internal(
+@@ -666,6 +772,8 @@ static int rsx_fp_decompile_internal(
       * Emitting the preamble here would mean guessing it. */
      Out o = { out, out_size, 0, 1 };
      out[0] = '\0';
@@ -3386,7 +3517,69 @@ index cfb9685b..4cd6af2c 100644
      int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
      out_puts(&o,
          "    float4 r[48]; float4 h[48];\n"
-@@ -1161,6 +1255,8 @@ static int rsx_fp_decompile_internal(
+@@ -779,7 +887,7 @@ static int rsx_fp_decompile_internal(
+         Src s0, s1, s2;
+         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
+         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
+-        decode_src(w3, 0,                &s2);
++        decode_src(w3, w3 & FP_SRC2_ABS, &s2);
+ 
+         /* Inline constant: any CONST source pulls the next 16 bytes as a
+          * float4 literal and advances past it. */
+@@ -802,16 +910,16 @@ static int rsx_fp_decompile_internal(
+          * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
+          * address instead. */
+         const int persp = !is_branch && (w3 >> 31) != 0;
+-        char a[200], b[200], c[200];
++        char a[240], b[240], c[240];
+         emit_src(
+             &s0, input_src, persp, k, has_k, buffered, constant_slot,
+-            a, sizeof(a));
++            is_branch ? 0 : (w2 >> 19) & 7, a, sizeof(a));
+         emit_src(
+             &s1, input_src, persp, k, has_k, buffered, constant_slot,
+-            b, sizeof(b));
++            is_branch ? 0 : (w2 >> 22) & 7, b, sizeof(b));
+         emit_src(
+             &s2, input_src, persp, k, has_k, buffered, constant_slot,
+-            c, sizeof(c));
++            is_branch ? 0 : (w2 >> 25) & 7, c, sizeof(c));
+         if (has_k)
+             constant_slot++;
+ 
+@@ -1092,6 +1200,31 @@ static int rsx_fp_decompile_internal(
+             dest_mask(w0, m);
+ 
+             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
++            /* OPDEST [22:23] is the destination precision (RPCS3 OPDEST.prec,
++             * SetDst/ClampValue): 1 fp16 range, 2 fx12 [-2,2], 3 fx9 [-1,1].
++             * Saturate wins. As in RPCS3: opcodes whose result is already in
++             * range or that must keep it (NRM MIN MAX COS SIN RFL EX2 FRC LIT
++             * LIF LRP LG2) are left alone, and an h-to-h temp MOV is a copy.
++             * Only the fixed-point formats clamp here: real fp16 overflows
++             * to Inf rather than to 65504, so prec 1 (on nearly every h
++             * write) is left alone. A no-dest CC write is not clamped (the
++             * sign it records is unchanged anyway). */
++            const u32 dprec = (w0 >> 22) & 3u;
++            if (!(w0 & FP_OUT_SAT) && has_dest && dprec >= 2) {
++                int exempt = 0;
++                switch (opcode) {
++                case OP_NRM: case OP_MIN: case OP_MAX: case OP_COS: case OP_SIN:
++                case OP_RFL: case OP_EX2: case OP_FRC: case OP_LIT: case OP_LIF:
++                case OP_LRP: case OP_LG2:
++                    exempt = 1; break;
++                case OP_MOV:
++                    exempt = dst_half && s0.half && s0.type == FP_REG_TYPE_TEMP; break;
++                default: break;
++                }
++                if (!exempt)
++                    sat = dprec == 2 ? " _v = clamp(_v, -2.0, 2.0);"
++                                     : " _v = clamp(_v, -1.0, 1.0);";
++            }
+             /* NV40 per-instruction result-scale modifier (SRC1 word bits
+              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
+              * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
+@@ -1161,6 +1294,8 @@ static int rsx_fp_decompile_internal(
              }
  
              if (has_dest) {
@@ -3395,11 +3588,1007 @@ index cfb9685b..4cd6af2c 100644
                  const int target = fp_export_target(dst_idx, dst_half);
                  if (target >= 0) wrote[dst_half][target] = 1;
              }
+diff --git a/libs/video/rsx_ui.cpp b/libs/video/rsx_ui.cpp
+new file mode 100644
+index 00000000..fd1c3c47
+--- /dev/null
++++ b/libs/video/rsx_ui.cpp
+@@ -0,0 +1,770 @@
++/*
++ * ps3recomp - a user interface over the game's window (Dear ImGui, Vulkan).
++ * See rsx_ui.h for the threads, rsx_ui_vk.h for the backend's side.
++ */
++#include "rsx_ui.h"
++#include "rsx_ui_vk.h"
++
++#include "imgui.h"
++#include "backends/imgui_impl_sdl2.h"
++#include "backends/imgui_impl_vulkan.h"
++
++#include <SDL2/SDL.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++extern "C" volatile int g_pad_ui_capture;   /* libs/input/cellPad.c: a neutral pad */
++
++namespace {
++
++#define UI_FN(X) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateFramebuffer) \
++    X(vkDestroyFramebuffer) X(vkCreateRenderPass) X(vkDestroyRenderPass)           \
++    X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkCmdBeginRenderPass)   \
++    X(vkCmdEndRenderPass) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)   \
++    X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory)            \
++    X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                      \
++    X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkMapMemory)          \
++    X(vkCreateSampler) X(vkDestroySampler) X(vkCmdPipelineBarrier)                 \
++    X(vkCmdCopyBufferToImage) X(vkGetPhysicalDeviceMemoryProperties)              \
++    X(vkCmdCopyImageToBuffer) X(vkUnmapMemory)
++
++struct Ui {
++    std::mutex lock;                  /* the ImGui context and the copied draw data */
++    bool tried = false, imgui_vk = false;
++    std::atomic<bool> ok{false};      /* up, and not torn down or failed since */
++    void (*draw)(void*) = nullptr;
++    void* user = nullptr;
++    int (*hotkey)(int, void*) = nullptr;   /* the port's function keys (rsx_ui_set_hotkey) */
++    void* hotkey_user = nullptr;
++    std::atomic<int> menu{0}, visible{0}, modal{0};
++    std::atomic<bool> clear_input{false};  /* drop what ImGui held while it was hidden */
++    std::atomic<bool> reap{false};    /* the context outlived a teardown on another thread */
++    std::thread::id owner;            /* the window's thread: SDL and the context live there */
++
++    SDL_Window* window = nullptr;
++    rsx_ui_vk_info vk{};
++#define UI_DECL(n) PFN_##n n = nullptr;
++    UI_FN(UI_DECL)
++#undef UI_DECL
++    VkDescriptorPool pool = VK_NULL_HANDLE;
++    VkRenderPass rp = VK_NULL_HANDLE;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    std::vector<VkImageView> views;
++    std::vector<VkFramebuffer> fbs;
++    uint32_t w = 0, h = 0;
++
++    ImDrawData snap;                  /* the last frame, for the presenting thread */
++    std::vector<ImDrawList*> lists;
++    bool have_snap = false;
++
++    /* A picture for the port's screens (rsx_ui_set_image): the pixels wait
++     * here until the presenting thread's command buffer uploads them. */
++    struct {
++        std::vector<unsigned char> rgba;
++        int w = 0, h = 0;
++        bool want = false, ready = false;
++        VkImage img = VK_NULL_HANDLE;
++        VkDeviceMemory mem = VK_NULL_HANDLE, staging_mem = VK_NULL_HANDLE;
++        VkBuffer staging = VK_NULL_HANDLE;
++        VkImageView view = VK_NULL_HANDLE;
++        VkSampler sampler = VK_NULL_HANDLE;
++        VkDescriptorSet ds = VK_NULL_HANDLE;
++    } image;
++
++    /* PS3RECOMP_UI_SHOT=<file.ppm>: the swapchain image, UI and all, read
++     * back once after PS3RECOMP_UI_SHOT_AFTER (default 120) UI passes. The
++     * offscreen frame dump (PS3RECOMP_VK_DUMP) is taken before the UI. */
++    struct {
++        const char* path = nullptr;
++        long after = 120, passes = 0;
++        int state = 0;                /* 0 waiting, 1 copy recorded, 2 written */
++        bool src = false;             /* the swapchain was made with TRANSFER_SRC */
++        std::vector<VkImage> images;  /* the swapchain's */
++        VkBuffer buf = VK_NULL_HANDLE;
++        VkDeviceMemory mem = VK_NULL_HANDLE;
++        uint32_t w = 0, h = 0;
++    } shot;
++
++    std::chrono::steady_clock::time_point last{};
++    double dt = 0.0;
++    double hold = 0.0;                /* Select+Start held, seconds */
++    ImFont* title_font = nullptr;
++};
++/* On the heap and never freed: exit() runs from a guest thread while the rsx
++ * thread and the recording thread may still be in here. */
++Ui& U = *new Ui;
++
++PFN_vkVoidFunction ui_load(const char* name, void*)
++{
++    return U.vk.gipa(U.vk.instance, name);
++}
++
++void free_snap()
++{
++    for (ImDrawList* l : U.lists) IM_DELETE(l);
++    U.lists.clear();
++    U.snap.CmdLists.clear();
++    U.have_snap = false;
++}
++
++/* The SDL side and the context, on the window's thread, after a teardown
++ * elsewhere (rsx_ui_vk_shutdown) left them. Under U.lock. */
++void reap_locked()
++{
++    if (!U.reap || std::this_thread::get_id() != U.owner) return;
++    ImGui_ImplSDL2_Shutdown();
++    ImGui::DestroyContext();
++    U.reap = false;
++}
++
++void destroy_targets()
++{
++    for (VkFramebuffer f : U.fbs) U.vkDestroyFramebuffer(U.vk.device, f, nullptr);
++    for (VkImageView v : U.views) U.vkDestroyImageView(U.vk.device, v, nullptr);
++    U.fbs.clear(); U.views.clear();
++}
++
++/* A memory type with these bits and properties, or ~0u. */
++uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
++{
++    VkPhysicalDeviceMemoryProperties mp;
++    U.vkGetPhysicalDeviceMemoryProperties(U.vk.phys, &mp);
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
++    return ~0u;
++}
++
++void image_release_locked()
++{
++    auto& im = U.image;
++    if (im.ds && U.imgui_vk) ImGui_ImplVulkan_RemoveTexture(im.ds);
++    if (im.sampler) U.vkDestroySampler(U.vk.device, im.sampler, nullptr);
++    if (im.view) U.vkDestroyImageView(U.vk.device, im.view, nullptr);
++    if (im.img) U.vkDestroyImage(U.vk.device, im.img, nullptr);
++    if (im.mem) U.vkFreeMemory(U.vk.device, im.mem, nullptr);
++    if (im.staging) U.vkDestroyBuffer(U.vk.device, im.staging, nullptr);
++    if (im.staging_mem) U.vkFreeMemory(U.vk.device, im.staging_mem, nullptr);
++    im.ds = VK_NULL_HANDLE; im.sampler = VK_NULL_HANDLE; im.view = VK_NULL_HANDLE;
++    im.img = VK_NULL_HANDLE; im.mem = VK_NULL_HANDLE;
++    im.staging = VK_NULL_HANDLE; im.staging_mem = VK_NULL_HANDLE;
++    im.ready = false;
++}
++
++/* The picture into a sampled image, recorded into `cb` ahead of the UI's
++ * render pass (the presenting thread owns the queue; nothing else submits
++ * for it). The staging buffer stays until the UI goes. Under U.lock. */
++void image_upload_locked(VkCommandBuffer cb)
++{
++    auto& im = U.image;
++    im.want = false;
++    const VkDeviceSize bytes = (VkDeviceSize)im.w * im.h * 4u;
++    const VkDevice dev = U.vk.device;
++    auto fail = [&](const char* what) {
++        fprintf(stderr, "[ui] the picture was not uploaded (%s)\n", what);
++        image_release_locked();
++    };
++    VkBufferCreateInfo bi = {};
++    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bi.size = bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if (U.vkCreateBuffer(dev, &bi, nullptr, &im.staging) != VK_SUCCESS) return fail("buffer");
++    VkMemoryRequirements mr;
++    U.vkGetBufferMemoryRequirements(dev, im.staging, &mr);
++    VkMemoryAllocateInfo ai = {};
++    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    ai.allocationSize = mr.size;
++    ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    if (ai.memoryTypeIndex == ~0u || U.vkAllocateMemory(dev, &ai, nullptr, &im.staging_mem) != VK_SUCCESS ||
++        U.vkBindBufferMemory(dev, im.staging, im.staging_mem, 0) != VK_SUCCESS) return fail("staging memory");
++    void* map = nullptr;
++    if (U.vkMapMemory(dev, im.staging_mem, 0, bytes, 0, &map) != VK_SUCCESS) return fail("map");
++    memcpy(map, im.rgba.data(), (size_t)bytes);
++
++    VkImageCreateInfo ii = {};
++    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM;
++    ii.extent = { (uint32_t)im.w, (uint32_t)im.h, 1 }; ii.mipLevels = 1; ii.arrayLayers = 1;
++    ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (U.vkCreateImage(dev, &ii, nullptr, &im.img) != VK_SUCCESS) return fail("image");
++    U.vkGetImageMemoryRequirements(dev, im.img, &mr);
++    ai.allocationSize = mr.size;
++    ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (ai.memoryTypeIndex == ~0u || U.vkAllocateMemory(dev, &ai, nullptr, &im.mem) != VK_SUCCESS ||
++        U.vkBindImageMemory(dev, im.img, im.mem, 0) != VK_SUCCESS) return fail("image memory");
++
++    VkImageMemoryBarrier b = {};
++    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = im.img; b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    U.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                           0, nullptr, 0, nullptr, 1, &b);
++    VkBufferImageCopy c = {};
++    c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    c.imageExtent = ii.extent;
++    U.vkCmdCopyBufferToImage(cb, im.staging, im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
++    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++    U.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
++                           0, nullptr, 0, nullptr, 1, &b);
++
++    VkImageViewCreateInfo vi = {};
++    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    vi.image = im.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ii.format;
++    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    if (U.vkCreateImageView(dev, &vi, nullptr, &im.view) != VK_SUCCESS) return fail("view");
++    VkSamplerCreateInfo si = {};
++    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
++    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    si.maxLod = 1.0f;
++    if (U.vkCreateSampler(dev, &si, nullptr, &im.sampler) != VK_SUCCESS) return fail("sampler");
++    im.ds = ImGui_ImplVulkan_AddTexture(im.sampler, im.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    if (!im.ds) return fail("descriptor");
++    im.ready = true;
++}
++
++/* The screenshot's copy, recorded after the UI pass: the image goes from
++ * PRESENT_SRC to TRANSFER_SRC, into a host-visible buffer, and back. The
++ * caller waits for the submit before presenting, so the next pass may read
++ * the buffer. Under U.lock. */
++void shot_record_locked(VkCommandBuffer cb, uint32_t image)
++{
++    auto& sh = U.shot;
++    if (image >= sh.images.size()) return;
++    const VkDevice dev = U.vk.device;
++    const VkDeviceSize bytes = (VkDeviceSize)U.w * U.h * 4u;
++    VkBufferCreateInfo bi = {};
++    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bi.size = bytes; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    if (U.vkCreateBuffer(dev, &bi, nullptr, &sh.buf) != VK_SUCCESS) { sh.state = 2; return; }
++    VkMemoryRequirements mr;
++    U.vkGetBufferMemoryRequirements(dev, sh.buf, &mr);
++    VkMemoryAllocateInfo ai = {};
++    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    ai.allocationSize = mr.size;
++    ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++    if (ai.memoryTypeIndex == ~0u || U.vkAllocateMemory(dev, &ai, nullptr, &sh.mem) != VK_SUCCESS ||
++        U.vkBindBufferMemory(dev, sh.buf, sh.mem, 0) != VK_SUCCESS) {
++        fprintf(stderr, "[ui] screenshot: no memory\n");
++        sh.state = 2; return;
++    }
++    VkImageMemoryBarrier b = {};
++    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = sh.images[image]; b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    U.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           0, 0, nullptr, 0, nullptr, 1, &b);
++    VkBufferImageCopy c = {};
++    c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++    c.imageExtent = { U.w, U.h, 1 };
++    U.vkCmdCopyImageToBuffer(cb, sh.images[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sh.buf, 1, &c);
++    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = 0;
++    U.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                           0, 0, nullptr, 0, nullptr, 1, &b);
++    sh.w = U.w; sh.h = U.h;
++    sh.state = 1;
++}
++
++/* The copy has landed (the submit it was in was waited on): write the PPM.
++ * Under U.lock. */
++void shot_write_locked()
++{
++    auto& sh = U.shot;
++    sh.state = 2;
++    void* map = nullptr;
++    if (U.vkMapMemory(U.vk.device, sh.mem, 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS) {
++        const bool bgr = U.format == VK_FORMAT_B8G8R8A8_UNORM || U.format == VK_FORMAT_B8G8R8A8_SRGB;
++        if (FILE* f = fopen(sh.path, "wb")) {
++            fprintf(f, "P6\n%u %u\n255\n", sh.w, sh.h);
++            const unsigned char* p = (const unsigned char*)map;
++            std::vector<unsigned char> row((size_t)sh.w * 3u);
++            for (uint32_t y = 0; y < sh.h; y++) {
++                for (uint32_t x = 0; x < sh.w; x++, p += 4) {
++                    row[x * 3 + 0] = bgr ? p[2] : p[0];
++                    row[x * 3 + 1] = p[1];
++                    row[x * 3 + 2] = bgr ? p[0] : p[2];
++                }
++                fwrite(row.data(), 1, row.size(), f);
++            }
++            fclose(f);
++            fprintf(stderr, "[ui] screenshot %ux%u (game frame + UI) written to %s\n", sh.w, sh.h, sh.path);
++        } else fprintf(stderr, "[ui] screenshot: cannot open %s\n", sh.path);
++        U.vkUnmapMemory(U.vk.device, sh.mem);
++    }
++    U.vkDestroyBuffer(U.vk.device, sh.buf, nullptr);
++    U.vkFreeMemory(U.vk.device, sh.mem, nullptr);
++    sh.buf = VK_NULL_HANDLE; sh.mem = VK_NULL_HANDLE;
++}
++
++/* The UI is over, for good (the window went, or a swapchain it cannot draw
++ * into): everything Vulkan goes now, the SDL side and the context on the
++ * window's thread, and the game gets its pad back. Under U.lock. */
++void teardown_locked()
++{
++    free_snap();
++    if (U.ok || U.imgui_vk) {
++        image_release_locked();
++        if (U.shot.buf) U.vkDestroyBuffer(U.vk.device, U.shot.buf, nullptr);
++        if (U.shot.mem) U.vkFreeMemory(U.vk.device, U.shot.mem, nullptr);
++        U.shot.buf = VK_NULL_HANDLE; U.shot.mem = VK_NULL_HANDLE;
++        if (U.shot.state == 1) U.shot.state = 0;
++        if (U.imgui_vk) ImGui_ImplVulkan_Shutdown();
++        destroy_targets();
++        if (U.rp) U.vkDestroyRenderPass(U.vk.device, U.rp, nullptr);
++        if (U.pool) U.vkDestroyDescriptorPool(U.vk.device, U.pool, nullptr);
++        U.reap = true;
++        reap_locked();
++    }
++    U.rp = VK_NULL_HANDLE; U.pool = VK_NULL_HANDLE;
++    U.ok = false; U.imgui_vk = false;
++    U.menu = 0; U.modal = 0; U.visible = 0;
++    g_pad_ui_capture = 0;
++}
++
++/* Whether anything is up to draw. */
++bool shown() { return U.visible || U.menu || U.modal; }
++
++/* The font: Inter where the system has it, ImGui's own otherwise. Baked
++ * large (RSX_UI_FONT_PX) and scaled down per frame to the window
++ * (io.FontGlobalScale, rsx_ui_frame), so a 720p window and a 4K screen read
++ * the same and going full screen needs no new atlas. */
++#define RSX_UI_FONT_PX 36.0f
++void load_fonts(ImGuiIO& io)
++{
++    const float px = RSX_UI_FONT_PX;
++    const char* env = getenv("PS3RECOMP_UI_FONT");
++    static const char* const paths[] = {
++        "/usr/share/fonts/rsms-inter-fonts/Inter-Medium.ttf",          /* Fedora */
++        "/usr/share/fonts/rsms-inter-fonts/Inter-Regular.ttf",
++        "/usr/share/fonts/truetype/inter/Inter-Medium.ttf",            /* Debian */
++        "/usr/share/fonts/inter/Inter-Medium.ttf",
++        "/usr/share/fonts/TTF/Inter-Medium.ttf",                       /* Arch */
++        "/usr/share/fonts/google-noto/NotoSans-Medium.ttf",
++        "/usr/share/fonts/noto/NotoSans-Medium.ttf",
++        "/usr/share/fonts/truetype/noto/NotoSans-Medium.ttf",
++    };
++    ImFontConfig cfg;
++    cfg.OversampleH = 2;
++    ImFont* f = nullptr;
++    if (env && *env) f = io.Fonts->AddFontFromFileTTF(env, px, &cfg, io.Fonts->GetGlyphRangesDefault());
++    for (const char* p : paths) {
++        if (f) break;
++        FILE* t = fopen(p, "rb");
++        if (!t) continue;
++        fclose(t);
++        f = io.Fonts->AddFontFromFileTTF(p, px, &cfg, io.Fonts->GetGlyphRangesDefault());
++    }
++    if (!f) {
++        ImFontConfig d; d.SizePixels = px;
++        io.Fonts->AddFontDefault(&d);
++    }
++    /* Titles: Inter Display Black where it exists, three times the size. */
++    static const char* const titles[] = {
++        "/usr/share/fonts/rsms-inter-fonts/InterDisplay-Black.ttf",
++        "/usr/share/fonts/rsms-inter-fonts/Inter-Black.ttf",
++        "/usr/share/fonts/truetype/inter/Inter-Black.ttf",
++        "/usr/share/fonts/inter/Inter-Black.ttf",
++        "/usr/share/fonts/TTF/Inter-Black.ttf",
++    };
++    for (const char* p : titles) {
++        FILE* t = fopen(p, "rb");
++        if (!t) continue;
++        fclose(t);
++        U.title_font = io.Fonts->AddFontFromFileTTF(p, px * 3.0f, &cfg, io.Fonts->GetGlyphRangesDefault());
++        break;
++    }
++}
++
++} /* namespace */
++
++extern "C" {
++
++void rsx_ui_set_draw(void (*draw)(void*), void* user)
++{
++    std::lock_guard<std::mutex> g(U.lock);
++    U.draw = draw; U.user = user;
++}
++
++void rsx_ui_set_hotkey(int (*fn)(int key, void* user), void* user)
++{
++    std::lock_guard<std::mutex> g(U.lock);
++    U.hotkey = fn; U.hotkey_user = user;
++}
++
++int rsx_ui_menu_open(void) { return U.menu.load(); }
++
++void rsx_ui_set_menu_open(int open)
++{
++    if (open && !U.menu) U.clear_input = true;
++    if ((open ? 1 : 0) != U.menu) fprintf(stderr, "[ui] menu %s\n", open ? "opened" : "closed");
++    U.menu = open ? 1 : 0;
++    g_pad_ui_capture = open ? 1 : 0;
++}
++
++void rsx_ui_set_visible(int visible)
++{
++    if (visible && !U.visible) U.clear_input = true;
++    U.visible = visible ? 1 : 0;
++}
++
++void rsx_ui_set_modal(int on)
++{
++    if (on && !U.modal) U.clear_input = true;
++    U.modal = on ? 1 : 0;
++}
++
++int rsx_ui_display_index(void)
++{
++    const int i = U.window ? SDL_GetWindowDisplayIndex(U.window) : 0;
++    return i < 0 ? 0 : i;
++}
++
++double rsx_ui_frame_dt(void) { return U.dt; }
++
++/* U.ok alone: the pipeline is rebuilt for a new swapchain format, and a start
++ * screen waiting on this must not take that moment for the end of the UI. */
++int rsx_ui_available(void) { return U.ok ? 1 : 0; }
++
++void* rsx_ui_title_font(void) { return U.title_font; }
++
++void rsx_ui_set_fullscreen(int on)
++{
++    if (U.window) SDL_SetWindowFullscreen(U.window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
++}
++
++int rsx_ui_fullscreen(void)
++{
++    return U.window && (SDL_GetWindowFlags(U.window) & SDL_WINDOW_FULLSCREEN) != 0;
++}
++
++void rsx_ui_set_image(const void* rgba, int w, int h)
++{
++    if (!rgba || w <= 0 || h <= 0 || w > 8192 || h > 8192) return;
++    std::lock_guard<std::mutex> g(U.lock);
++    if (U.image.ready || U.image.want) return;   /* one picture */
++    U.image.rgba.assign((const unsigned char*)rgba, (const unsigned char*)rgba + (size_t)w * h * 4u);
++    U.image.w = w; U.image.h = h;
++    U.image.want = true;
++}
++
++void* rsx_ui_image(int* w, int* h)
++{
++    /* Read on the rsx thread while it builds a frame, under U.lock already
++     * (the port's draw callback): no lock here. */
++    if (!U.image.ready || !U.image.ds) return nullptr;
++    if (w) *w = U.image.w;
++    if (h) *h = U.image.h;
++    return (void*)U.image.ds;
++}
++
++int rsx_ui_event(const void* ev)
++{
++    const SDL_Event* e = (const SDL_Event*)ev;
++    std::lock_guard<std::mutex> g(U.lock);
++    reap_locked();
++    if (!U.ok || !U.imgui_vk) return 0;
++    const bool key = e->type == SDL_KEYDOWN || e->type == SDL_KEYUP;
++    const SDL_Keycode sym = key ? e->key.keysym.sym : 0;
++    /* Full screen and back stay the window's, whatever is open. */
++    if (sym == SDLK_F11 || (sym == SDLK_RETURN && (e->key.keysym.mod & KMOD_ALT))) return 0;
++    /* A pad coming or going: ImGui rebuilds its list of pads only on these,
++     * so they go to it even while nothing is shown. They queue nothing. */
++    if (e->type == SDL_CONTROLLERDEVICEADDED || e->type == SDL_CONTROLLERDEVICEREMOVED) {
++        ImGui_ImplSDL2_ProcessEvent(e);
++        return 0;
++    }
++    /* A screen that owns the window (the start screen) takes every event:
++     * Escape would otherwise quit the game. */
++    if (U.modal) {
++        if (sym != SDLK_F1) ImGui_ImplSDL2_ProcessEvent(e);
++        return 1;
++    }
++    if (e->type == SDL_KEYDOWN && !e->key.repeat && sym == SDLK_F1) {
++        rsx_ui_set_menu_open(!U.menu);
++        return 1;
++    }
++    /* Escape closes the menu (and does not quit the game while it is open). */
++    if (U.menu && e->type == SDL_KEYDOWN && !e->key.repeat && sym == SDLK_ESCAPE) {
++        rsx_ui_set_menu_open(0);
++        return 1;
++    }
++    /* The port's own function keys (F10: the FPS counter). */
++    if (e->type == SDL_KEYDOWN && !e->key.repeat && U.hotkey &&
++        ((sym >= SDLK_F2 && sym <= SDLK_F10) || sym == SDLK_F12) && U.hotkey((int)sym, U.hotkey_user))
++        return 1;
++    /* Hidden, nothing reads the events: queued, they would replay into the
++     * menu the next time it opens. */
++    if (!shown()) return 0;
++    ImGui_ImplSDL2_ProcessEvent(e);
++    return U.menu ? 1 : 0;
++}
++
++void rsx_ui_frame(void)
++{
++    const auto now = std::chrono::steady_clock::now();
++    U.dt = U.last.time_since_epoch().count() ? std::chrono::duration<double>(now - U.last).count() : 0.0;
++    U.last = now;
++
++    std::lock_guard<std::mutex> g(U.lock);
++    reap_locked();
++    if (!U.ok || !U.imgui_vk) return;
++
++    /* Select+Start held half a second opens or closes the menu. */
++    /* Under SDL's joystick lock: cellPad opens and polls the same pads from
++     * the game's threads, and the device list behind SDL_NumJoysticks is
++     * rebuilt on each call (two threads at once corrupted the heap). */
++    if (!U.modal) { SDL_GameController* gc = nullptr;
++      SDL_LockJoysticks();
++      for (int i = 0; i < SDL_NumJoysticks() && !gc; i++)
++          if (SDL_IsGameController(i)) gc = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
++      const bool both = gc && SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK) &&
++                        SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START);
++      SDL_UnlockJoysticks();
++      if (both) {
++          const double before = U.hold;
++          U.hold += U.dt;
++          if (before < 0.5 && U.hold >= 0.5) rsx_ui_set_menu_open(!U.menu);
++      } else U.hold = 0.0; }
++
++    if (!U.draw || !shown()) { free_snap(); return; }
++    if (U.clear_input.exchange(false)) {
++        ImGuiIO& io = ImGui::GetIO();
++        io.ClearEventsQueue(); io.ClearInputKeys(); io.ClearInputMouse();
++    }
++    ImGui_ImplVulkan_NewFrame();
++    ImGui_ImplSDL2_NewFrame();
++    /* 20 px text on a 1080-line window, in proportion elsewhere. */
++    { ImGuiIO& io = ImGui::GetIO();
++      float sc = io.DisplaySize.y > 0 ? io.DisplaySize.y / 1080.0f * 20.0f / RSX_UI_FONT_PX : 0.55f;
++      io.FontGlobalScale = sc < 0.42f ? 0.42f : sc > 1.6f ? 1.6f : sc; }
++    ImGui::NewFrame();
++    U.draw(U.user);
++    ImGui::Render();
++    free_snap();
++    ImDrawData* d = ImGui::GetDrawData();
++    if (!d || !d->Valid || d->TotalVtxCount == 0) return;
++    U.snap = *d;
++    U.snap.CmdLists.clear();
++    for (ImDrawList* l : d->CmdLists) {
++        ImDrawList* c = l->CloneOutput();
++        U.lists.push_back(c);
++        U.snap.CmdLists.push_back(c);
++    }
++    U.have_snap = true;
++}
++
++int rsx_ui_vk_init(void* sdl_window, const rsx_ui_vk_info* info)
++{
++    if (U.tried) return U.ok ? 0 : -1;
++    U.tried = true;
++    { const char* e = getenv("PS3RECOMP_UI"); if (e && e[0] == '0') return -1; }
++    if (!sdl_window || !info || !info->gipa) return -1;
++    U.window = (SDL_Window*)sdl_window;
++    U.vk = *info;
++    U.owner = std::this_thread::get_id();
++#define UI_LOAD(n) if (!(U.n = (PFN_##n)U.vk.gipa(U.vk.instance, #n))) { fprintf(stderr, "[ui] no %s\n", #n); return -1; }
++    UI_FN(UI_LOAD)
++#undef UI_LOAD
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGuiIO& io = ImGui::GetIO();
++    io.IniFilename = nullptr;
++    io.LogFilename = nullptr;
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
++    load_fonts(io);
++    if (!ImGui_ImplSDL2_InitForVulkan(U.window) ||
++        !ImGui_ImplVulkan_LoadFunctions(ui_load, nullptr)) {
++        fprintf(stderr, "[ui] ImGui did not start: the game runs without its menu\n");
++        ImGui::DestroyContext();
++        return -1;
++    }
++    const VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 };
++    VkDescriptorPoolCreateInfo pci = {};
++    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
++    pci.maxSets = 16; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
++    if (U.vkCreateDescriptorPool(U.vk.device, &pci, nullptr, &U.pool) != VK_SUCCESS) {
++        ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext();
++        return -1;
++    }
++    U.ok = true;
++    /* PS3RECOMP_UI_OPEN=1: the menu is open from the start (a check that the
++     * overlay draws, with no hand on the keyboard). */
++    { const char* e = getenv("PS3RECOMP_UI_OPEN"); if (e && e[0] == '1') rsx_ui_set_menu_open(1); }
++    { const char* e = getenv("PS3RECOMP_UI_SHOT");
++      if (e && *e) {
++          U.shot.path = e;
++          const char* a = getenv("PS3RECOMP_UI_SHOT_AFTER");
++          if (a && *a) U.shot.after = atol(a);
++      } }
++    fprintf(stderr, "[ui] started: F1 (or Select+Start held) opens the menu, F10 the FPS counter\n");
++    return 0;
++}
++
++VkImageUsageFlags rsx_ui_vk_image_usage(VkImageUsageFlags supported)
++{
++    if (!U.ok || !(supported & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return 0;
++    VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    if (U.shot.path && U.shot.state == 0 && (supported & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
++        u |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    U.shot.src = (u & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
++    return u;
++}
++
++void rsx_ui_vk_swapchain(VkFormat format, uint32_t count, const VkImage* images,
++                         uint32_t width, uint32_t height)
++{
++    if (!U.ok) return;
++    std::lock_guard<std::mutex> g(U.lock);
++    destroy_targets();
++    U.shot.images.clear();
++    if (!count) return;                 /* only letting go of the old images */
++    if (U.rp && U.format != format) {
++        /* Another format: the pipeline is the old render pass's, and the
++         * copied frame points at the font's descriptor set it frees. */
++        free_snap();
++        if (U.image.ds && U.imgui_vk) { ImGui_ImplVulkan_RemoveTexture(U.image.ds); U.image.ds = VK_NULL_HANDLE; }
++        if (U.imgui_vk) { ImGui_ImplVulkan_Shutdown(); U.imgui_vk = false; }
++        U.vkDestroyRenderPass(U.vk.device, U.rp, nullptr);
++        U.rp = VK_NULL_HANDLE;
++    }
++    U.format = format; U.w = width; U.h = height;
++    U.shot.images.assign(images, images + count);
++    if (!U.rp) {
++        VkAttachmentDescription at = {};
++        at.format = format;
++        at.samples = VK_SAMPLE_COUNT_1_BIT;
++        at.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++        at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        at.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        at.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        at.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;   /* after the frame's blit */
++        at.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++        VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++        VkSubpassDescription sub = {};
++        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++        sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
++        VkSubpassDependency dep[2] = {};
++        dep[0].srcSubpass = VK_SUBPASS_EXTERNAL; dep[0].dstSubpass = 0;
++        dep[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
++        dep[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        dep[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        dep[1].srcSubpass = 0; dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
++        dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        dep[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++        VkRenderPassCreateInfo rci = {};
++        rci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++        rci.attachmentCount = 1; rci.pAttachments = &at;
++        rci.subpassCount = 1; rci.pSubpasses = &sub;
++        rci.dependencyCount = 2; rci.pDependencies = dep;
++        if (U.vkCreateRenderPass(U.vk.device, &rci, nullptr, &U.rp) != VK_SUCCESS) {
++            fprintf(stderr, "[ui] no render pass: the game runs without its menu\n");
++            U.rp = VK_NULL_HANDLE;
++            teardown_locked();
++            return;
++        }
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        VkImageViewCreateInfo vci = {};
++        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++        vci.image = images[i];
++        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vci.format = format;
++        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        VkImageView v = VK_NULL_HANDLE;
++        if (U.vkCreateImageView(U.vk.device, &vci, nullptr, &v) != VK_SUCCESS) {
++            fprintf(stderr, "[ui] no image view: the game runs without its menu\n");
++            teardown_locked();
++            return;
++        }
++        U.views.push_back(v);
++        VkFramebufferCreateInfo fci = {};
++        fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
++        fci.renderPass = U.rp; fci.attachmentCount = 1; fci.pAttachments = &v;
++        fci.width = width; fci.height = height; fci.layers = 1;
++        VkFramebuffer f = VK_NULL_HANDLE;
++        if (U.vkCreateFramebuffer(U.vk.device, &fci, nullptr, &f) != VK_SUCCESS) {
++            fprintf(stderr, "[ui] no framebuffer: the game runs without its menu\n");
++            teardown_locked();
++            return;
++        }
++        U.fbs.push_back(f);
++    }
++    if (!U.imgui_vk) {
++        ImGui_ImplVulkan_InitInfo ii = {};
++        ii.Instance = U.vk.instance; ii.PhysicalDevice = U.vk.phys; ii.Device = U.vk.device;
++        ii.QueueFamily = U.vk.queue_family; ii.Queue = U.vk.queue;
++        ii.DescriptorPool = U.pool; ii.RenderPass = U.rp;
++        ii.MinImageCount = count < 2 ? 2 : count;
++        ii.ImageCount = count < 2 ? 2 : count;
++        ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
++        const bool init = ImGui_ImplVulkan_Init(&ii);
++        if (!init || !ImGui_ImplVulkan_CreateFontsTexture()) {
++            if (init) ImGui_ImplVulkan_Shutdown();
++            fprintf(stderr, "[ui] the ImGui pipeline did not build: the game runs without its menu\n");
++            teardown_locked();
++            return;
++        }
++        U.imgui_vk = true;
++        if (U.image.ready && !U.image.ds)   /* a new format: the picture's set went with the old pipeline */
++            U.image.ds = ImGui_ImplVulkan_AddTexture(U.image.sampler, U.image.view,
++                                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        fprintf(stderr, "[ui] ready (%ux%u, %u images)\n", width, height, count);
++    }
++}
++
++int rsx_ui_vk_record(VkCommandBuffer cb, uint32_t image)
++{
++    if (!shown()) return 0;
++    std::lock_guard<std::mutex> g(U.lock);
++    if (U.shot.state == 1) shot_write_locked();   /* the previous pass's copy */
++    if (!U.ok || !U.imgui_vk || !U.have_snap || image >= U.fbs.size()) return 0;
++    if (U.image.want && !U.image.ready) image_upload_locked(cb);
++    VkRenderPassBeginInfo bi = {};
++    bi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
++    bi.renderPass = U.rp;
++    bi.framebuffer = U.fbs[image];
++    bi.renderArea.extent = { U.w, U.h };
++    U.vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
++    ImGui_ImplVulkan_RenderDrawData(&U.snap, cb);
++    U.vkCmdEndRenderPass(cb);
++    if (U.shot.path && U.shot.src && U.shot.state == 0 && ++U.shot.passes >= U.shot.after) shot_record_locked(cb, image);
++    return 1;
++}
++
++void rsx_ui_vk_shutdown(void)
++{
++    if (!U.tried) return;
++    std::lock_guard<std::mutex> g(U.lock);
++    /* A swapchain lost on the recording thread lands here on that one: the
++     * SDL side and the context wait for rsx_ui_reap on the window's. */
++    teardown_locked();
++}
++
++void rsx_ui_reap(void)
++{
++    if (!U.reap) return;
++    std::lock_guard<std::mutex> g(U.lock);
++    reap_locked();
++}
++
++} /* extern "C" */
+diff --git a/libs/video/rsx_ui.h b/libs/video/rsx_ui.h
+new file mode 100644
+index 00000000..7c0bac4c
+--- /dev/null
++++ b/libs/video/rsx_ui.h
+@@ -0,0 +1,87 @@
++/*
++ * ps3recomp - a user interface over the game's window (Dear ImGui, Vulkan)
++ *
++ * The port's in-game menu (F1) and FPS counter are drawn with this. Only a
++ * windowed run (PS3RECOMP_VK_WINDOW=1) has a UI; offscreen runs never start it. The
++ * frame is built on the thread that owns the SDL window (the rsx thread:
++ * events and SDL calls stay there), copied, and recorded into the swapchain
++ * image by whichever thread presents the window, after the game frame's blit.
++ * What is drawn is the port's: it registers a callback (rsx_ui_set_draw) and
++ * makes ImGui calls in it.
++ */
++#ifndef PS3RECOMP_RSX_UI_H
++#define PS3RECOMP_RSX_UI_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The port's widgets, called once per UI frame between ImGui::NewFrame and
++ * ImGui::Render. */
++void rsx_ui_set_draw(void (*draw)(void* user), void* user);
++
++/* The port's function keys: F2-F10 and F12 key presses (SDL keycodes) go to
++ * `fn` on the window's thread while no modal screen is up; it returns 1 when
++ * it used the key. */
++void rsx_ui_set_hotkey(int (*fn)(int key, void* user), void* user);
++
++/* Rsx thread: an SDL event (const SDL_Event*). Returns 1 when the UI took it
++ * and the game should not see it. */
++int  rsx_ui_event(const void* sdl_event);
++
++/* Rsx thread: build one UI frame and keep a copy for the next window
++ * present. Cheap when nothing is shown. */
++void rsx_ui_frame(void);
++
++/* Whether the menu is open (the game gets a neutral pad), and opening or
++ * closing it. */
++int  rsx_ui_menu_open(void);
++void rsx_ui_set_menu_open(int open);
++
++/* Whether anything is drawn at all (the menu, the start screen, the FPS
++ * counter): the present skips the UI pass when not. */
++void rsx_ui_set_visible(int visible);
++
++/* A screen that owns the window (the start screen): every event goes to the
++ * UI, F1 and Select+Start do nothing, Escape does not quit. */
++void rsx_ui_set_modal(int on);
++
++/* The monitor the window is on (SDL's index). */
++int  rsx_ui_display_index(void);
++
++/* Seconds since the previous rsx_ui_frame, for the port's FPS counter and
++ * hold-to-open timing. */
++double rsx_ui_frame_dt(void);
++
++/* Whether the UI is up: started, and not failed or torn down since. A start
++ * screen gives up waiting when it is not. */
++int  rsx_ui_available(void);
++
++/* The window's thread, every event pump: finish a teardown another thread
++ * started (the SDL side and the ImGui context live on this one). */
++void rsx_ui_reap(void);
++
++/* A picture for the port's screens, RGBA8, copied: uploaded by the next
++ * present. One per run. */
++void rsx_ui_set_image(const void* rgba, int w, int h);
++
++/* The picture as an ImTextureID once it is on the GPU, else NULL. From the
++ * draw callback only. */
++void* rsx_ui_image(int* w, int* h);
++
++/* The large font for titles (ImFont*), or NULL: the regular one then. */
++void* rsx_ui_title_font(void);
++
++/* The window full screen (desktop resolution) or not, and its state now
++ * (F11 / Alt+Enter change it behind the menu's back). From the draw callback
++ * or the window's thread. */
++void rsx_ui_set_fullscreen(int on);
++int  rsx_ui_fullscreen(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/libs/video/rsx_ui_vk.h b/libs/video/rsx_ui_vk.h
+new file mode 100644
+index 00000000..c4705297
+--- /dev/null
++++ b/libs/video/rsx_ui_vk.h
+@@ -0,0 +1,53 @@
++/*
++ * ps3recomp - rsx_ui.cpp's side of the Vulkan backend (rsx_vulkan_backend.c).
++ */
++#ifndef PS3RECOMP_RSX_UI_VK_H
++#define PS3RECOMP_RSX_UI_VK_H
++
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct rsx_ui_vk_info {
++    PFN_vkGetInstanceProcAddr gipa;
++    VkInstance       instance;
++    VkPhysicalDevice phys;
++    VkDevice         device;
++    uint32_t         queue_family;
++    VkQueue          queue;
++} rsx_ui_vk_info;
++
++/* Once the device exists and the window is open. Nothing is created yet: the
++ * pipeline needs the swapchain's format (rsx_ui_vk_swapchain). 0 when the UI
++ * can run, -1 when it is off (PS3RECOMP_UI=0) or cannot. */
++int  rsx_ui_vk_init(void* sdl_window, const rsx_ui_vk_info* info);
++
++/* After the swapchain is created or created again, with the device idle and
++ * on the thread that submits to the queue: the image views, the render pass,
++ * the framebuffers, and on the first call ImGui's pipeline and font texture.
++ * The images must allow VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. */
++void rsx_ui_vk_swapchain(VkFormat format, uint32_t count, const VkImage* images,
++                         uint32_t width, uint32_t height);
++
++/* After the game frame's blit into swapchain image `image`, which is in
++ * TRANSFER_DST_OPTIMAL: the UI pass over it. Returns 1 when it recorded one,
++ * which leaves the image in PRESENT_SRC_KHR; 0 when there is nothing to draw,
++ * and the caller makes the transition itself. */
++int  rsx_ui_vk_record(VkCommandBuffer cb, uint32_t image);
++
++/* The usage bits the UI needs on the swapchain images, out of what the
++ * surface supports: COLOR_ATTACHMENT for its pass, and TRANSFER_SRC while a
++ * screenshot is asked for (PS3RECOMP_UI_SHOT). 0 when the UI cannot draw. */
++VkImageUsageFlags rsx_ui_vk_image_usage(VkImageUsageFlags supported);
++
++/* Before the device goes, with nothing in flight. */
++void rsx_ui_vk_shutdown(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302e..da347b10 100644
+index db64302e..a6dee626 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
-@@ -2622,23 +2622,33 @@ static void vk_eng_snapshot_pool_drain(void)
+@@ -57,6 +57,10 @@
+  * opens the optional window. Same include style as those two. */
+ #include <SDL2/SDL.h>
+ #include <SDL2/SDL_vulkan.h>
++#ifdef PS3RECOMP_UI
++#include "rsx_ui.h"     /* the port's menu over the window (rsx_ui.cpp) */
++#include "rsx_ui_vk.h"
++#endif
+ 
+ #include <dlfcn.h>
+ #include <pthread.h>
+@@ -1714,11 +1718,18 @@ static int vk_env_on(const char* name)
+     return v && v[0] && v[0] != '0';
+ }
+ 
++#ifdef PS3RECOMP_UI
++static int s_vk_ui;     /* rsx_ui runs over the window */
++#endif
++
+ static void vk_window_drop(const char* why)
+ {
+     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
+     if (s_vk.device && pvkDeviceWaitIdle) {
+         vk_device_idle();
++#ifdef PS3RECOMP_UI
++        if (s_vk_ui) { rsx_ui_vk_shutdown(); s_vk_ui = 0; }
++#endif
+         for (u32 i = 0; i < 8; i++)
+             if (s_vk.sc_done[i]) {
+                 pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
+@@ -1845,8 +1856,15 @@ static int vk_create_swapchain(void)
+         .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+         .clipped = VK_TRUE, .oldSwapchain = old,
+     };
++#ifdef PS3RECOMP_UI
++    /* + what the UI draws with (a colour attachment) */
++    if (s_vk_ui) sci.imageUsage |= rsx_ui_vk_image_usage(caps.supportedUsageFlags);
++#endif
+     VkSwapchainKHR sc = VK_NULL_HANDLE;
+     VkResult r = pvkCreateSwapchainKHR(s_vk.device, &sci, NULL, &sc);
++#ifdef PS3RECOMP_UI
++    if (old && s_vk_ui) rsx_ui_vk_swapchain(fmt.format, 0, NULL, 0, 0);   /* its views first */
++#endif
+     if (old) pvkDestroySwapchainKHR(s_vk.device, old, NULL);
+     s_vk.swapchain = VK_NULL_HANDLE;
+     if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
+@@ -1868,6 +1886,10 @@ static int vk_create_swapchain(void)
+ 
+     s_vk.sc_extent = ext;
+     s_vk.sc_count = n;
++#ifdef PS3RECOMP_UI
++    if (s_vk_ui && (sci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
++        rsx_ui_vk_swapchain(fmt.format, n, s_vk.sc_images, ext.width, ext.height);
++#endif
+     VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+     return 0;
+ }
+@@ -1922,6 +1944,10 @@ static void vk_present_window(void)
+     b.dstAccessMask = 0;
+     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++#ifdef PS3RECOMP_UI
++    /* The UI's pass over the blit leaves the image ready to present itself. */
++    if (!(s_vk_ui && rsx_ui_vk_record(cb, idx)))
++#endif
+     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           0, 0, NULL, 0, NULL, 1, &b);
+     if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
+@@ -2622,23 +2648,33 @@ static void vk_eng_snapshot_pool_drain(void)
      vk_destroy_buffer(&s_snap_st);
  }
  
@@ -3436,7 +4625,7 @@ index db64302e..da347b10 100644
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT)) {
          vk_destroy_image(&o->im);
-@@ -2646,7 +2656,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+@@ -2646,7 +2682,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
          return 0;
      }
      o->kind = VK_ENG_COLOR; o->snapshot = 1;
@@ -3445,7 +4634,7 @@ index db64302e..da347b10 100644
      if (vk_begin()) { vk_eng_release(user, hd); return 0; }
      vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                       reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
-@@ -2654,7 +2664,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+@@ -2654,7 +2690,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
      VkImageCopy c = {
          .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
          .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -3454,7 +4643,7 @@ index db64302e..da347b10 100644
      };
      pvkCmdCopyImage(s_vk.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL,
                      o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-@@ -3764,6 +3774,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3764,6 +3800,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .depth_target_release = vk_eng_release,
      .depth_snapshot       = vk_eng_depth_snapshot,
      .color_snapshot       = vk_eng_color_snapshot,
@@ -3462,6 +4651,53 @@ index db64302e..da347b10 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
+@@ -3937,6 +3974,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+     if (vk_submit_and_wait()) return -1;
+ 
+     if (s_vk.windowed) {
++#ifdef PS3RECOMP_UI
++        { rsx_ui_vk_info ui = { pvkGetInstanceProcAddr, s_vk.instance, s_vk.phys, s_vk.device,
++                                s_vk.queue_family, s_vk.queue };
++          s_vk_ui = rsx_ui_vk_init(s_vk.window, &ui) == 0; }
++#endif
+         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+         if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
+             vk_create_swapchain())
+@@ -4027,10 +4069,24 @@ void rsx_vulkan_backend_shutdown(void)
+ 
+ int rsx_vulkan_backend_pump_messages(void)
+ {
++#ifdef PS3RECOMP_UI
++    rsx_ui_reap();                  /* a teardown on another thread */
++#endif
+     if (!s_vk.windowed) return 0;
+     int quit = 0;
+     SDL_Event e;
+     while (SDL_PollEvent(&e)) {
++#ifdef PS3RECOMP_UI
++        /* The menu takes what it uses (F1, F10, everything while it is open). */
++        if (e.type != SDL_QUIT && s_vk_ui && rsx_ui_event(&e)) continue;
++        /* F11 or Alt+Enter: full screen and back. */
++        if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
++            (e.key.keysym.sym == SDLK_F11 ||
++             (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
++            rsx_ui_set_fullscreen(!rsx_ui_fullscreen());
++            continue;
++        }
++#endif
+         if (e.type == SDL_QUIT) quit = 1;
+         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+     }
+@@ -4046,6 +4102,9 @@ void rsx_vulkan_backend_present(void)
+ void rsx_vulkan_backend_present_begin(void)
+ {
+     if (!s_vk.device) return;
++#ifdef PS3RECOMP_UI
++    if (s_vk_ui) rsx_ui_frame();    /* the window's thread: SDL and ImGui stay there */
++#endif
+     s_vk.present_split = 1;
+     if (s_vk.eng_active) rsx_draw_engine_present();
+     else                 vk_cb_present(&s_vk, 0);
 diff --git a/libs/video/tests/test_fp_decompiler.c b/libs/video/tests/test_fp_decompiler.c
 index 033d2528..370e7dae 100644
 --- a/libs/video/tests/test_fp_decompiler.c
@@ -3569,10 +4805,74 @@ index 15d4ef60..ebb5bce3 100644
      /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
       * call it makes. WAITBT_EVERY only samples threads that are blocking on an
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index 9cb50400..5ab346aa 100644
+index 9cb50400..add57400 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
-@@ -596,6 +596,7 @@ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int,
+@@ -409,13 +409,35 @@ static void sys_lwcond_create(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
++/* Wake channel for the poll-style wait below. The wait used to be a bare
++ * Sleep(1) with the signals no-ops, so every hand-off through an lwcond cost a
++ * millisecond or more (Pacific Rift's job-worker pool, Bink's IO/audio threads:
++ * 7-10 threads parked here, each wake a timer expiry). A signal now bumps the
++ * bucket's generation and wakes its waiters at once; the 1 ms bound stays as
++ * the fallback, so a wake that is never signalled is no slower than before.
++ * Waking more than the guest asked for is fine: lwcond waits may wake
++ * spuriously and every caller re-checks its predicate. */
++#include <mutex>
++#include <condition_variable>
++namespace {
++struct LwcBucket { std::mutex m; std::condition_variable cv; uint64_t gen = 0; };
++LwcBucket g_lwc[64];
++LwcBucket& lwc_bucket(uint32_t lwcond) { return g_lwc[(lwcond * 2654435761u) >> 26]; }
++}
++static void lwc_wake(uint32_t lwcond)
++{
++    LwcBucket& b = lwc_bucket(lwcond);
++    { std::lock_guard<std::mutex> g(b.m); b.gen++; }
++    b.cv.notify_all();
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }
+ /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++ * signaler. Release the paired lwmutex, wait for a signal (at most ~1 ms),
++ * reacquire; the guest's while(!predicate) loop re-checks. The generation is
++ * read before the lwmutex is released, so a signal made under the lwmutex
++ * after that cannot be missed. Handles the common single (non-recursive) hold. */
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+@@ -424,11 +446,20 @@ static void sys_lwcond_wait(ppu_context* ctx)
+     if (sl) {
+         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++        LwcBucket& b = lwc_bucket(lwcond);
++        uint64_t gen0;
++        { std::lock_guard<std::mutex> g(b.m); gen0 = b.gen; }
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ppu_thread_note_block(ctx->thread_id);
+         lwm_release(sl);
+-        Sleep(1);
++        static int s_old = -1;   /* PS3_LWCOND_SLEEP=1: the old bare Sleep(1), for A/B */
++        if (s_old < 0) s_old = getenv("PS3_LWCOND_SLEEP") ? 1 : 0;
++        if (s_old) Sleep(1);
++        else {
++            std::unique_lock<std::mutex> g(b.m);
++            b.cv.wait_for(g, std::chrono::microseconds(1000), [&] { return b.gen != gen0; });
++        }
+         lwm_acquire(sl, 0);
+         vm_write32(lwmutex + LWM_OWNER, own);
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+@@ -596,6 +627,7 @@ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int,
  extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
  extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
  extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
@@ -3580,7 +4880,7 @@ index 9cb50400..5ab346aa 100644
  static uint32_t g_net_errno_ea = 0;
  static void hle_net_errno_loc(ppu_context* ctx)
  {
-@@ -932,6 +933,10 @@ extern "C" void ppu_sysprx_register(void)
+@@ -932,6 +964,10 @@ extern "C" void ppu_sysprx_register(void)
      cellSaveData_register_ctx_handlers();
      /* cellVideoOutSetGamma's float argument is in f1. */
      avconf_register_ctx();
@@ -3758,6 +5058,46 @@ index 5fc50208..17d028f2 100644
                return;
            } }
          spu_halt(ctx);
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index c5ccbec7..8c59b682 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -532,6 +532,17 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+ #endif
+ #if defined(__ARM_NEON)
+ #include <arm_neon.h>     /* the quadword swap is one rev32 */
++#elif defined(__SSSE3__) && !defined(SPU_LS_NO_SSSE3)   /* SPU_LS_NO_SSSE3: the old form, for A/B */
++#include <tmmintrin.h>    /* ...and on x86 one pshufb */
++/* Byte-reverse each 32-bit word: the memcpy+bswap form below is NOT turned
++ * into a shuffle by clang -- it became four 32-bit loads, two shifts/ors and
++ * two bswap'd 64-bit stores per quadword (~11 instructions for every lqd/stqd
++ * of the Bink decoder), so the shuffle is written out. */
++#define SPU_LS_SSSE3 1
++static inline __m128i spu_ls_bswap32x4(__m128i v)
++{
++    return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
++}
+ #endif
+ 
+ /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
+@@ -628,6 +639,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+     const uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
++#elif defined(SPU_LS_SSSE3)
++    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap32x4(_mm_loadu_si128((const __m128i*)p)));
+ #elif SPU_LS_FAST
+     uint32_t w0, w1, w2, w3;
+     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+@@ -725,6 +738,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+     uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
++#elif defined(SPU_LS_SSSE3)
++    _mm_storeu_si128((__m128i*)p, spu_ls_bswap32x4(_mm_loadu_si128((const __m128i*)val._u8)));
+ #elif SPU_LS_FAST
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
 diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
 index 8c4ccaa8..f9bc7867 100644
 --- a/runtime/spu/spu_dma.h
