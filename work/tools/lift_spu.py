@@ -30,6 +30,10 @@ runs on the SPUs and how the port's runtime dispatches each kind:
     are passed as --handled (interpreter route), not lifted.
 
 Usage: work/tools/lift_spu.py [--eboot ELF] [--toolkit DIR] [--spu-dir DIR]
+  SPU_OUT=<dir>          output directory (default work/port/spu; --spu-dir wins)
+  SPU_LIFT_EXTRA="..."   extra spu_lifter.py options for EVERY lift (ELFs, job
+                         modules, PM, MultiStream DSP), passed down as
+                         SPU_LIFTER_ARGS, e.g. "--local-regs --const-bi"
 Exits nonzero if any expected kind is missing or any tool fails. The output
 directory is deleted and rebuilt on every run.
 """
@@ -237,7 +241,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eboot", default=str(ROOT / "disc/PS3_GAME/USRDIR/EBOOT.elf"))
     ap.add_argument("--toolkit", default=os.environ.get("PS3RECOMP_DIR") or str(ROOT / "ps3recomp"))
-    ap.add_argument("--spu-dir", default=str(ROOT / "work/port/spu"))
+    ap.add_argument("--spu-dir", default=os.environ.get("SPU_OUT") or str(ROOT / "work/port/spu"))
     args = ap.parse_args()
 
     tools = Path(args.toolkit).resolve() / "tools"
@@ -245,6 +249,10 @@ def main():
         die(f"no toolkit at {args.toolkit}")
     py = sys.executable
     spu = Path(args.spu_dir).resolve()
+    extra = os.environ.get("SPU_LIFT_EXTRA", "").strip()
+    os.environ["SPU_LIFTER_ARGS"] = extra       # inherited by every lift below
+    if extra:
+        print(f"[lift_spu] extra lifter options for every lift: {extra}")
     eb = Eboot(args.eboot)
     exact = hashlib.sha256(eb.d).hexdigest() == EXPECT_SHA256
     if not exact:
@@ -342,6 +350,7 @@ __attribute__((constructor)) static void port_wws_pm_register_ctor(void)
 
     manifest = dict(
         eboot_sha256=hashlib.sha256(eb.d).hexdigest(),
+        lifter_args=os.environ.get("SPU_LIFTER_ARGS", ""),
         wws_pm=dict(ea=hex(pm["ea"]), size=hex(pm["raw_size"]), rounded=hex(rounded), ls=hex(PM_LSA),
                     image_id=PM_IMAGE_ID, fingerprints=[f"0x{f:016X}" for f in fps],
                     extra_entries=[hex(a) for a in extra]),

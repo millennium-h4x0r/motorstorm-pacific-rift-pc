@@ -12,4 +12,4 @@ PY="${PYTHON:-.venv/bin/python}"
 exec "$PY" work/tools/lift_spu.py \
     --eboot "${1:-disc/PS3_GAME/USRDIR/EBOOT.elf}" \
     --toolkit "${PS3RECOMP_DIR:-ps3recomp}" \
-    --spu-dir work/port/spu
+    --spu-dir "${SPU_OUT:-work/port/spu}"

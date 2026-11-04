@@ -37,11 +37,26 @@ ROOT = Path(__file__).resolve().parents[2]
 PLUGINS = {
     "mstream_dsp_filter.pic": 0x38700,
     "mstream_dsp_i3dl2.pic": 0x35E80,
+    # Free-Play race (Kanaloa Bay), from SPU_INTERP_STATS and a local-store dump: the
+    # interpreter ran ~30% of the MultiStream core thread on these three.
+    "mstream_dsp_aux_return.pic": 0x35E80,
+    "mstream_dsp_multi_compressor_TD.": 0x36300,   # the ELF note is truncated to 32 bytes
+    "mstream_dsp_aux_send.pic": 0x37080,
 }
 # Entry points reached only through pointers, as offsets from the image base.
 ENTRIES = {
     "mstream_dsp_filter.pic": [0x90, 0x3D0],
     "mstream_dsp_i3dl2.pic": [0x90, 0x98, 0xF0, 0x510, 0xCC0, 0xFF0],
+    "mstream_dsp_aux_return.pic": [0x90, 0xF0],
+    "mstream_dsp_multi_compressor_TD.": [0x90, 0xB70],
+    "mstream_dsp_aux_send.pic": [0x90, 0xF0],
+}
+# Byte ranges (offsets from the plugin base, [start, end)) left out of the code check that
+# gates dispatch. aux_send: the quadword at +0x980 (the head of a routine, `rchcnt $2,
+# SPU_RdInMbox; brnz ...`) is overwritten with data once the plugin is installed, so a
+# check of the whole .text never passed and the plugin stayed interpreted.
+VERIFY_SKIP = {
+    "mstream_dsp_aux_send.pic": [(0x980, 0x990)],
 }
 # Firmware decoders the core loads from dev_flash the same way (lifted from the
 # user's own dev_flash, $PS3_DEV_FLASH, default ~/.config/rpcs3/dev_flash; skipped
@@ -153,6 +168,14 @@ def main():
         text = elf[toff:toff + tsize]
         rows = ",\n".join("    " + ", ".join(f"0x{x:02X}" for x in text[i:i + 16])
                           for i in range(0, len(text), 16))
+        # verified runs of .text: everything but VERIFY_SKIP (offsets from the base)
+        cuts, pos = [], 0
+        for a, b in sorted(VERIFY_SKIP.get(note, [])):
+            a, b = max(a - taddr, 0), min(b - taddr, tsize)
+            if a > pos: cuts.append((pos, a))
+            pos = max(pos, b)
+        if pos < tsize: cuts.append((pos, tsize))
+        segs = ", ".join(f"{{ 0x{base + taddr + a:05X}u, 0x{b - a:X}u, {tag}_text + 0x{a:X} }}" for a, b in cuts)
         with open(out / "spu_recomp.c", "a", encoding="utf-8", newline="\n") as f:
             f.write(f"""
 /* ---- appended by work/tools/lift_ms_dsp.py --------------------------------------
@@ -169,8 +192,8 @@ static const unsigned char {tag}_text[0x{tsize:X}] = {{
 __attribute__((constructor)) static void {tag}_register(void)
 {{
     spu_begin_image({img}); {tag}_spu_recomp_register(); spu_begin_image(0);
-    const spu_overlay_code_segment seg = {{ 0x{base + taddr:05X}u, sizeof {tag}_text, {tag}_text }};
-    spu_overlay_register_pinned(0x{base + taddr:05X}u, sizeof {tag}_text, {img}, &seg, 1);
+    const spu_overlay_code_segment seg[] = {{ {segs} }};
+    spu_overlay_register_pinned(0x{base + taddr:05X}u, sizeof {tag}_text, {img}, seg, sizeof seg / sizeof seg[0]);
 }}
 """)
         print(f"[lift_ms_dsp] {note}: image {img} at LS 0x{base:05X} -> {out}")

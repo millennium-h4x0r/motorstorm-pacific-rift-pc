@@ -55,10 +55,10 @@ index 250d8d2c..bb962cd8 100644
      message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
  endif()
 diff --git a/docs/BUILDING.md b/docs/BUILDING.md
-index 3bbabf62..86cbea9b 100644
+index 3bbabf62..515d3825 100644
 --- a/docs/BUILDING.md
 +++ b/docs/BUILDING.md
-@@ -284,6 +284,11 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+@@ -284,6 +284,13 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
  | `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
  | `RSX_ENGINE_COHERENCE_LOG=<n>` | Log the first *n* syncs between guest memory and the engine's surfaces around NV3089 transfers, with how many non-zero pixels moved |
  | `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
@@ -66,6 +66,8 @@ index 3bbabf62..86cbea9b 100644
 +| `PS3RECOMP_ENG_SMALL_WRITEBACK=<pixels>` | Colour targets of at most this many pixels (default 1024) that were rendered in the frame are stored to guest memory at each present, for titles that read a reduction target with the CPU; 0 turns it off |
 +| `PS3RECOMP_ENG_CORNER=0` | A linear texture smaller than the colour target it points into, at the target's pitch, samples the whole target instead of a copy of its top-left corner (`eng_surface_corner`). The corner copy is what dynamic-resolution titles need; this switch is for A/B tests |
 +| `PS3RECOMP_ENG_REINTERPRET=0` | Turn off the GPU reinterpretations, so these reads go through guest memory again (a readback and a CPU decode): an A8R8G8B8 colour target sampled as Y16_X16_FLOAT, and (on a backend without `depth_as_color`) a Z24S8 depth target sampled as A8R8G8B8 |
++| `PS3RECOMP_SPIRV_CACHE=<dir>` | Keep the Vulkan backend's HLSL -> SPIR-V translations on disk in an existing *dir*, one file per shader keyed by stage and the whole HLSL text and checked against the glslang version and the translator's build, so a later run loads them instead of running glslang (20-150 ms each, on the FIFO thread). A port may set a default |
++| `PS3RECOMP_SPIRV_LOG=1` | One line per shader that was not already in memory: stage, whether it came from disk or glslang, what it cost, the running counts and a steady-clock time stamp in microseconds |
 +| `RSX_ENGINE_DROP_LOG=1` | Every 300 frames, print how many draw groups reached the engine, how many it drew, and how many it dropped at each early exit of `sink_end` (numbered `#n` in source order) |
  | `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
  
@@ -2641,7 +2643,7 @@ index 9ab90ee1..d3c697c4 100644
      u8  channel;
      u8  encoder;
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c6..185f0da6 100644
+index 82ea66c6..503e7432 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -27,6 +27,45 @@
@@ -2690,7 +2692,38 @@ index 82ea66c6..185f0da6 100644
  uint32_t g_ydkj_real_taskid     = 0;
  uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
  
-@@ -907,9 +946,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+@@ -452,7 +491,12 @@ static struct SpursInst {
+     int kernel_live, stopping, starting;
+     int kick;   /* an SPU committed the request line since the coordinator last looked */
+     SRWLOCK lock;
+-    CONDITION_VARIABLE wake;
++    CONDITION_VARIABLE wake;    /* policy-module workers wait here for their slot */
++    /* The coordinator's own wait. Request-line commits (every SPU PUTLLC and
++     * PPU stwcx. on the line, thousands a second) and worker exits used to
++     * broadcast `wake`, waking all five idle workers each time just to go back
++     * to sleep: ~8% of the race's SPU job threads in futex/condvar traffic. */
++    CONDITION_VARIABLE kwake;
+     HANDLE coordinator;
+     struct SpursPmSlot slots[6];
+     u8 active[16], idle[16];
+@@ -482,7 +526,7 @@ static void spurs_line_committed(uint32_t line)
+         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE))
+             continue;
+         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
+-        WakeAllConditionVariable(&si->wake);
++        WakeAllConditionVariable(&si->kwake);
+     }
+ }
+ static void spurs_commit_hook(uint32_t line)
+@@ -523,6 +567,7 @@ static void spurs_api_unlock(struct SpursInst* si)
+ {
+     ReleaseSRWLockExclusive(&s_workload_registry_lock);
+     WakeAllConditionVariable(&si->wake);
++    WakeAllConditionVariable(&si->kwake);
+     ReleaseSRWLockExclusive(&si->lock);
+ }
+ 
+@@ -907,9 +952,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
      /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
       * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
       * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
@@ -2702,26 +2735,152 @@ index 82ea66c6..185f0da6 100644
  
      g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
      printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
-@@ -3405,38 +3445,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -1394,6 +1440,17 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
+     s32 lock_rc = spurs_api_lock(spurs_ea, &si);
+     if (lock_rc) return lock_rc;
+     const u8* priority_h = GUEST_PTR(priority, const u8*);
++    /* SPURS_MAXCONT_MIN=<n> (experiment): run every policy-module workload added here on up to
++     * n virtual SPUs at once, whatever maxContention the title asked for. A WWS job manager
++     * claims jobs from its list atomically and orders them with its own barrier commands, so
++     * a list can be shared by several SPUs; whether a title's jobs tolerate it is the title's
++     * business, hence opt-in. Unset: the title's maxContention, as on hardware. */
++    { const char* e = getenv("SPURS_MAXCONT_MIN");
++      const u32 floor_n = e ? (u32)atoi(e) : 0u;
++      if (floor_n > maxContention) {
++          printf("[cellSpurs] SPURS_MAXCONT_MIN: maxContention %u -> %u\n", maxContention, floor_n);
++          maxContention = floor_n;
++      } }
+ 
+ 
+     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+@@ -1714,6 +1771,34 @@ static WklPm* spurs_resolve_pm(u32 wid)
+  * occupies only its own slot; a later runnable producer can use another slot.
+  * Admission and lifecycle state are serialized per instance. Guest execution
+  * never runs under that lock, and only a genuine return releases contention. */
++/* SPURS_DISPATCH_STATS=1: every 2 s, per workload: dispatches found by a
++ * request (kick) vs by an idle probe, runs that polled (did work), time spent
++ * in runs, and the mean gap from a run ending to the next dispatch. */
++static struct { unsigned kick, probe, worked; unsigned long long run_ns, gap_ns, gaps, end_ns, start_ns; } s_dstat[16];
++static int spurs_dstat_on(void) { static int v = -1; if (v < 0) v = getenv("SPURS_DISPATCH_STATS") ? 1 : 0; return v; }
++static unsigned long long spurs_now_ns(void)
++{
++    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
++    return (unsigned long long)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
++}
++static void spurs_dstat_print(void)
++{
++    static unsigned long long t0;
++    const unsigned long long now = spurs_now_ns();
++    if (!t0) { t0 = now; return; }
++    if (now - t0 < 2000000000ull) return;
++    for (int w = 0; w < 16; w++) {
++        if (!s_dstat[w].kick && !s_dstat[w].probe) continue;
++        fprintf(stderr, "[spurs-dstat] wid %d: kick %u probe %u worked %u, run %.1f ms, gap mean %.3f ms (%llu) in %.1f s\n",
++                w, s_dstat[w].kick, s_dstat[w].probe, s_dstat[w].worked, s_dstat[w].run_ns / 1e6,
++                s_dstat[w].gaps ? s_dstat[w].gap_ns / 1e6 / s_dstat[w].gaps : 0.0, s_dstat[w].gaps, (now - t0) / 1e9);
++        const unsigned long long e = s_dstat[w].end_ns;
++        memset(&s_dstat[w], 0, sizeof s_dstat[w]);
++        s_dstat[w].end_ns = e;
++    }
++    t0 = now;
++}
++
+ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+ {
+     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
+@@ -1735,6 +1820,13 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+         unsigned polls = g_spurs_pm_polls;
+         AcquireSRWLockExclusive(&si->lock);
+         u32 wid = slot->wid;
++        if (spurs_dstat_on() && wid < 16) {
++            const unsigned long long now = spurs_now_ns();
++            s_dstat[wid].run_ns += now - s_dstat[wid].start_ns;
++            s_dstat[wid].end_ns = now;
++            if (polls) s_dstat[wid].worked++;
++            spurs_dstat_print();
++        }
+         if (si->active[wid]) si->active[wid]--;
+         spu_lockline_lock();
+         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+@@ -1742,7 +1834,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+         if (polls) si->idle[wid] = 0;
+         else if (si->idle[wid] < 4) si->idle[wid]++;
+         slot->busy = 0;
+-        WakeAllConditionVariable(&si->wake);
++        WakeAllConditionVariable(&si->kwake);   /* a free slot: only the coordinator cares */
+     }
+     ReleaseSRWLockExclusive(&si->lock);
+     ps3_tprof_thread_exit();
+@@ -1767,7 +1859,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
+             kick_pass = ++kick_run < 16;
+         } else {
+-            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
++            SleepConditionVariableSRW(&si->kwake, &si->lock, 1, 0);
+             /* This full pass reads the line after any commit that woke it. */
+             (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
+         }
+@@ -1812,6 +1904,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 slot->pm_size = s_workloads[wid].sizePm;
+                 slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+                 slot->wid = wid; slot->ea = ea;
++                if (spurs_dstat_on() && wid < 16) {
++                    const unsigned long long now = spurs_now_ns();
++                    if (kicked) s_dstat[wid].kick++; else s_dstat[wid].probe++;
++                    if (s_dstat[wid].end_ns) { s_dstat[wid].gap_ns += now - s_dstat[wid].end_ns; s_dstat[wid].gaps++; }
++                    s_dstat[wid].start_ns = now;
++                }
+                 si->active[wid]++;
+                 spu_lockline_lock();
+                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+@@ -1847,7 +1945,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+     return CELL_OK;
+ failed:
+     AcquireSRWLockExclusive(&si->lock);
+-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
++    si->stopping = 1; WakeAllConditionVariable(&si->wake); WakeAllConditionVariable(&si->kwake);
+     ReleaseSRWLockExclusive(&si->lock);
+     for (u32 sn = 0; sn < si->nspus; sn++) {
+         HANDLE h = si->slots[sn].thread;
+@@ -1866,7 +1964,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
+     if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+     for (u32 wid = 0; wid < 16; wid++)
+         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
++    si->stopping = 1; WakeAllConditionVariable(&si->wake); WakeAllConditionVariable(&si->kwake);
+     ReleaseSRWLockExclusive(&si->lock);
+     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
+     for (u32 sn = 0; sn < si->nspus; sn++) {
+@@ -3405,38 +3503,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
      return CELL_OK;
  }
  
 -/* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
 - *      const void* buffer, u32 size, u32 depth, u32 direction)
-+/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
-  *
+- *
 - * This one CANNOT be a stub, because the consumer is recompiled SPU code that
 - * reads the queue out of main memory itself. Disassembling image 1 around the
 - * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
 - * a 128-byte line at LS 0x80 and commits it with
+- *
+- *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
+- *   rdch MFC_RdAtomicStat ; brnz -> retry
+- *
+- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
+- * bytes in guest memory ARE the interface, and they have to be the real
+- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
++/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
+  *
+- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
 + * Ported from the MotorStorm Apocalypse port (its toolkit patch), where the
 + * layout and protocol were read out of the libspurs task-side LFQueue code
 + * linked into an SPU zlib task. The consumer is recompiled SPU task code that
 + * works on the queue line in main memory with GETLLAR/PUTLLC, so the bytes ARE
 + * the interface. The PPU push is the pop protocol mirrored.
   *
-- *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
-- *   rdch MFC_RdAtomicStat ; brnz -> retry
+- * The title's own call corroborates the size: it passes q=0x4059FD00 with
+- * buffer=0x4059FD80, exactly 128 bytes later.
 + *   +0x00 u16 pop  done index      +0x08 u16 push done index
 + *   +0x02 u16 pop  done bitmap     +0x0A u16 push done bitmap
 + *   +0x04 u16 pop  waiters (dir 3) +0x0C u16 push waiters (dir 3)
@@ -2732,16 +2891,6 @@ index 82ea66c6..185f0da6 100644
 + *   +0x50 u16 push waiters  +0x52 u16 push waiter ids[15]
 + *   +0x70 u64 owner (taskset, or SPURS|1)
   *
-- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
-- * bytes in guest memory ARE the interface, and they have to be the real
-- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
-- *
-- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
-- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
-- *
-- * The title's own call corroborates the size: it passes q=0x4059FD00 with
-- * buffer=0x4059FD80, exactly 128 bytes later.
-- *
 - * NOTE: libs/sync/cellSync.c has a CellSyncLFQueue too, but that one is a
 - * HOST-native struct (atomic_uint, a 64-bit host buffer pointer). It is fine
 - * for a queue both of whose ends are HLE, and completely wrong here -- writing
@@ -2781,7 +2930,7 @@ index 82ea66c6..185f0da6 100644
  s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                  u32 size, u32 depth, u32 direction)
  {
-@@ -3445,30 +3496,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+@@ -3445,30 +3554,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
  
      uint32_t q = (uint32_t)queue_ea;
      for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
@@ -2818,7 +2967,7 @@ index 82ea66c6..185f0da6 100644
                 (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
      return CELL_OK;
  }
-@@ -3479,3 +3517,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3479,3 +3575,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
      return CELL_OK;
  }
@@ -3040,7 +3189,7 @@ index 298ee7de..88d4497c 100644
      /* The guest struct is two 4-byte EAs, not two host pointers. */
      vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff6011..719257d8 100644
+index 8dff6011..098ef751 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -106,9 +106,16 @@ typedef struct {
@@ -3078,7 +3227,32 @@ index 8dff6011..719257d8 100644
  
  } eng_texture;
  
-@@ -699,6 +710,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -267,6 +278,24 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
+     s_guest_user = user;
+ }
+ 
++/* RSX_ENGINE_PROFILE=1 (diagnostic): wall time of the phases of sink_end and
++ * of the whole FIFO thread between presents, averaged per frame and printed
++ * every 120 frames. */
++enum { EP_LAYOUT, EP_FETCH, EP_PIPE, EP_TEX, EP_CONST, EP_BIND, EP_DRAW, EP_N };
++static const char* const kEpName[EP_N] = { "layout", "fetch", "pipeline", "textures",
++                                           "constants", "bind", "draw" };
++static u64 s_ep_ns[EP_N], s_ep_draws, s_ep_frame0;
++static u64 s_tx_dec_ns, s_tx_slot_ns, s_tx_view_ns, s_tx_units;
++static u64 s_tx_conv_ns[6], s_tx_conv_n[6], s_tx_real[3];   /* corner, reinterp, zbytes, zsnap, feedback, zguest */
++static u64 s_ep_full_hash, s_ep_full_bytes, s_ep_full_io, s_ep_full_sparse, s_ep_full_sched, s_ep_sparse, s_ep_slot_ns, s_ep_full_ns;
++static int s_ep_on = -1;
++static inline u64 ep_now(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
++}
++#define EP_ON() (s_ep_on > 0)
++#define EP_MARK(phase, t) do { if (EP_ON()) { const u64 _n = ep_now(); s_ep_ns[phase] += _n - (t); (t) = _n; } } while (0)
+ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+                                u32 min_bytes)
+ {
+@@ -699,6 +728,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
  
      eng_surface* s = &g.surfaces[slot];
      if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
@@ -3087,7 +3261,7 @@ index 8dff6011..719257d8 100644
      if (s->handle) g.be->color_target_release(g.be->user, s->handle);
      s->location = location; s->offset = offset;
      s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
-@@ -856,6 +869,7 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
+@@ -856,6 +887,7 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
      }
  }
  
@@ -3095,7 +3269,7 @@ index 8dff6011..719257d8 100644
  void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
  {
      if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
-@@ -879,7 +893,8 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -879,7 +911,8 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
      const u32 n = (skip + bytes + bpp - 1u) / bpp;
      u8* rows = eng_coherence_buffer(n * bpp * h);
      if (!rows) return;
@@ -3105,7 +3279,7 @@ index 8dff6011..719257d8 100644
      g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
      if (eng_coherence_log())
          fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
-@@ -1000,7 +1015,9 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -1000,7 +1033,9 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
      if (z->conv) g.be->texture_release(g.be->user, z->conv);
      if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
@@ -3115,7 +3289,7 @@ index 8dff6011..719257d8 100644
      z->location = location; z->offset = offset;
      z->w = want_w; z->h = want_h;
      z->handle = handle;
-@@ -1212,6 +1229,52 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
+@@ -1212,6 +1247,52 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
      return hash;
  }
  
@@ -3168,7 +3342,15 @@ index 8dff6011..719257d8 100644
  /* Whether a cached texture gets the full hash at this use: always when it
   * is small or under PS3RECOMP_ENG_TEXHASH_FULL=1 (the old behaviour, read
   * at engine init), otherwise once ENG_TEXHASH_FULL_EVERY frames have passed
-@@ -1374,10 +1437,17 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1367,6 +1448,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             u64 hash = e->content_hash;
+             const u64 sparse = eng_texture_sparse_hash(location, offset, span,
+                                                        &readable);
++            if (EP_ON()) s_ep_sparse++;
+             /* The engine just stored a surface or depth target over these
+              * bytes: they are new, so upload without hashing them all. The
+              * stored hash becomes unknown and the next ordinary check
+@@ -1374,10 +1456,25 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (e->rewritten && readable) {
                  hash = ~e->content_hash;
                  e->rewritten = 0;
@@ -3181,16 +3363,24 @@ index 8dff6011..719257d8 100644
 +                    ? eng_io_written_gen(offset, span) : 0u;
 +                if (readable && (sparse != e->sparse_hash || io_gen > e->io_gen ||
 +                                 eng_texture_full_rehash(span, e->last_full_frame))) {
++                    if (EP_ON()) {
++                        s_ep_full_hash++; s_ep_full_bytes += span;
++                        if (sparse != e->sparse_hash) s_ep_full_sparse++;
++                        else if (io_gen > e->io_gen) s_ep_full_io++;
++                        else s_ep_full_sched++;
++                    }
++                    const u64 fh_t = EP_ON() ? ep_now() : 0;
 +                    /* Take the generation before reading: a write that lands
 +                     * during the hash leaves a newer one for the next use. */
 +                    e->io_gen = __atomic_load_n(&s_io_gen, __ATOMIC_RELAXED);
 +                    hash = eng_texture_content_hash(location, offset, span, &readable);
 +                    e->last_full_frame = g.frames;
++                    if (EP_ON()) s_ep_full_ns += ep_now() - fh_t;
 +                }
              }
              if (readable) e->sparse_hash = sparse;
              e->last_hash_frame = g.frames;
-@@ -1422,6 +1492,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1422,6 +1519,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
      e.last_hash_frame = g.frames;
      e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
      e.last_use_serial = ++g.texture_use_serial;
@@ -3198,7 +3388,7 @@ index 8dff6011..719257d8 100644
      { int readable = 0;
        e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
        e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
-@@ -1579,6 +1650,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+@@ -1579,6 +1677,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
      for (u32 i = 0; i < n_targets; i++) {
          g.surfaces[targets[i]].color_serial = serial;
          g.surfaces[targets[i]].guest_dirty = 1;
@@ -3206,7 +3396,7 @@ index 8dff6011..719257d8 100644
      }
  }
  
-@@ -2314,7 +2386,11 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -2314,7 +2413,11 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
      /* Only a topology this engine rebuilds through an index buffer may share
       * repeated references. A line strip or a point list is drawn in the order
       * it arrived, so collapsing duplicates would reorder it. */
@@ -3219,7 +3409,7 @@ index 8dff6011..719257d8 100644
          u32 unique = dc.n_refs;
          if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
              dc.refs_remapped = unique < dc.n_refs;
-@@ -2465,6 +2541,242 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+@@ -2465,6 +2568,267 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
      return ENG_INVALID;
  }
  
@@ -3249,6 +3439,7 @@ index 8dff6011..719257d8 100644
 +        if (!copy) return 0;
 +        if (s->sub) g.be->texture_release(g.be->user, s->sub);
 +        s->sub = copy; s->sub_w = t->width; s->sub_h = t->height;
++        if (EP_ON()) s_tx_real[0]++;
 +        s->sub_serial = s->color_serial;
 +    }
 +    return s->sub;
@@ -3359,6 +3550,7 @@ index 8dff6011..719257d8 100644
 +    g.be->set_scissor(g.be->user, 0, 0, t->width, t->height);
 +    g.be->draw(g.be->user, RSX_TOPOLOGY_TRIANGLES, tri, 3, layout.stride, NULL, 0);
 +    s->rei_serial = s->color_serial;
++    if (EP_ON()) s_tx_real[1]++;
 +    return s->rei;
 +}
 +
@@ -3455,26 +3647,73 @@ index 8dff6011..719257d8 100644
 +        if (!z->bconv) return 0;
 +    }
 +    eng_gpu_convert(pipe, snap, z->bconv, t->width, t->height);
++    if (EP_ON()) s_tx_real[2]++;
 +    z->bconv_serial = z->depth_serial;
 +    return z->bconv;
 +}
 +
++static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
++                            u32 levels, u32 pitch, int cube, u32 remap, u32 depth);
++static inline u32 tx_view_timed(u32 surface, u32 remap, u32 fmt)
++{
++    const u64 t = EP_ON() ? ep_now() : 0;
++    const u32 r = g.be->surface_view(g.be->user, surface, remap, fmt);
++    if (EP_ON()) s_tx_view_ns += ep_now() - t;
++    return r;
++}
++#define TX_VIEW(user, surface, remap, fmt) tx_view_timed(surface, remap, fmt)
++static inline u32 tx_slot_timed(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
++                                u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
++{
++    const u64 t = EP_ON() ? ep_now() : 0;
++    const u32 r = eng_texture_slot(location, offset, fmt, w, h, levels, pitch, cube, remap, depth);
++    if (EP_ON()) s_tx_slot_ns += ep_now() - t;
++    return r;
++}
++#define TX_SLOT tx_slot_timed
++#define TXC(i, expr) ({ const u64 _t = EP_ON() ? ep_now() : 0; __typeof__(expr) _r = (expr); \
++    if (EP_ON()) { s_tx_conv_ns[i] += ep_now() - _t; s_tx_conv_n[i]++; } _r; })
++
  static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                u32 current_zslot, u32 tex_used,
                                u32 textures[RSX_BE_MAX_TEXTURES],
-@@ -2530,6 +2842,26 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2474,6 +2838,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+     u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
+     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+         rsx_dsp_texture t;
++        const u64 tx_t0 = EP_ON() ? ep_now() : 0;
+         rsx_dsp_get_texture(&g.rsx, u, &t);
+         /* A unit left enabled by an earlier draw but not sampled by this
+          * program is skipped: resolving it would cost a cache check, and an
+@@ -2482,6 +2847,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         mask |= 1u << u;
+         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
+         samplers[u].border = eng_border_class(t.format, t.border_color);
++        if (EP_ON()) { s_tx_dec_ns += ep_now() - tx_t0; s_tx_units++; }
+ 
+         int sampled = -1, own = 0, surface_at = -1;
+         /* DXT data is never a render target's output: no surface colour
+@@ -2525,13 +2891,33 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
+              * anything else goes through guest memory. */
+             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
+-                const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height);
++                const u32 snap = TXC(3, eng_zdepth_snapshot((u32)zsrc, t.width, t.height));
+                 if (snap) { textures[u] = snap; continue; }
              }
              const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
              if (conv) { textures[u] = conv; continue; }
+-            if (eng_zdepth_to_guest((u32)zsrc)) {
+-                textures[u] = eng_texture_slot(t.location, t.offset, t.format,
 +            /* The zeta may still be bound: a title reads its scene depth with
 +             * depth writes off and the zeta left in place, and the snapshot,
 +             * in command order, holds the depth as the draws so far left it --
 +             * what the guest store would read back. */
 +            {
-+                const u32 bytes = eng_zdepth_bytes_gpu((u32)zsrc, &t);
++                const u32 bytes = TXC(2, eng_zdepth_bytes_gpu((u32)zsrc, &t));
 +                if (bytes) {
 +                    const u32 view = g.be->surface_view
-+                        ? g.be->surface_view(g.be->user, bytes, t.remap & 0xFFFFu, t.format) : 0;
++                        ? TX_VIEW(g.be->user, bytes, t.remap & 0xFFFFu, t.format) : 0;
 +                    textures[u] = view ? view : bytes;
 +                    continue;
 +                }
@@ -3486,18 +3725,36 @@ index 8dff6011..719257d8 100644
 +                                  " %ux%u pitch %u (zeta pitch %u, used %ux%u, zfmt %u, bound %d)\n",
 +                          t.offset, u, t.format, t.width, t.height, t.pitch, z->pitch,
 +                          z->used_w, z->used_h, z->zfmt, current_zslot == (u32)zsrc); }
-             if (eng_zdepth_to_guest((u32)zsrc)) {
-                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
++            if (TXC(5, eng_zdepth_to_guest((u32)zsrc))) {
++                textures[u] = TX_SLOT(t.location, t.offset, t.format,
                                                 t.width, t.height, t.mipmaps, t.pitch,
-@@ -2564,6 +2896,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                                                (int)t.cubemap, t.remap & 0xFFFFu,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+@@ -2548,13 +2934,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
+             if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
+             if (!feedback[k]) {
+-                const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
++                const u32 copy = TXC(4, g.be->color_snapshot(g.be->user, s->handle));
+                 if (!copy) return eng_color_feedback_failure(u, s, &t);
+                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
+                 s->feedback = feedback[k] = copy;
+             }
+             if (g.be->surface_view) {
+-                textures[u] = g.be->surface_view(g.be->user, feedback[k],
++                textures[u] = TX_VIEW(g.be->user, feedback[k],
+                                                t.remap & 0xffffu, t.format);
+                 if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
+             } else if ((t.remap & 0xffffu) == 0xaae4u) {
+@@ -2564,22 +2950,32 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              }
              continue;
          }
 +        if (sampled >= 0 && zsrc < 0) {
-+            const u32 rei = eng_surface_reinterpret(&g.surfaces[sampled], &t, base_fmt);
++            const u32 rei = TXC(1, eng_surface_reinterpret(&g.surfaces[sampled], &t, base_fmt));
 +            if (rei) {
 +                const u32 view = g.be->surface_view
-+                    ? g.be->surface_view(g.be->user, rei, t.remap & 0xFFFFu, t.format) : 0;
++                    ? TX_VIEW(g.be->user, rei, t.remap & 0xFFFFu, t.format) : 0;
 +                textures[u] = view ? view : rei;
 +                continue;
 +            }
@@ -3505,23 +3762,44 @@ index 8dff6011..719257d8 100644
          if (sampled >= 0 && zsrc < 0 &&
              g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
              eng_format_reinterprets_rgba8(base_fmt) &&
-@@ -2575,11 +2916,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             eng_surface_to_guest((u32)sampled)) {
+-            textures[u] = eng_texture_slot(t.location, t.offset, t.format,
++            textures[u] = TX_SLOT(t.location, t.offset, t.format,
+                                            t.width, t.height, t.mipmaps, t.pitch,
+                                            (int)t.cubemap, t.remap & 0xFFFFu,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
              continue;
          }
          if (sampled >= 0) {
-+            const u32 corner = eng_surface_corner(&g.surfaces[sampled], &t);
++            const u32 corner = TXC(0, eng_surface_corner(&g.surfaces[sampled], &t));
 +            const u32 src = corner ? corner : g.surfaces[sampled].handle;
              const u32 view = g.be->surface_view
 -                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
 -                                     t.remap & 0xFFFFu, t.format)
-+                ? g.be->surface_view(g.be->user, src, t.remap & 0xFFFFu, t.format)
++                ? TX_VIEW(g.be->user, src, t.remap & 0xFFFFu, t.format)
                  : 0;
 -            textures[u] = view ? view : g.surfaces[sampled].handle;
 +            textures[u] = view ? view : src;
              continue;
          }
          if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
-@@ -2672,6 +3014,7 @@ static int pd_open_index(void)
+@@ -2587,13 +2983,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                 if (g.zdepths[i].location == t.location &&
+                     g.zdepths[i].offset == t.offset && current_zslot != i) {
+                     g.zdepths[i].last_use = g.frames;
+-                    const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
++                    const u32 snap = TXC(3, eng_zdepth_snapshot(i, t.width, t.height));
+                     if (snap) textures[u] = snap;
+                     break;
+                 }
+             if (textures[u]) continue;
+         }
+-        textures[u] = eng_texture_slot(t.location, t.offset, t.format,
++        textures[u] = TX_SLOT(t.location, t.offset, t.format,
+                                        t.width, t.height, t.mipmaps, t.pitch,
+                                        (int)t.cubemap, t.remap & 0xFFFFu,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+@@ -2672,6 +3068,7 @@ static int pd_open_index(void)
      }
      s_pd.state = 2;
      s_pd.open = 0;
@@ -3529,7 +3807,7 @@ index 8dff6011..719257d8 100644
      return 1;
  }
  
-@@ -2691,6 +3034,22 @@ static int pd_capturing(void)
+@@ -2691,6 +3088,22 @@ static int pd_capturing(void)
      if (s_pd.state == 1 && s_pd.after_s &&
          difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
          fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
@@ -3552,7 +3830,7 @@ index 8dff6011..719257d8 100644
      return s_pd.state == 2;
  }
  
-@@ -2829,6 +3188,10 @@ static void pd_close_pass(void)
+@@ -2829,6 +3242,10 @@ static void pd_close_pass(void)
          s_pd.state = 3;
          fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
                  s_pd.pass, s_pd.dir);
@@ -3563,7 +3841,7 @@ index 8dff6011..719257d8 100644
      }
  }
  
-@@ -2941,7 +3304,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2941,7 +3358,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
  static void pd_present(u32 presented)
  {
      if (s_pd.state == 0) pd_capturing();
@@ -3573,10 +3851,41 @@ index 8dff6011..719257d8 100644
          if (pd_open_index())
              fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                      g.frames + 1, g.guest_draws);
-@@ -3022,14 +3386,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+@@ -3022,14 +3440,64 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                  what, rc[0], rc[1], rc[2], rc[3], w, h);
  }
  
++static void ep_frame(void)
++{
++    if (s_ep_on < 0) { const char* e = getenv("RSX_ENGINE_PROFILE"); s_ep_on = e && *e && *e != '0'; }
++    if (!EP_ON()) return;
++    static u32 frames;
++    const u64 now = ep_now();
++    if (!s_ep_frame0) s_ep_frame0 = now;
++    if (++frames < 120) return;
++    u64 sum = 0;
++    for (u32 i = 0; i < EP_N; i++) sum += s_ep_ns[i];
++    fprintf(stderr, "[rsx prof] %.1f ms/frame wall, %.0f draws/frame, sink_end %.2f ms/frame:",
++            (now - s_ep_frame0) / 1e6 / frames, (double)s_ep_draws / frames, sum / 1e6 / frames);
++    for (u32 i = 0; i < EP_N; i++)
++        fprintf(stderr, " %s %.2f", kEpName[i], s_ep_ns[i] / 1e6 / frames);
++    fprintf(stderr, " | units %.0f dec %.2f slot %.2f view %.2f", (double)s_tx_units / frames,
++            s_tx_dec_ns / 1e6 / frames, s_tx_slot_ns / 1e6 / frames, s_tx_view_ns / 1e6 / frames);
++    for (u32 i = 0; i < 6; i++) fprintf(stderr, " c%u %.0f/%.2f", i, (double)s_tx_conv_n[i] / frames, s_tx_conv_ns[i] / 1e6 / frames);
++    fprintf(stderr, " real corner %.0f rei %.0f zb %.0f", (double)s_tx_real[0] / frames,
++            (double)s_tx_real[1] / frames, (double)s_tx_real[2] / frames);
++    memset(s_tx_real, 0, sizeof s_tx_real);
++    memset(s_tx_conv_ns, 0, sizeof s_tx_conv_ns); memset(s_tx_conv_n, 0, sizeof s_tx_conv_n);
++    s_tx_dec_ns = s_tx_slot_ns = s_tx_view_ns = s_tx_units = 0;
++    fprintf(stderr, " | tex: slot %.2f ms, sparse %.0f, full %.0f (%.1f MB, %.2f ms; io %.0f sparse %.0f sched %.0f)\n",
++            s_ep_slot_ns / 1e6 / frames, (double)s_ep_sparse / frames, (double)s_ep_full_hash / frames,
++            s_ep_full_bytes / 1e6 / frames, s_ep_full_ns / 1e6 / frames, (double)s_ep_full_io / frames,
++            (double)s_ep_full_sparse / frames, (double)s_ep_full_sched / frames);
++    s_ep_full_hash = s_ep_full_bytes = s_ep_full_io = s_ep_full_sparse = s_ep_full_sched = 0;
++    s_ep_sparse = s_ep_slot_ns = s_ep_full_ns = 0;
++    memset(s_ep_ns, 0, sizeof s_ep_ns); s_ep_draws = 0; s_ep_frame0 = now; frames = 0;
++}
++
 +/* RSX_ENGINE_DROP_LOG=1 (diagnostic): count each early exit of sink_end by
 + * site and print the tally every 300 frames, to see which draws never reach
 + * the backend and why. */
@@ -3599,6 +3908,7 @@ index 8dff6011..719257d8 100644
      (void)user; (void)r;
 -    if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
 +    s_drop_end++;
++    u64 ep_t = EP_ON() ? ep_now() : 0;
 +    if (!g.ready || !dc.n_packets || !dc.fetch_ok) DROPR(1);
      /* Mixed geometry sources have no defined concatenation here. Reject the
       * whole group instead of drawing partial/misordered geometry. */
@@ -3608,7 +3918,7 @@ index 8dff6011..719257d8 100644
  
      const u32 prim = g.rsx.current_primitive;
      /* Everything that becomes triangles -- lists, strips, fans, quads, quad
-@@ -3044,33 +3426,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3044,33 +3512,35 @@ static void sink_end(void* user, const rsx_dispatch* r)
      int scratch = 0;
      const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
      if (!rebuild) {
@@ -3621,8 +3931,10 @@ index 8dff6011..719257d8 100644
  
      rsx_vertex_layout_plan layout;
      eng_vertex_layout(&layout);
++    EP_MARK(EP_LAYOUT, ep_t);
      dc_fetch(&layout, rebuild);
 -    if (!dc.n_verts || !dc.fetch_ok) return;
++    EP_MARK(EP_FETCH, ep_t);
 +    if (!dc.n_verts || !dc.fetch_ok) DROPR(5);
  
      int indexed = 0;
@@ -3648,23 +3960,25 @@ index 8dff6011..719257d8 100644
      const u32 target = targets[0];
  
      rsx_dsp_surface sf;
-@@ -3091,8 +3473,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3091,8 +3561,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                            eng_surface_format(sf.color_format),
                                            n_targets, &pipeline_is_fixed, &tex_used,
                                            &fp_hash);
 -    if (!pipeline) return;
 -    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
++    EP_MARK(EP_PIPE, ep_t);
 +    if (!pipeline) DROPR(9);
 +    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) DROPR(10);
  
      /* Textures before any pipeline or target binding: a cache refresh can
       * replace a resource, and the backend is free to submit while doing it. */
-@@ -3106,12 +3488,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3106,12 +3577,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
      memset(vsamplers, 0, sizeof vsamplers);
      const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                              textures, samplers);
 -    if (tex_mask == ENG_INVALID) return;
 +    if (tex_mask == ENG_INVALID) DROPR(11);
++    EP_MARK(EP_TEX, ep_t);
      const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                      vsamplers);
  
@@ -3674,7 +3988,7 @@ index 8dff6011..719257d8 100644
          rsx_draw_engine_write_topology_indices(
              prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
              dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
-@@ -3145,7 +3527,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3145,7 +3617,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      const u32 fp_bytes = (nslots + 1u) * 16u;
      if (g.fp_cb_cap < fp_bytes) {
          u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
@@ -3683,15 +3997,33 @@ index 8dff6011..719257d8 100644
          g.fp_cb = n;
          g.fp_cb_cap = fp_bytes;
      }
-@@ -3231,6 +3613,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3162,6 +3634,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
+       alpha[3] = 0.0f; }
+ 
++    EP_MARK(EP_CONST, ep_t);
+     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+ 
+     /* The depth attachment is cleared the first time it is bound, so a title
+@@ -3224,13 +3697,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
+                              sf.depth_format == 1u ? 16u : 24u);
+     }
+ 
++    EP_MARK(EP_BIND, ep_t);
+     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+     /* Counted only when the draw ran the guest's OWN programs, which is what
       * the test hook means: a draw through the built-in pair is a draw, not
       * evidence that the decompile-translate-compile path worked. */
++    EP_MARK(EP_DRAW, ep_t);
++    if (EP_ON()) s_ep_draws++;
      if (!pipeline_is_fixed) g.guest_draws++;
 +    s_drop_ok++;
  
      if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
      if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-@@ -3360,6 +3743,49 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -3360,6 +3837,49 @@ static u32 eng_present_surface(u32 buffer_id)
      return eng_current_surface();
  }
  
@@ -3741,7 +4073,7 @@ index 8dff6011..719257d8 100644
  static void eng_present(u32 buffer_id)
  {
      if (!g.ready) return;
-@@ -3376,9 +3802,11 @@ static void eng_present(u32 buffer_id)
+@@ -3376,9 +3896,12 @@ static void eng_present(u32 buffer_id)
                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
      }
      pd_present(target);
@@ -3750,10 +4082,11 @@ index 8dff6011..719257d8 100644
      g.be->present(g.be->user, g.surfaces[target].handle);
      g.frames++;
 +    eng_drop_log();
++    ep_frame();
      g.last_guest_draws = g.guest_draws;
      g.guest_draws = 0;
  }
-@@ -3466,10 +3894,13 @@ void rsx_draw_engine_shutdown(void)
+@@ -3466,10 +3989,13 @@ void rsx_draw_engine_shutdown(void)
          if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
      for (u32 i = 0; i < g.n_surfaces; i++) {
          if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
@@ -4040,6 +4373,48 @@ index cfb9685b..72523305 100644
                  const int target = fp_export_target(dst_idx, dst_half);
                  if (target >= 0) wrote[dst_half][target] = 1;
              }
+diff --git a/libs/video/rsx_shader_spirv.cpp b/libs/video/rsx_shader_spirv.cpp
+index 4aa4a176..54333fcd 100644
+--- a/libs/video/rsx_shader_spirv.cpp
++++ b/libs/video/rsx_shader_spirv.cpp
+@@ -37,6 +37,7 @@
+ #include <glslang/Public/ResourceLimits.h>
+ #include <glslang/SPIRV/GlslangToSpv.h>
+ 
++#include <chrono>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -254,12 +255,29 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
+         std::vector<unsigned int> spirv;
+         const std::string& dir = cache_dir(c);
+         const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
++        const auto t0 = std::chrono::steady_clock::now();
++        const char* how;
+         if (!dir.empty() && cache_load(path, key, spirv)) {
+             c.stats.disk_hits++;
++            how = "disk";
+         } else {
+             if (translate(hlsl, stage, spirv, log, log_size)) return -1;
+             c.stats.translations++;
+             if (!dir.empty()) cache_store(path, key, spirv);
++            how = "glslang";
++        }
++        /* PS3RECOMP_SPIRV_LOG=1: one line per shader not already in memory,
++         * with where it came from and what it cost the calling thread. */
++        static int log_on = -1;
++        if (log_on < 0) { const char* e = getenv("PS3RECOMP_SPIRV_LOG"); log_on = e && *e && *e != '0'; }
++        if (log_on) {
++            const double ms = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - t0).count();
++            fprintf(stderr, "[spirv] %s %s %.1f ms (glslang %u, disk %u) t=%llu\n",
++                    stage == RSX_SHADER_STAGE_VERTEX ? "vs" : "ps", how, ms,
++                    c.stats.translations, c.stats.disk_hits,
++                    (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
++                        std::chrono::steady_clock::now().time_since_epoch()).count());
+         }
+         it = c.map.emplace(key, std::move(spirv)).first;
+     }
 diff --git a/libs/video/rsx_ui.cpp b/libs/video/rsx_ui.cpp
 new file mode 100644
 index 00000000..fd1c3c47
@@ -4969,7 +5344,7 @@ index 00000000..c4705297
 +
 +#endif
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302e..e26cf9e2 100644
+index db64302e..02210f5d 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -42,6 +42,7 @@
@@ -4991,7 +5366,7 @@ index db64302e..e26cf9e2 100644
  
  #include <dlfcn.h>
  #include <pthread.h>
-@@ -453,7 +458,12 @@ static void vk_present_wait_gpu(void);
+@@ -453,16 +458,86 @@ static void vk_present_wait_gpu(void);
   * all earlier work has completed. */
  static u32 s_eb_pending;
  static void vk_eng_flush(void);
@@ -5004,25 +5379,99 @@ index db64302e..e26cf9e2 100644
  static u32 vk_eb_max(void);
  static void vk_eb_recorded(void);   /* one more command in the open batch */
  static void vk_eb_release(void);    /* engine shutdown: rings and pool */
-@@ -462,7 +472,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
+ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
+                         u32 rows, u32 row_bytes);   /* -2: not batched, do it the old way */
  
++/* Deferred destruction (VK_EB_DEFER, default on; 0 = flush and destroy at
++ * once, as before). Destroying an object a recorded or in-flight batch may
++ * still use used to flush and wait for the whole GPU first: in the race,
++ * releasing a texture/view or the framebuffer cache from sink_bind_textures
++ * did that several times a frame (~25% of the FIFO thread's wall time in
++ * vk_eng_flush <- vk_destroy_image). Now the handles go on a list tied to
++ * the batch being recorded and are destroyed once that batch's fence has
++ * signalled (vk_eb_wait_inflight / vk_eng_flush). */
++enum { VK_DEFER_IMAGE = 1, VK_DEFER_BUFFER, VK_DEFER_FB };
++typedef struct { int kind; VkImageView view; VkImage img; VkBuffer buf; VkDeviceMemory mem; int mapped; VkFramebuffer fb; } vk_deferred;
++static struct { vk_deferred* v; u32 n, cap; } s_defer_cur, s_defer_inflight;
++static int vk_defer_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("VK_EB_DEFER"); on = !(e && *e == '0'); }
++    return on;
++}
++static void vk_defer_push(const vk_deferred* d)
++{
++    if (s_defer_cur.n == s_defer_cur.cap) {
++        u32 cap = s_defer_cur.cap ? s_defer_cur.cap * 2u : 64u;
++        vk_deferred* nv = (vk_deferred*)realloc(s_defer_cur.v, cap * sizeof *nv);
++        if (!nv) abort();
++        s_defer_cur.v = nv; s_defer_cur.cap = cap;
++    }
++    s_defer_cur.v[s_defer_cur.n++] = *d;
++}
++static void vk_defer_run(vk_deferred* v, u32* n)
++{
++    if (!*n) return;
++    int waited = 0;
++    for (u32 i = 0; i < *n; i++) {
++        vk_deferred* d = &v[i];
++        if (d->kind == VK_DEFER_IMAGE) {
++            if (d->img && !waited) { vk_present_wait_gpu(); waited = 1; }   /* never under a present's copy */
++            if (d->view) pvkDestroyImageView(s_vk.device, d->view, NULL);
++            if (d->img)  pvkDestroyImage(s_vk.device, d->img, NULL);
++            if (d->mem)  pvkFreeMemory(s_vk.device, d->mem, NULL);
++        } else if (d->kind == VK_DEFER_BUFFER) {
++            if (d->mapped) pvkUnmapMemory(s_vk.device, d->mem);
++            if (d->buf) pvkDestroyBuffer(s_vk.device, d->buf, NULL);
++            if (d->mem) pvkFreeMemory(s_vk.device, d->mem, NULL);
++        } else if (d->kind == VK_DEFER_FB) {
++            if (d->fb) pvkDestroyFramebuffer(s_vk.device, d->fb, NULL);
++        }
++    }
++    *n = 0;
++}
++/* The batch just recorded has been submitted: what it may use waits on it. */
++static void vk_defer_cur_to_inflight(void)
++{
++    vk_defer_run(s_defer_inflight.v, &s_defer_inflight.n);   /* must be empty here; be safe */
++    vk_deferred* t = s_defer_inflight.v; u32 c = s_defer_inflight.cap;
++    s_defer_inflight = s_defer_cur;
++    s_defer_cur.v = t; s_defer_cur.cap = c; s_defer_cur.n = 0;
++}
++
  static void vk_destroy_image(vk_image* im)
  {
 -    if (s_eb_pending) vk_eng_flush();
++    if (vk_eb_busy() && vk_defer_on()) {
++        if (im->view || im->img || im->mem) {
++            vk_deferred d = { .kind = VK_DEFER_IMAGE, .view = im->view, .img = im->img, .mem = im->mem };
++            vk_defer_push(&d);
++        }
++        memset(im, 0, sizeof *im);
++        return;
++    }
 +    if (vk_eb_busy()) vk_eng_flush();
      /* Never under a present's copy that may still read it. */
      if (im->img) vk_present_wait_gpu();
      if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
-@@ -525,7 +535,7 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
+@@ -525,7 +600,15 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
  
  static void vk_destroy_buffer(vk_buffer* b)
  {
 -    if (s_eb_pending) vk_eng_flush();
++    if (vk_eb_busy() && vk_defer_on()) {
++        if (b->buf || b->mem) {
++            vk_deferred d = { .kind = VK_DEFER_BUFFER, .buf = b->buf, .mem = b->mem, .mapped = b->ptr != NULL };
++            vk_defer_push(&d);
++        }
++        memset(b, 0, sizeof *b);
++        return;
++    }
 +    if (vk_eb_busy()) vk_eng_flush();
      if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
      if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
      if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
-@@ -584,9 +594,24 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
+@@ -584,9 +667,24 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
  }
  
@@ -5048,7 +5497,7 @@ index db64302e..e26cf9e2 100644
      VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
      VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-@@ -598,6 +623,32 @@ static int vk_begin(void)
+@@ -598,6 +696,32 @@ static int vk_begin(void)
      return 0;
  }
  
@@ -5081,7 +5530,7 @@ index db64302e..e26cf9e2 100644
  static int vk_submit_and_wait(void)
  {
      VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
-@@ -605,7 +656,11 @@ static int vk_submit_and_wait(void)
+@@ -605,7 +729,11 @@ static int vk_submit_and_wait(void)
                          .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
      VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
      VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
@@ -5093,7 +5542,7 @@ index db64302e..e26cf9e2 100644
      return 0;
  }
  
-@@ -1714,11 +1769,18 @@ static int vk_env_on(const char* name)
+@@ -1714,11 +1842,18 @@ static int vk_env_on(const char* name)
      return v && v[0] && v[0] != '0';
  }
  
@@ -5112,7 +5561,7 @@ index db64302e..e26cf9e2 100644
          for (u32 i = 0; i < 8; i++)
              if (s_vk.sc_done[i]) {
                  pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
-@@ -1845,8 +1907,15 @@ static int vk_create_swapchain(void)
+@@ -1845,8 +1980,15 @@ static int vk_create_swapchain(void)
          .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
          .clipped = VK_TRUE, .oldSwapchain = old,
      };
@@ -5128,7 +5577,7 @@ index db64302e..e26cf9e2 100644
      if (old) pvkDestroySwapchainKHR(s_vk.device, old, NULL);
      s_vk.swapchain = VK_NULL_HANDLE;
      if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
-@@ -1868,6 +1937,10 @@ static int vk_create_swapchain(void)
+@@ -1868,6 +2010,10 @@ static int vk_create_swapchain(void)
  
      s_vk.sc_extent = ext;
      s_vk.sc_count = n;
@@ -5139,7 +5588,7 @@ index db64302e..e26cf9e2 100644
      VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
      return 0;
  }
-@@ -1922,6 +1995,10 @@ static void vk_present_window(void)
+@@ -1922,6 +2068,10 @@ static void vk_present_window(void)
      b.dstAccessMask = 0;
      b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
      b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -5150,7 +5599,7 @@ index db64302e..e26cf9e2 100644
      pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                            0, 0, NULL, 0, NULL, 1, &b);
      if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
-@@ -2308,7 +2385,7 @@ static void vk_eng_shutdown(void* user)
+@@ -2308,7 +2458,7 @@ static void vk_eng_shutdown(void* user)
  static void vk_eng_submit_and_wait(void* user, u32 reason)
  {
      (void)user; (void)reason;      /* every other submission has already completed */
@@ -5159,7 +5608,7 @@ index db64302e..e26cf9e2 100644
  }
  
  static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
-@@ -2389,8 +2466,9 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
+@@ -2389,8 +2539,9 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
                         (u32)(rgba[2] * 255.0f + 0.5f);
      vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
      if (!o) return;
@@ -5171,7 +5620,7 @@ index db64302e..e26cf9e2 100644
      VkClearColorValue v;
      memcpy(v.float32, rgba, sizeof v.float32);
      VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-@@ -2409,8 +2487,9 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2409,8 +2560,9 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
      if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
      if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
      if (!o || !aspect) return;
@@ -5183,7 +5632,7 @@ index db64302e..e26cf9e2 100644
      VkClearDepthStencilValue d = { depth_value, stencil };
      VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
      vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
-@@ -2425,7 +2504,7 @@ static void vk_eng_present(void* user, u32 surface)
+@@ -2425,7 +2577,7 @@ static void vk_eng_present(void* user, u32 surface)
  {
      (void)user;
      if (!s_vk.device) return;
@@ -5192,7 +5641,7 @@ index db64302e..e26cf9e2 100644
      vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
      pthread_mutex_lock(&s_vk.present_mu);
      VkCommandBuffer cb = vk_present_record_begin();
-@@ -2622,23 +2701,33 @@ static void vk_eng_snapshot_pool_drain(void)
+@@ -2622,23 +2774,33 @@ static void vk_eng_snapshot_pool_drain(void)
      vk_destroy_buffer(&s_snap_st);
  }
  
@@ -5229,7 +5678,7 @@ index db64302e..e26cf9e2 100644
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT)) {
          vk_destroy_image(&o->im);
-@@ -2646,20 +2735,30 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+@@ -2646,20 +2808,30 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
          return 0;
      }
      o->kind = VK_ENG_COLOR; o->snapshot = 1;
@@ -5263,7 +5712,7 @@ index db64302e..e26cf9e2 100644
      if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
      return hd;
  }
-@@ -2725,9 +2824,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2725,9 +2897,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          }
      }
      vk_buffer st = s_snap_st;
@@ -5276,7 +5725,7 @@ index db64302e..e26cf9e2 100644
      if (!rc) {
          vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
          vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-@@ -2746,7 +2845,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2746,7 +2918,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
          if (batch) {
              vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -5285,16 +5734,22 @@ index db64302e..e26cf9e2 100644
          } else
              rc = vk_submit_and_wait();
      }
-@@ -2860,7 +2959,7 @@ static u32 s_esamp_count;
+@@ -2860,7 +3032,13 @@ static u32 s_esamp_count;
  
  static void vk_eng_drop_framebuffers(void)
  {
 -    if (s_eb_pending) vk_eng_flush();
++    if (vk_eb_busy() && vk_defer_on()) {
++        for (u32 i = 0; i < s_e2.fb_count; i++)
++            if (s_e2.fb[i].fb) { vk_deferred d = { .kind = VK_DEFER_FB, .fb = s_e2.fb[i].fb }; vk_defer_push(&d); }
++        s_e2.fb_count = 0;
++        return;
++    }
 +    if (vk_eb_busy()) vk_eng_flush();
      for (u32 i = 0; i < s_e2.fb_count; i++)
          if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
      s_e2.fb_count = 0;
-@@ -3070,7 +3169,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+@@ -3070,7 +3248,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
  static void vk_eng_pipeline_release(void* user, u32 pipeline)
  {
      (void)user;
@@ -5303,7 +5758,7 @@ index db64302e..e26cf9e2 100644
      if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
      vk_eng_pipe* P = &s_epipe[pipeline - 1];
      for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-@@ -3450,6 +3549,18 @@ static struct {
+@@ -3450,6 +3628,18 @@ static struct {
      VkDescriptorPool pool;
      u32              sets;
      unsigned long long draws, flushes;
@@ -5322,7 +5777,7 @@ index db64302e..e26cf9e2 100644
  } s_eb = { .on = -1 };
  
  static int vk_eb_on(void)
-@@ -3479,7 +3590,21 @@ static int vk_eb_on(void)
+@@ -3479,7 +3669,21 @@ static int vk_eb_on(void)
          VK_LOG("draw batching: no host-coherent ring memory, staying off\n");
          return 0;
      }
@@ -5345,7 +5800,7 @@ index db64302e..e26cf9e2 100644
      s_eb.on = 1;
      return 1;
  }
-@@ -3488,19 +3613,30 @@ static int vk_eb_on(void)
+@@ -3488,19 +3692,30 @@ static int vk_eb_on(void)
   * decides again. Also frees what a failed vk_eb_on had already created. */
  static void vk_eb_release(void)
  {
@@ -5378,7 +5833,7 @@ index db64302e..e26cf9e2 100644
  
  static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align);
  
-@@ -3512,43 +3648,162 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
+@@ -3512,43 +3727,167 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
  static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                          u32 rows, u32 row_bytes)
  {
@@ -5418,6 +5873,7 @@ index db64302e..e26cf9e2 100644
 +                    (const void*)vk_eb_wait_inflight);
 +    s_eb.inflight2 = 0;
 +    if (s_eb.sets2) { pvkResetDescriptorPool(s_vk.device, s_eb.pool2, 0); s_eb.sets2 = 0; }
++    vk_defer_run(s_defer_inflight.v, &s_defer_inflight.n);
 +}
 +
 +/* Everything recorded or in flight is complete when this returns. */
@@ -5433,6 +5889,9 @@ index db64302e..e26cf9e2 100644
 +            VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
 +    }
 +    vk_eb_wait_inflight();          /* submitted before the one just waited on */
++    /* Everything is complete now: what was deferred can go. */
++    vk_defer_run(s_defer_inflight.v, &s_defer_inflight.n);
++    vk_defer_run(s_defer_cur.v, &s_defer_cur.n);
 +}
 +
 +/* A full batch: submit it without waiting and go on recording into the other
@@ -5460,6 +5919,7 @@ index db64302e..e26cf9e2 100644
 +    VkDescriptorPool p = s_eb.pool; s_eb.pool = s_eb.pool2; s_eb.pool2 = p;
 +    u32 n = s_eb.sets; s_eb.sets = s_eb.sets2; s_eb.sets2 = n;   /* sets is 0 after wait_inflight */
 +    s_eb.inflight2 = 1;
++    vk_defer_cur_to_inflight();
 +    s_eb.half ^= 1u;
      s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
 -    if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
@@ -5517,7 +5977,7 @@ index db64302e..e26cf9e2 100644
 +    for (u32 i = 0; i < s_rpm.nwritten; i++) if (s_rpm.written[i] == img) return 1;
 +    return 0;
 +}
- 
++
 +static void vk_rpm_add_written(VkImage img)
 +{
 +    if (!img || vk_rpm_written(img)) return;
@@ -5534,7 +5994,7 @@ index db64302e..e26cf9e2 100644
 +        return s_eobj[o->surface].im.img;
 +    return o->im.img;
 +}
-+
+ 
 +/* Heads are relative to the half being recorded into (the whole ring when
 + * not double-buffered); the offset returned is absolute. */
  static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -5550,7 +6010,7 @@ index db64302e..e26cf9e2 100644
  }
  
  static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
-@@ -3650,7 +3905,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3650,7 +3989,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      VkDeviceSize voff = 0, ioff = 0;
      VkDescriptorSet set = VK_NULL_HANDLE;
      const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
@@ -5559,7 +6019,7 @@ index db64302e..e26cf9e2 100644
      if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
      if (batched) {
          /* Slices of the rings and a set from the pool; a full one flushes the
-@@ -3678,7 +3933,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3678,7 +4017,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                  set = VK_NULL_HANDLE;
              }
              if (tries || !s_eb_pending) { batched = 0; break; }
@@ -5568,7 +6028,7 @@ index db64302e..e26cf9e2 100644
          }
          if (batched && !set) batched = 0;
      }
-@@ -3686,12 +3941,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3686,12 +4025,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
          if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
          vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
@@ -5583,7 +6043,7 @@ index db64302e..e26cf9e2 100644
          if (vk_ensure_vertex_buffer(vbytes)) return;
          memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
          if (ibytes) {
-@@ -3706,14 +3958,55 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3706,14 +4042,55 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          if (!set) return;
          if (vk_begin()) return;
      }
@@ -5647,7 +6107,7 @@ index db64302e..e26cf9e2 100644
      pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
      VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
      if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
-@@ -3743,10 +4036,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3743,10 +4120,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      } else {
          pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
      }
@@ -5663,7 +6123,7 @@ index db64302e..e26cf9e2 100644
  }
  
  static const rsx_draw_backend s_vk_engine_backend = {
-@@ -3764,6 +4060,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3764,6 +4144,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .depth_target_release = vk_eng_release,
      .depth_snapshot       = vk_eng_depth_snapshot,
      .color_snapshot       = vk_eng_color_snapshot,
@@ -5671,7 +6131,7 @@ index db64302e..e26cf9e2 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
-@@ -3937,6 +4234,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3937,6 +4318,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      if (vk_submit_and_wait()) return -1;
  
      if (s_vk.windowed) {
@@ -5683,7 +6143,7 @@ index db64302e..e26cf9e2 100644
          VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
          if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
              vk_create_swapchain())
-@@ -4027,10 +4329,24 @@ void rsx_vulkan_backend_shutdown(void)
+@@ -4027,10 +4413,24 @@ void rsx_vulkan_backend_shutdown(void)
  
  int rsx_vulkan_backend_pump_messages(void)
  {
@@ -5708,7 +6168,7 @@ index db64302e..e26cf9e2 100644
          if (e.type == SDL_QUIT) quit = 1;
          else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
      }
-@@ -4046,6 +4362,9 @@ void rsx_vulkan_backend_present(void)
+@@ -4046,6 +4446,9 @@ void rsx_vulkan_backend_present(void)
  void rsx_vulkan_backend_present_begin(void)
  {
      if (!s_vk.device) return;
@@ -5956,6 +6416,47 @@ index 15d4ef60..ebb5bce3 100644
  
      /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
       * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 9309f2d3..b6c203c0 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1033,6 +1033,7 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
+ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
+ extern "C" uint32_t g_ww_lo, g_ww_hi;
+ 
++extern "C" void (*g_spu_line_commit_hook)(uint32_t line);   /* runtime/spu/spu_channels.c */
+ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+ {
+     uint32_t exp_raw = __builtin_bswap32(expected);
+@@ -1075,6 +1076,16 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+     }
+     if (ok) ppu_resv_break(ea);
+     resv_unlock(L);
++    /* A PPU atomic on a SPURS instance's request line (the game's inlined
++     * readyCount/signal updates that kick a workload) woke nobody: the SPURS
++     * coordinator only found it on its next 1 ms timed pass. Report the commit
++     * the way an SPU PUTLLC does (libs/spurs: kick + wake). The hook only
++     * compares the line against the live instances. PPU_STWCX_KICK=0: off. */
++    if (ok && g_spu_line_commit_hook) {
++        static int s_k = -1;
++        if (s_k < 0) { const char* e = getenv("PPU_STWCX_KICK"); s_k = !(e && *e == '0'); }
++        if (s_k) g_spu_line_commit_hook((uint32_t)ea & ~127u);
++    }
+     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
+      * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
+      * spins on) is written exclusively through here and looked untouched. */
+@@ -1148,6 +1159,11 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+     }
+     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
+     resv_unlock(L);
++    if (ok && g_spu_line_commit_hook) {   /* as in ppu_stwcx32: kick a SPURS coordinator */
++        static int s_k = -1;
++        if (s_k < 0) { const char* e = getenv("PPU_STWCX_KICK"); s_k = !(e && *e == '0'); }
++        if (s_k) g_spu_line_commit_hook((uint32_t)ea & ~127u);
++    }
+     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
+         /* Report as two words: the watch window is word-granular, and a
+          * doubleword CAS on a counter pair is exactly the case worth seeing. */
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
 index 9cb50400..add57400 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
@@ -6044,10 +6545,59 @@ index 9cb50400..add57400 100644
       * sys_net NID LBP imports so none fall to the unresolved-NID default. */
      ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 5fc50208..17d028f2 100644
+index 5fc50208..1b162639 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
-@@ -1842,7 +1842,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+@@ -242,7 +242,8 @@ void spu_stop(spu_context* ctx)
+  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
+  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
+  * lifted floating point must keep round to nearest with denormals. Double precision restores
+- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
++ * the default around itself inside a run. arm64, and x86 built with AVX2+FMA (MXCSR); elsewhere
++ * the exact forms always run.
+  * Returns the FPCR to restore, or ~0 when nothing was changed. */
+ static uint64_t spu_float_mode_enter(void)
+ {
+@@ -260,6 +261,24 @@ static uint64_t spu_float_mode_enter(void)
+     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
+     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
+     return v;
++#elif defined(__x86_64__) || defined(_M_X64)
++    /* x86: MXCSR round toward zero + FTZ + DAZ (spu_helpers.h, spu__x8_rz; the native forms are
++     * in the lifted TUs, built with AVX2+FMA; everything else is exact under the mode). */
++    static int s_on = -1;
++    int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
++    if (on < 0) {
++        const char* e = getenv("SPU_FLOAT_RZ");
++        on = e && e[0] == '1' && !e[1];
++        __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
++    }
++    if (!on) return ~0ull;
++    const unsigned v = _mm_getcsr();
++    if (SPU_MXCSR_IS_RZ(v)) return ~0ull;   /* nested run: the outer one restores */
++    _mm_setcsr((v & ~0x3Fu & ~0xFFC0u) | SPU_MXCSR_RZFZ);
++#if defined(SPU_FLOAT_RZ_FLAG)
++    g_spu_float_rz = 1;
++#endif
++    return v;
+ #else
+     return ~0ull;
+ #endif
+@@ -268,6 +287,13 @@ static void spu_float_mode_leave(uint64_t outer)
+ {
+ #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
++#elif defined(__x86_64__) || defined(_M_X64)
++    if (outer != ~0ull) {
++        _mm_setcsr((unsigned)outer);
++#if defined(SPU_FLOAT_RZ_FLAG)
++        g_spu_float_rz = 0;
++#endif
++    }
+ #else
+     (void)outer;
+ #endif
+@@ -1842,7 +1868,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
   * marks that overlay resident in the streaming context; dispatch retries a
   * primary-image miss against the resident overlay's registry. */
  typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
@@ -6057,7 +6607,7 @@ index 5fc50208..17d028f2 100644
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
   * the same job code buffer at LS 0x4000, dispatched by content signature). */
  #define SPU_OVL_SRC_MAX 128
-@@ -2151,6 +2152,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2151,6 +2178,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      if (size < 512 && !spu_ovl_ea_known(ea)) return;
      for (int i = 0; i < nsrc; i++) {
          const spu_ovl_src* o = &s_ovl_src[i];
@@ -6065,7 +6615,7 @@ index 5fc50208..17d028f2 100644
          int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
                               : (o->src_ea == ea);
          if (hit) {
-@@ -2186,6 +2188,78 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2186,6 +2214,78 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      }
  }
  
@@ -6144,7 +6694,7 @@ index 5fc50208..17d028f2 100644
  /* Match a 16-byte module header against the registered content signatures.
   * Returns the overlay image id, or 0 if none. Used by the WWS job-code dispatch
   * path: the job manager streams a module into the code buffer via a DMA LIST
-@@ -2768,6 +2842,10 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2768,6 +2868,10 @@ void spu_indirect_branch(spu_context* ctx)
      }
      /* Use the same ownership order as the interpreter's rejoin probe. */
      spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
@@ -6155,7 +6705,7 @@ index 5fc50208..17d028f2 100644
      /* The job returned through the link register we planted: it is finished.
       * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
       * return landed on LS 0, which is the job's OWN entry, and it ran a second
-@@ -2825,14 +2903,17 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2825,14 +2929,17 @@ void spu_indirect_branch(spu_context* ctx)
      }
  
      if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
@@ -6175,7 +6725,7 @@ index 5fc50208..17d028f2 100644
              { fprintf(stderr, "      last dispatched PCs (oldest first):");
                for (unsigned q = 0; q < 8; q++) {
                    unsigned idx = (g_spu_pch_n + q) & 7u;
-@@ -2864,14 +2945,31 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2864,14 +2971,31 @@ void spu_indirect_branch(spu_context* ctx)
          { uint32_t p = ctx->pc & SPU_LS_MASK;
            uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                          ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
@@ -6284,13 +6834,30 @@ index 8c4ccaa8..f9bc7867 100644
       * are the ones the SDK's own dma.h asserts: a non-zero size, at most
       * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
 diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
-index f04fda63..8901a2da 100644
+index f04fda63..5dbd0c47 100644
 --- a/runtime/spu/spu_helpers.h
 +++ b/runtime/spu/spu_helpers.h
-@@ -17,6 +17,27 @@
+@@ -16,6 +16,43 @@
+ #include "spu_context.h"
  #include <string.h>
  #include <math.h>
- 
++#if defined(__x86_64__) || defined(_M_X64)
++#include <xmmintrin.h>
++/* SPU_FLOAT_RZ on x86: MXCSR FZ | RC=11 (toward zero) | all exceptions masked | DAZ. The sticky
++ * exception flags (bits 0-5) are ignored when testing for it. Set by spu_float_mode_enter
++ * (spu_channels.c) for the length of spu_run_with_halt. */
++#define SPU_MXCSR_RZFZ 0xFFC0u
++#define SPU_MXCSR_IS_RZ(m) (((m) & 0xFFC0u) == SPU_MXCSR_RZFZ)
++#if defined(__GNUC__) || defined(__clang__)
++/* 1 while this thread runs SPU code under that MXCSR: set and restored together with it by
++ * spu_float_mode_enter/leave. The single-precision helpers test this instead of reading MXCSR
++ * (stmxcsr cost ~4 ns per op in a throughput loop, and the compiler cannot hoist it). Weak, so a
++ * test harness that sets MXCSR itself can set the flag without linking the runtime. */
++__attribute__((weak)) __thread int g_spu_float_rz;
++#define SPU_FLOAT_RZ_FLAG 1
++#endif
++#endif
++
 +#if defined(__GNUC__) || defined(__clang__)
 +/* Registers held in locals by a --local-regs lift (tools/spu_lifter.py,
 + * localize_registers): GCC vectors, which live in vector registers, where a
@@ -6311,10 +6878,119 @@ index f04fda63..8901a2da 100644
 +{
 +    return ctx->int_enable && (ctx->event_status & ctx->event_mask);
 +}
-+
+ 
  #ifdef __cplusplus
  extern "C" {
- #endif
+@@ -1105,9 +1142,7 @@ SPU__X8_INLINE u128 spu__x8_fa(u128 a, u128 b, uint32_t negb) {
+     ok = _mm_and_si128(ok, pre);
+     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb);
+ }
+-SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
+-SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
+-SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) {
++SPU__X8_INLINE u128 spu__x8_fm_exact(u128 a, u128 b) {
+     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
+     __m128i ok, zm;
+     const __m128i r = spu__x8_trunc0(_mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
+@@ -1126,9 +1161,72 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t
+     ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)), spu__x8_plain0(z)));
+     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc);
+ }
+-SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
+-SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+-SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x8_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
++#if defined(__FMA__)
++/* SPU_FLOAT_RZ on x86 (the arm64 FPCR mode above, spu__nv_rz): SPU code may run with MXCSR at
++ * round toward zero, flush-to-zero and denormals-are-zero (spu_float_mode_enter,
++ * runtime/spu/spu_channels.c). The host's single-precision ops then truncate like the SPU and
++ * read and write a denormal as zero, so of the exact forms only the range check and the +0 rule
++ * remain: one native op per vector instead of the f64x4 round trip. The lane rules are the arm64
++ * RZ forms': a result whose magnitude is not below FLT_MAX (an extended-range operand, Inf/NaN on
++ * the host, or a saturated/extended result) goes to the exact per-lane fix-up; a zero result is
++ * +0; a zero factor gives a zero product (fma: the addend as it is). The mode is read per op from
++ * the thread-local g_spu_float_rz (MXCSR itself where weak TLS is unavailable). */
++#if defined(SPU_FLOAT_RZ_FLAG)
++SPU__X8_INLINE int spu__x8_rz(void) { return __builtin_expect(g_spu_float_rz, 1); }
++#else
++SPU__X8_INLINE int spu__x8_rz(void) { return SPU_MXCSR_IS_RZ(_mm_getcsr()); }
++#endif
++/* all-ones in the lanes the SPU reads as zero (biased exponent 0): |x| < 2^-126 as one compare,
++ * which an extended-range word -- Inf or NaN here -- fails (a denormal compares as 0 under DAZ) */
++SPU__X8_INLINE __m128 spu__x8_abs(__m128 x) { return _mm_and_ps(x, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); }
++SPU__X8_INLINE __m128 spu__x8_z(__m128 x) { return _mm_cmplt_ps(spu__x8_abs(x), _mm_set1_ps(0x1p-126f)); }
++SPU__X8_INLINE __m128 spu__x8_inrange(__m128 r) { return _mm_cmplt_ps(spu__x8_abs(r), _mm_set1_ps(0x1.fffffep127f)); }
++SPU__X8_INLINE __m128 spu__x8_flush(__m128 r) { return _mm_andnot_ps(spu__x8_z(r), r); }
++SPU__X8_INLINE u128 spu__x8_rz_fa(u128 a, u128 b, uint32_t negb) {
++    const __m128 x = _mm_castsi128_ps(spu__x8_ld(a));
++    const __m128 y = _mm_castsi128_ps(_mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb)));
++    const __m128 s = _mm_add_ps(x, y);
++    const __m128i ok = _mm_castps_si128(spu__x8_inrange(s));
++    const __m128i r = _mm_castps_si128(spu__x8_flush(s));
++    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb);
++}
++SPU__X8_INLINE u128 spu__x8_rz_fm(u128 a, u128 b) {
++    const __m128 x = _mm_castsi128_ps(spu__x8_ld(a)), y = _mm_castsi128_ps(spu__x8_ld(b));
++    const __m128 zp = _mm_or_ps(spu__x8_z(x), spu__x8_z(y));              /* zero product */
++    const __m128 s = _mm_mul_ps(x, y);
++    const __m128i ok = _mm_castps_si128(_mm_or_ps(spu__x8_inrange(s), zp));
++    const __m128i r = _mm_castps_si128(_mm_andnot_ps(zp, spu__x8_flush(s)));
++    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b);
++}
++SPU__X8_INLINE u128 spu__x8_rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
++    const __m128 xa = _mm_castsi128_ps(spu__x8_ld(a)), y = _mm_castsi128_ps(spu__x8_ld(b));
++    const __m128 zc = _mm_castsi128_ps(spu__x8_ld(c));
++    const __m128 zp = _mm_or_ps(spu__x8_z(xa), spu__x8_z(y));             /* zero product */
++    const __m128 zi = _mm_andnot_ps(spu__x8_z(zc),                          /* zero addend: +0 */
++                                    _mm_xor_ps(zc, _mm_castsi128_ps(_mm_set1_epi32((int)negc))));
++    const __m128 x = _mm_xor_ps(xa, _mm_castsi128_ps(_mm_set1_epi32((int)negp)));
++    const __m128 s = _mm_fmadd_ps(x, y, zi);
++    const __m128i ok = _mm_castps_si128(_mm_or_ps(spu__x8_inrange(s), zp));
++    const __m128i r = _mm_castps_si128(_mm_blendv_ps(spu__x8_flush(s), zi, zp));
++    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc);
++}
++SPU__X8_INLINE u128 spu__x8_fa_m(u128 a, u128 b, uint32_t negb) {
++    return spu__x8_rz() ? spu__x8_rz_fa(a, b, negb) : spu__x8_fa(a, b, negb);
++}
++#define SPU__X8_FA(a, b, nb) spu__x8_fa_m(a, b, nb)
++#define SPU__X8_FM(a, b) (spu__x8_rz() ? spu__x8_rz_fm(a, b) : spu__x8_fm_exact(a, b))
++#define SPU__X8_FMA(a, b, c, np, nc) (spu__x8_rz() ? spu__x8_rz_fma(a, b, c, np, nc) : spu__x8_fma(a, b, c, np, nc))
++#else
++#define SPU__X8_FA(a, b, nb) spu__x8_fa(a, b, nb)
++#define SPU__X8_FM(a, b) spu__x8_fm_exact(a, b)
++#define SPU__X8_FMA(a, b, c, np, nc) spu__x8_fma(a, b, c, np, nc)
++#endif
++SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return SPU__X8_FA(a, b, 0); }
++SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return SPU__X8_FA(a, b, 0x80000000u); }
++SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return SPU__X8_FM(a, b); }
++SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0); }            /* a*b + c */
++SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__X8_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
++SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__X8_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+ #else
+ static inline u128 spu_fa(u128 a, u128 b) { return spu__fa_s(a, b); }
+ static inline u128 spu_fs(u128 a, u128 b) { return spu__fs_s(a, b); }
+@@ -1369,6 +1467,22 @@ static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :
+     if (__builtin_expect(m == 0, 1)) return f##_h_(a, b, c); \
+     spu__fpcr_put(0); __asm__ volatile("" : "+m"(a), "+m"(b), "+m"(c)); u128 r = f##_h_(a, b, c); \
+     __asm__ volatile("" : "+m"(r)); spu__fpcr_put(m); return r; }
++#elif defined(__x86_64__) || defined(_M_X64)
++/* x86 SPU_FLOAT_RZ (MXCSR round toward zero, FTZ, DAZ): the same bracket with MXCSR, in every
++ * TU (the interpreter and runtime build with SSE4.1 only, but run under the mode too). */
++#define SPU__DP_CSR_DEFAULT 0x1F80u
++#define SPU__DP_RN1(f) static inline u128 f(u128 a) { const unsigned m = _mm_getcsr(); \
++    if (__builtin_expect(!SPU_MXCSR_IS_RZ(m), 1)) return f##_h_(a); \
++    _mm_setcsr(SPU__DP_CSR_DEFAULT); __asm__ volatile("" : "+m"(a)); u128 r = f##_h_(a); \
++    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
++#define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { const unsigned m = _mm_getcsr(); \
++    if (__builtin_expect(!SPU_MXCSR_IS_RZ(m), 1)) return f##_h_(a, b); \
++    _mm_setcsr(SPU__DP_CSR_DEFAULT); __asm__ volatile("" : "+m"(a), "+m"(b)); u128 r = f##_h_(a, b); \
++    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
++#define SPU__DP_RN3(f) static inline u128 f(u128 a, u128 b, u128 c) { const unsigned m = _mm_getcsr(); \
++    if (__builtin_expect(!SPU_MXCSR_IS_RZ(m), 1)) return f##_h_(a, b, c); \
++    _mm_setcsr(SPU__DP_CSR_DEFAULT); __asm__ volatile("" : "+m"(a), "+m"(b), "+m"(c)); u128 r = f##_h_(a, b, c); \
++    __asm__ volatile("" : "+m"(r)); _mm_setcsr(m); return r; }
+ #else
+ #define SPU__DP_RN1(f) static inline u128 f(u128 a) { return f##_h_(a); }
+ #define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { return f##_h_(a, b); }
 diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
 index 08af5b11..351e88bc 100644
 --- a/runtime/spu/spu_overlay_residency.h
@@ -6488,3 +7164,758 @@ index 3ce8d0d6..0d19b91e 100644
      if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
          fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                  "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+diff --git a/runtime/spu/tests/test_spu_float_rz_mode.c b/runtime/spu/tests/test_spu_float_rz_mode.c
+index 3e96dc4e..08924674 100644
+--- a/runtime/spu/tests/test_spu_float_rz_mode.c
++++ b/runtime/spu/tests/test_spu_float_rz_mode.c
+@@ -2,7 +2,7 @@
+  * flush-to-zero and puts the caller's FPCR back on the way out -- after a normal return, after a
+  * halt (longjmp), and around a nested run. A run can happen synchronously on a PPU thread, whose
+  * floating point must keep round to nearest with denormals. Without SPU_FLOAT_RZ=1 FPCR is never
+- * touched. arm64 only. */
++ * touched. arm64 (FPCR) and x86-64 (MXCSR: round toward zero, FTZ, DAZ). */
+ #include "../spu_helpers.h"
+ #include "../spu_interp.h"
+ #include <assert.h>
+@@ -15,9 +15,21 @@ uint32_t ppu_vm_size;
+ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+ extern void spu_halt(spu_context*);
+ 
+-#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
++#if (defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)) || defined(__x86_64__)
++#if defined(__aarch64__)
+ static uint64_t fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+ static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
++#define MODE_DEFAULT 0ull
++#define MODE_UP      0x00400000ull           /* round toward +inf */
++#define MODE_RZ      SPU_FPCR_RZFZ
++#else
++/* MXCSR without the sticky exception flags (bits 0-5), which ordinary arithmetic sets */
++static uint64_t fpcr_get(void) { return _mm_getcsr() & ~0x3Fu; }
++static void fpcr_set(uint64_t v) { _mm_setcsr((unsigned)v); }
++#define MODE_DEFAULT 0x1F80ull
++#define MODE_UP      0x5F80ull               /* round toward +inf */
++#define MODE_RZ      ((uint64_t)SPU_MXCSR_RZFZ)
++#endif
+ 
+ static spu_context ctx, inner_ctx;
+ static uint64_t seen_inner, seen_outer_after;
+@@ -40,8 +52,8 @@ static void run(void (*entry)(spu_context*), uint64_t caller, const char* what)
+     spu_context_init(&ctx, 0);
+     spu_run_with_halt(entry, &ctx);
+     const uint64_t after = fpcr_get();
+-    fpcr_set(0);
+-    const uint64_t want_inner = rz ? SPU_FPCR_RZFZ : caller;
++    fpcr_set(MODE_DEFAULT);
++    const uint64_t want_inner = rz ? MODE_RZ : caller;
+     if (seen_inner != want_inner || after != caller ||
+         (entry == outer_nested && seen_outer_after != want_inner)) {
+         fprintf(stderr, "FAIL %s (SPU_FLOAT_RZ=%d, caller FPCR %llX): inside %llX (want %llX), "
+@@ -56,7 +68,7 @@ int main(void)
+ {
+     const char* e = getenv("SPU_FLOAT_RZ");
+     rz = e && !strcmp(e, "1");
+-    const uint64_t callers[] = { 0, 0x00400000ull /* round toward +inf */, SPU_FPCR_RZFZ };
++    const uint64_t callers[] = { MODE_DEFAULT, MODE_UP, MODE_RZ };
+     for (unsigned i = 0; i < sizeof callers / sizeof callers[0]; i++) {
+         run(leaf_return, callers[i], "return");
+         run(leaf_halt, callers[i], "halt");
+@@ -66,7 +78,7 @@ int main(void)
+     return 0;
+ }
+ #else
+-int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 only"); return 0; }
++int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 and x86-64 only"); return 0; }
+ #endif
+ 
+ /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 3a022815..27c422e7 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -8,6 +8,9 @@
+ #include "sys_timer.h"
+ #include "sys_ppu_thread.h"   /* ppu_thread_note_block */
+ #include <time.h>
++#ifndef _WIN32
++#include <sched.h>   /* sched_yield: PS3_USLEEP_LOCKWAIT */
++#endif
+ #include "sys_event.h"
+ #include "../memory/vm.h"
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+@@ -276,6 +279,99 @@ int64_t sys_timer_usleep(ppu_context* ctx)
+         } while (qpc_now.QuadPart < qpc_deadline);
+     }
+ #else
++    /* PS3_USLEEP_LOCKWAIT="<lr>[,<lr>...]:<reg>": a usleep reached from one of
++     * these return addresses is a spinlock's back-off and register <reg> holds
++     * the lock word's address. Wait until that word reads 0 (or the time is
++     * up) instead of sleeping the full period. The guest's own spin gives up
++     * after a fixed iteration count, which on the host is well under a
++     * microsecond, then sleeps (Pacific Rift: 250 us, func_004B63F0) while the
++     * lock is usually released a few microseconds later; its main thread spent
++     * ~40% of each race frame there with the lock free. An early return is
++     * indistinguishable from a short sleep, and the guest retries the lock. */
++    if (usec > 0 && usec <= 2000) {
++        static int s_lw_n = -1;
++        static uint32_t s_lw_lr[128];
++        static int s_lw_reg;
++        if (s_lw_n < 0) {
++            int n = 0;
++            const char* e = getenv("PS3_USLEEP_LOCKWAIT");
++            if (e && *e) {
++                const char* c = strchr(e, ':');
++                s_lw_reg = c ? atoi(c + 1) : 29;
++                if (s_lw_reg < 0 || s_lw_reg > 31) s_lw_reg = 29;
++                for (const char* q = e; *q && *q != ':' && n < 128; ) {
++                    char* end;
++                    unsigned long v = strtoul(q, &end, 16);
++                    if (end == q) break;
++                    s_lw_lr[n++] = (uint32_t)v;
++                    q = (*end == ',') ? end + 1 : end;
++                }
++            }
++            s_lw_n = n;
++        }
++        int hit = 0;
++        for (int i = 0; i < s_lw_n; i++) if ((uint32_t)ctx->lr == s_lw_lr[i]) { hit = 1; break; }
++        const uint32_t lock = hit ? (uint32_t)ctx->gpr[s_lw_reg] : 0;
++        if (hit && vm_base && lock >= 0x10000u) {
++            struct timespec t0, now;
++            clock_gettime(CLOCK_MONOTONIC, &t0);
++            const uint64_t end_ns = (uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec + usec * 1000ull;
++            const volatile uint32_t* w = (const volatile uint32_t*)(vm_base + lock);
++            int freed = 0;
++            for (unsigned k = 0;; k++) {
++                if (*w == 0) { freed = 1; break; }
++                if (k < 64) { __builtin_ia32_pause(); continue; }
++                clock_gettime(CLOCK_MONOTONIC, &now);
++                if ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec >= end_ns) break;
++                if (k < 512) sched_yield();
++                else { struct timespec d = { 0, 20000 }; nanosleep(&d, NULL); }
++            }
++            /* PS3_USLEEP_LOCKWAIT_STATS=1: every 2 s, waits ended by the lock
++             * coming free vs by the timeout, and the time spent. */
++            { static int st = -1; if (st < 0) st = getenv("PS3_USLEEP_LOCKWAIT_STATS") ? 1 : 0;
++              if (st) {
++                  static unsigned long long nfree, ntime, ns_sum, t_last;
++                  clock_gettime(CLOCK_MONOTONIC, &now);
++                  const uint64_t n_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
++                  const uint64_t s_ns = (uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec;
++                  if (freed) nfree++; else ntime++;
++                  if (!freed) { static int _k = 0; if (_k++ < 12)
++                      fprintf(stderr, "[lockwait] timeout tid=%u lr=0x%08X lock=0x%08X word=%08X\n",
++                              (unsigned)ctx->thread_id, (uint32_t)ctx->lr, lock, __builtin_bswap32(*w)); }
++                  ns_sum += n_ns - s_ns;
++                  if (!t_last) t_last = n_ns;
++                  if (n_ns - t_last > 2000000000ull) {
++                      fprintf(stderr, "[lockwait] freed %llu, timed out %llu, %.1f ms waited in %.1f s\n",
++                              nfree, ntime, ns_sum / 1e6, (n_ns - t_last) / 1e9);
++                      nfree = ntime = ns_sum = 0; t_last = n_ns;
++                  }
++              } }
++            return CELL_OK;
++        }
++    }
++    /* PS3_USLEEP_CAP="<lr>:<us>[,<lr>:<us>...]": a usleep from one of these
++     * return addresses sleeps at most <us>. For a guest poll loop whose period
++     * is pure latency (Pacific Rift's JobBatchHandler polls SPU job completion
++     * with usleep(200) and the main thread waits on it every job batch). */
++    if (usec > 0) {
++        static int s_cap_n = -1;
++        static uint32_t s_cap_lr[16], s_cap_us[16];
++        if (s_cap_n < 0) {
++            int n = 0;
++            const char* e = getenv("PS3_USLEEP_CAP");
++            for (const char* q = e; q && *q && n < 16; ) {
++                char* end;
++                unsigned long lr = strtoul(q, &end, 16);
++                if (end == q || *end != ':') break;
++                unsigned long us = strtoul(end + 1, &end, 10);
++                s_cap_lr[n] = (uint32_t)lr; s_cap_us[n] = (uint32_t)us; n++;
++                q = (*end == ',') ? end + 1 : end;
++            }
++            s_cap_n = n;
++        }
++        for (int i = 0; i < s_cap_n; i++)
++            if ((uint32_t)ctx->lr == s_cap_lr[i] && usec > s_cap_us[i]) { usec = s_cap_us[i]; break; }
++    }
+     if (usec > 0) {
+         struct timespec ts;
+         ts.tv_sec  = (time_t)(usec / 1000000);
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 35d8d428..8cf46ef1 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -47,6 +47,7 @@ import argparse
+ import json
+ import os
+ import re
++import shlex
+ import sys
+ from dataclasses import dataclass, field
+ 
+@@ -197,6 +198,152 @@ def _chan(token: str) -> str:
+ # Lifter
+ # ---------------------------------------------------------------------------
+ 
++# ---------------------------------------------------------------------------
++# Register localization (--local-regs)
++# ---------------------------------------------------------------------------
++# Every lifted statement reads and writes the guest registers in ctx->gpr[], and
++# the lifted TUs build with -fno-strict-aliasing: each local-store write (a store
++# through a may_alias pointer) forces the compiler to reload every register it
++# is holding, and each value then reaches its next use through memory, a
++# store-to-load forwarding round trip on the critical path. With --local-regs, a
++# function's registers live in locals between the points where something else
++# can look at ctx: a register is written back before and reloaded after any
++# statement that passes ctx to anything but the local-store accessors, and
++# written back before every exit. The statements that do cross that line run
++# unchanged against ctx->gpr, so they need no knowledge of what each callee
++# reads or writes. (Ported from the MotorStorm Apocalypse port's lifter and
++# adapted to this lifter's SPU_DIRECT exits and merged-chunk interrupt checks.)
++_GPR_RE = re.compile(r"ctx->gpr\[(\d+)\]")
++_GPR_WRITE_RE = re.compile(
++    r"ctx->gpr\[(\d+)\](?:\._\w+\[\d+\])?\s*(?:[-+*/|&^%]|<<|>>)?=(?!=)|&ctx->gpr\[(\d+)\]")
++# Calls that take ctx but touch no register: the local-store accessors (their
++# register reads are debug-watch output only), the MFC parameter channel writes
++# (mfc_channel_write latches ctx->mfc_*), and the --const-bi interrupt helpers.
++_SAFE_CTX_RE = re.compile(r"spu_ls_(?:read|write)128\(ctx,|"
++                          r"spu_wrch\(ctx, MFC_(?:LSA|EAH|EAL|Size|TagID),|spu_int_set\(ctx,|"
++                          r"spu_irq_pending\(ctx\)")
++# The --merge-chunks chunk-entry interrupt test reads only interrupt state.
++_IRQ_TEST_RE = re.compile(r"ctx->int_enable && \(ctx->event_status & ctx->event_mask\)")
++_LABEL_RE = re.compile(r"loc_[0-9A-Fa-f]+:")
++
++
++def _lr_pure(s: str) -> bool:
++    """No ctx access but the registers and the local-store accessors, no exit,
++    and no register access _lr_local cannot rewrite."""
++    if "&ctx->gpr" in s or re.search(r"ctx->gpr\[\d+\]\._(?!u32\[\d+\]|u16\[\d+\])", s) \
++            or re.search(r"ctx->gpr\[\d+\](?:\._\w+\[\d+\])?\s*(?:[-+*/|&^%]|<<|>>)=", s) \
++            or re.search(r"ctx->gpr\[\d+\]\._\w+\[\d+\]\s*=(?!=)", s):
++        return False
++    t = _IRQ_TEST_RE.sub("1", _SAFE_CTX_RE.sub("(", _GPR_RE.sub("", s)))
++    return (re.search(r"\bctx\b", t) is None and "return" not in t
++            and "g_spu_trampoline_fn" not in t and "longjmp" not in t.lower())
++
++
++# The locals are GCC vectors (spu_v4u, runtime/spu/spu_helpers.h), not u128: a
++# union with array members is kept in memory -- every local went to the stack,
++# which was slower than ctx. Whole-register values cross into and out of the
++# u128 helpers through spu_u2v/spu_v2u, which compile to nothing.
++def _lr_reads(e: str) -> str:
++    e = re.sub(r"ctx->gpr\[(\d+)\]\._u32\[(\d+)\]", r"sr\1[\2]", e)
++    e = re.sub(r"ctx->gpr\[(\d+)\]\._u16\[(\d+)\]", r"((spu_v8u16)sr\1)[\2]", e)
++    return _GPR_RE.sub(lambda m: f"spu_v2u(sr{m.group(1)})", e)
++
++
++def _lr_local(s: str) -> str:
++    s = re.sub(r"ctx->gpr\[(\d+)\]\s*=(?!=)\s*([^;]*);",
++               lambda m: f"sr{m.group(1)} = spu_u2v({_lr_reads(m.group(2))});", s)
++    return _lr_reads(s)
++
++
++def _lr_exit(inner: str) -> bool:
++    """A block body that always leaves the function and does nothing a register
++    write-back placed in front of it could not cover."""
++    t = inner.strip()
++    if re.fullmatch(r"(?:ctx->int_enable = \d; )?(?:SPU_RET(?:_REG)?\(ctx(?:, \d+)?\)|"
++                    r"SPU_DIRECT\(ctx, 0x[0-9A-Fa-f]+, \w+\));", t):
++        return True
++    if not t.endswith("return;") or re.search(r"\)\s*return;$", t):
++        return False
++    return re.search(r"\b(?:if|while|for|goto|switch)\b|[{}]", t) is None
++
++
++def _lr_split_if(s: str):
++    """`if (COND) { INNER }` -> (indent, COND, INNER), or None."""
++    m = re.match(r"^(\s*)if \(", s)
++    if not m or not s.rstrip().endswith("}"):
++        return None
++    i, depth = m.end(), 1
++    while i < len(s) and depth:
++        depth += {"(": 1, ")": -1}.get(s[i], 0)
++        i += 1
++    if depth:
++        return None
++    rest = s[i:].strip()
++    if not (rest.startswith("{") and rest.endswith("}")):
++        return None
++    return m.group(1), s[m.end():i - 1], rest[1:-1]
++
++
++def localize_registers(lines: list[str]) -> list[str]:
++    used: set[int] = set()
++    written: set[int] = set()
++    plan = []
++    for line in lines:
++        st = line.strip()
++        if _LABEL_RE.fullmatch(st):
++            plan.append(("raw", line))
++            continue
++        if _lr_pure(line):
++            used.update(int(n) for n in _GPR_RE.findall(line))
++            written.update(int(a or b) for a, b in _GPR_WRITE_RE.findall(line))
++            plan.append(("pure", line))
++            continue
++        sp = _lr_split_if(line)
++        if sp and _lr_pure(sp[1]) and _lr_exit(sp[2]):
++            used.update(int(n) for n in _GPR_RE.findall(sp[1]))
++            plan.append(("cond_exit", sp))
++            continue
++        if st.startswith("{") and st.endswith("}") and _lr_exit(st[1:-1]):
++            plan.append(("exit", (line[:len(line) - len(line.lstrip())], st[1:-1])))
++            continue
++        if _lr_exit(st):
++            plan.append(("bare_exit", line))
++            continue
++        # A sync statement is bracketed by a write-back and a reload; one that
++        # could leave sideways would skip the reload.
++        if re.search(r"\b(?:goto|break|continue)\b", line):
++            raise ValueError(f"--local-regs: control transfer in a ctx statement: {line.strip()}")
++        plan.append(("sync", line))
++    if not used:
++        return lines
++    wb = " ".join(f"ctx->gpr[{n}] = spu_v2u(sr{n});" for n in sorted(written))
++    rl = " ".join(f"sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))
++    out = ["    " + " ".join(f"spu_v4u sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))]
++    for kind, v in plan:
++        if kind == "raw":
++            out.append(v)
++        elif kind == "pure":
++            out.append(_lr_local(v))
++        elif kind == "cond_exit":
++            ind, cond, inner = v
++            out.append(f"{ind}if ({_lr_local(cond)}) {{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
++        elif kind == "exit":
++            ind, inner = v
++            out.append(f"{ind}{{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
++        elif kind == "bare_exit":
++            out.append(f"    {wb}" if wb else "    /* no register written */;")
++            out.append(v)
++        else:
++            if wb:
++                out.append(f"    {wb}")
++            out.append(v)
++            out.append(f"    {rl}")
++    last = next((k for k, _ in reversed(plan) if k != "raw"), None)
++    if last not in ("exit", "bare_exit") and wb:
++        out.append(f"    {wb}")
++    return out
++
++
+ @dataclass
+ class LiftedFunction:
+     name: str = ""
+@@ -375,6 +522,52 @@ def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
+     return groups
+ 
+ 
++_FLOW_BREAKS = {"bi", "iret", "biz", "binz", "bihz", "bihnz", "br", "bra", "brz",
++                "brnz", "brhz", "brhnz", "brsl", "brasl", "bisl", "bisled",
++                "stop", "stopd"}
++
++
++def compute_const_bi_targets(insns, bounds) -> dict:
++    """`bi $rN` sites whose target is a constant: the nearest write to rN in
++    the same chunk, with no branch, call or stop between, is an `il`/`ila`.
++
++    That is how Sony's SPU code moves between the halves of an interrupt
++    window -- `ila $r3,<resume> / bid $r3` -- and it is most of the indirect
++    transfers in WWS job modules. Lifted as an indirect transfer, each goes
++    back to the drain loop, through spu_indirect_branch and a registry lookup,
++    to land on an address known at lift time. A chunk starts at every branch
++    target, so nothing enters between the load and the branch. Returns
++    {bi addr: target}. (Ported from the MotorStorm Apocalypse port's lifter.)"""
++    out = {}
++    ordered = sorted(insns, key=lambda x: x.addr)
++    # Every direct branch target is a place control can arrive from
++    # elsewhere: the scan stops there whatever the bounds are (sized symbols
++    # or --functions bounds need not split at each one).
++    entries = {t for t in (SPULifter._branch_target(i) for i in ordered) if t is not None}
++    for (s, e) in bounds:
++        fn = [i for i in ordered if s <= i.addr < e]
++        for idx, insn in enumerate(fn):
++            if insn.mnemonic != "bi":
++                continue
++            reg = _bi_target_reg(insn)
++            if reg is None:
++                continue
++            r = int(reg)
++            for j in range(idx - 1, -1, -1):
++                w = fn[j]
++                if w.mnemonic in _FLOW_BREAKS or fn[j + 1].addr in entries:
++                    break
++                if w.mnemonic in _NO_RT_WRITE or _dest_reg(w) != r:
++                    continue
++                if w.mnemonic == "ila":
++                    out[insn.addr] = ((w.raw >> 7) & 0x3FFFF) & 0x3FFFC
++                elif w.mnemonic == "il":
++                    v = (w.raw >> 7) & 0xFFFF
++                    out[insn.addr] = (v - 0x10000 if v & 0x8000 else v) & 0x3FFFC
++                break
++    return out
++
++
+ def compute_link_returns(insns, bounds) -> set:
+     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
+     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
+@@ -529,6 +722,16 @@ class SPULifter:
+         # compute_link_returns(). Emitted as `return;` so they compose with the
+         # brsl->C-call nesting instead of branching to an unregistered PC.
+         self.link_return: set = set()
++        # `bi $rN` sites with a constant target (compute_const_bi_targets,
++        # --const-bi): {addr: target}. Empty => every one dispatches indirectly.
++        self.const_bi: dict = {}
++        # Targets a direct trampoline must not take: where spu_indirect_branch
++        # does more than dispatch (kernel and policy-module services, job
++        # return), and call-return addresses, which the drain recognises as
++        # a return only through spu_indirect_branch.
++        self.const_bi_unsafe: set = set()
++        # --local-regs: emit_source runs localize_registers on every body.
++        self.local_regs: bool = False
+ 
+     # ------------------------------------------------------------------ #
+     def lift_function(self, insns: list[SPUInstruction],
+@@ -549,6 +752,11 @@ class SPULifter:
+         # every transfer. As gotos they would not, and a job waiting in a loop
+         # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
+         # each merged chunk entry hands back to the drain when one is pending.
++        for insn in insns:
++            if start <= insn.addr < end:
++                ct = self._const_bi_goto(insn, start, end)
++                if ct is not None:
++                    internal.add(ct)
+         merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
+         last_insn = None
+         for insn in insns:
+@@ -565,7 +773,8 @@ class SPULifter:
+             if c:
+                 if self.trace:
+                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
+-                func.body_lines.append(f"    {c}")
++                # One statement per line: --local-regs classifies lines.
++                func.body_lines.extend(f"    {part}" for part in c.split("\n"))
+                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
+                     rt_idx = insn.raw & 0x7F
+                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
+@@ -971,6 +1180,28 @@ class SPULifter:
+                 if tgt_reg != "0":
+                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
+                 return f"{_ied}SPU_RET(ctx);"
++            # --const-bi: rN was just loaded with il/ila (compute_const_bi_targets).
++            ct = self.const_bi.get(addr)
++            if ct is not None:
++                if self._const_bi_goto(insn, func.start_addr, func.end_addr) is not None:
++                    # spu_int_set, not a ctx store: --local-regs keeps the
++                    # registers in locals across it. Unless the branch disables
++                    # interrupts, one pending now is taken where the drain loop
++                    # would have taken it: on the way out.
++                    parts = []
++                    if insn.raw & 0x40000:
++                        parts.append("spu_int_set(ctx, 1);")
++                    elif insn.raw & 0x80000:
++                        parts.append("spu_int_set(ctx, 0);")
++                    if not insn.raw & 0x80000:
++                        parts.append(f"if (spu_irq_pending(ctx)) {{ ctx->pc = 0x{ct:X}; "
++                                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
++                    parts.append(f"goto loc_{ct:08X};")
++                    return "\n".join(parts)
++                if ct in getattr(self, "func_starts", set()) and ct not in self.const_bi_unsafe:
++                    self.branch_targets.add(ct)
++                    return (f"{_ied}ctx->pc = 0x{ct:X}; "
++                            f"g_spu_trampoline_fn = {self.prefix}spu_func_{ct:08X}; return;")
+             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+@@ -1047,6 +1278,23 @@ class SPULifter:
+         }
+         return table.get(mn, f"{word} != 0")
+ 
++    def _const_bi_goto(self, insn, start, end):
++        """The target of a constant `bi` that can be a goto: inside this
++        function. The drain loop it skips is where a pending interrupt is
++        taken, so a goto that does not disable interrupts checks for one first
++        (spu_irq_pending)."""
++        if insn.mnemonic != "bi":
++            return None
++        ct = self.const_bi.get(insn.addr)
++        # Forward only: a backward goto would be a loop with no hop in it,
++        # which neither the step budget nor a stop request can end.
++        if ct is None or ct == 0 or not (start <= ct < end) or ct <= insn.addr:
++            return None
++        if insn.addr in self.link_return or \
++                (_bi_target_reg(insn) == "0" and insn.addr not in self.bi_r0_jump):
++            return None
++        return ct
++
+     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
+         if tgt is None:
+             return "/* TODO spu: unresolved branch */;"
+@@ -1082,7 +1330,8 @@ class SPULifter:
+         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+         for f in self.functions:
+             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
+-            for b in f.body_lines:
++            body = localize_registers(f.body_lines) if self.local_regs else f.body_lines
++            for b in body:
+                 lines.append(b if b.endswith(":") else f"    {b}")
+             lines.append("}")
+             lines.append("")
+@@ -1179,6 +1428,15 @@ def main() -> None:
+                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
+                         "which append a zlib inflate string table + float tables "
+                         "after the code at 0xAE68 / 0xAE48).")
++    p.add_argument("--local-regs", action="store_true",
++                   help="Keep each function's registers in C locals (GCC vectors) "
++                        "between the statements that hand ctx to the runtime, "
++                        "instead of storing to and reloading from ctx->gpr[] on "
++                        "every instruction (see localize_registers). Speed only.")
++    p.add_argument("--const-bi", action="store_true",
++                   help="Dispatch `bi $rN` directly when rN was just loaded with "
++                        "il/ila: a goto for a forward target inside the function, a "
++                        "direct trampoline otherwise (compute_const_bi_targets).")
+     p.add_argument("--merge-chunks", action="store_true",
+                    help="Emit each run of contiguous chunks from one call target "
+                         "to the next as ONE C function (branches between them "
+@@ -1197,7 +1455,10 @@ def main() -> None:
+                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
+                         "dispatched blocks later -- classified as a return, which "
+                         "silently skipped every job-command handler).")
+-    args = p.parse_args()
++    # SPU_LIFTER_ARGS: extra options for every lift a driver runs (e.g.
++    # "--local-regs --const-bi"), including lifts started by
++    # build_spu_workloads.py and lift_jobmods.py, which have no pass-through.
++    args = p.parse_args(sys.argv[1:] + shlex.split(os.environ.get("SPU_LIFTER_ARGS", "")))
+ 
+     if args.auto_functions:
+         from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
+@@ -1332,6 +1593,13 @@ def main() -> None:
+               f"(`bi $rN` where rN is a brsl/bisl link reg): "
+               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
+     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
++    lifter.local_regs = args.local_regs
++    if args.const_bi:
++        lifter.const_bi = compute_const_bi_targets(insns, bounds)
++        lifter.const_bi_unsafe = {0x0, 0xA00, 0xA70, 0x290, 0x808, 0x3FF00} | {
++            (i.addr + 4) & 0x3FFFC for i in insns
++            if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")}
++        print(f"  {len(lifter.const_bi)} constant-target `bi` site(s) (--const-bi)")
+     groups = {}
+     if args.merge_chunks:
+         seeds = {base}
+diff --git a/tools/test_spu_lifter_local_regs.py b/tools/test_spu_lifter_local_regs.py
+new file mode 100644
+index 00000000..642fd407
+--- /dev/null
++++ b/tools/test_spu_lifter_local_regs.py
+@@ -0,0 +1,208 @@
++#!/usr/bin/env python3
++"""--local-regs and --const-bi must not change what a lifted program computes.
++
++--local-regs keeps a function's registers in C locals and syncs them with
++ctx->gpr only around statements that hand ctx to the runtime and before every
++exit; --const-bi turns `bi $rN` after `il/ila $rN` into a goto or a direct
++trampoline. Each fixture is lifted with and without the options, compiled, run
++and compared:
++
++  * the --merge-chunks interrupt loop: the counter lives in a local while the
++    drain's handler writes r5 in ctx, so the result needs the write-back at the
++    chunk-entry exit and the reload when the function is entered again;
++  * a constant `bi` that becomes a goto, with a local-store round trip;
++  * an opaque runtime call (wrch to the outbound mailbox) that must see the
++    registers written just before it and whose register writes must be seen
++    after it.
++
++Usage:
++    python3 tools/test_spu_lifter_local_regs.py
++"""
++
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++TOOLS = Path(__file__).resolve().parent
++RUNTIME = TOOLS.parent / 'runtime' / 'spu'
++sys.path.insert(0, str(TOOLS))
++
++from spu_disasm import disassemble_spu  # noqa: E402
++from spu_lifter import (SPULifter, merge_chunk_groups,  # noqa: E402
++                        compute_const_bi_targets, localize_registers)
++
++
++def ri16(op9, i16, rt):
++    return (op9 << 23) | ((i16 & 0xFFFF) << 7) | rt
++
++
++def ri18(op7, i18, rt):
++    return (op7 << 25) | ((i18 & 0x3FFFF) << 7) | rt
++
++
++def ri10(op8, i10, ra, rt):
++    return (op8 << 24) | ((i10 & 0x3FF) << 14) | (ra << 7) | rt
++
++
++def rr(op11, rb, ra, rt):
++    return (op11 << 21) | (rb << 14) | (ra << 7) | rt
++
++
++IL, ILA, AI, CEQI, OR, BRZ, BI = 0x081, 0x21, 0x1C, 0x7C, 0x041, 0x040, 0x1A8
++STQD, LQD, WRCH, A = 0x24, 0x34, 0x10D, 0x0C0
++
++# 1. The --merge-chunks interrupt loop: count r3 up until the handler sets r5.
++LOOP = ([ri16(IL, 0, 3),                      # 0x00 il   $3, 0
++         ri10(AI, 1, 3, 3),                   # 0x04 ai   $3, $3, 1   <- loop
++         ri10(CEQI, 100, 3, 6),               # 0x08 ceqi $6, $3, 100
++         rr(OR, 6, 5, 7),                     # 0x0C or   $7, $5, $6
++         ri16(BRZ, (0x04 - 0x10) >> 2, 7),    # 0x10 brz  $7, 0x04
++         rr(BI, 0, 0, 0)],                    # 0x14 bi   $0
++        [(0x00, 0x04), (0x04, 0x18)])
++
++# 2. A constant `bi` forward inside the function, around an LS round trip.
++CONSTBI = ([ri16(IL, 5, 3),                   # 0x00 il   $3, 5
++            ri16(IL, 0, 9),                   # 0x04 il   $9, 0
++            ri10(STQD, 0x100 >> 4, 9, 3),     # 0x08 stqd $3, 0x100($9)
++            ri18(ILA, 0x18, 4),               # 0x0C ila  $4, 0x18
++            rr(BI, 0, 4, 0),                  # 0x10 bi   $4  -> 0x18
++            ri16(IL, 99, 5),                  # 0x14 il   $5, 99  (skipped)
++            ri10(LQD, 0x100 >> 4, 9, 5),      # 0x18 lqd  $5, 0x100($9)
++            ri10(AI, 1, 5, 5),                # 0x1C ai   $5, $5, 1
++            rr(BI, 0, 0, 0)],                 # 0x20 bi   $0
++           [(0x00, 0x24)])
++
++# 3. wrch $ch28 (SPU_WrOutMbox) between register work done in locals.
++SYNC = ([ri16(IL, 11, 6),                     # 0x00 il   $6, 11
++         ri10(AI, 2, 6, 6),                   # 0x04 ai   $6, $6, 2   (13)
++         rr(WRCH, 0, 28, 6),                  # 0x08 wrch $ch28, $6
++         ri10(AI, 1, 7, 8),                   # 0x0C ai   $8, $7, 1   (r7 set by the call)
++         rr(A, 6, 8, 8),                      # 0x10 a    $8, $8, $6
++         rr(BI, 0, 0, 0)],                    # 0x14 bi   $0
++        [(0x00, 0x18)])
++
++DRIVER = r'''
++#include "lifted.h"
++#include <stdio.h>
++#include <string.h>
++SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
++volatile int g_spu_direct = 0;              /* SPU_DIRECT off: every hop drains */
++uint8_t g_spu_stack_reset_hint[1024];
++int g_spu_ls_watch_n = 0;
++static int returned, indirect;
++static uint32_t seen6 = 0xFFFFFFFF;
++void spu_indirect_branch(spu_context* ctx) { (void)ctx; indirect++; returned = 1; }
++void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }
++void spu_ls_watch_slow(uint32_t lsa, int w, const uint8_t* p, uint32_t pc, uint32_t lr)
++{ (void)lsa; (void)w; (void)p; (void)pc; (void)lr; }
++void spu_wrch(spu_context* ctx, uint32_t ch, u128 v)
++{
++    (void)ch; (void)v;
++    seen6 = ctx->gpr[6]._u32[0];            /* written back before the call? */
++    ctx->gpr[7]._u32[0] = 42;               /* reloaded after it? */
++}
++int main(void) {
++    static spu_context c;
++    static uint8_t ls[SPU_LS_SIZE];
++    uint32_t taken_at = 0;
++    c.ls = ls;
++    c.int_enable = FIXTURE_IRQ; c.event_mask = 1; c.event_status = 1;
++    spu_func_00000000(&c);
++    /* The drain: deliver a pending interrupt before each transfer. The
++     * "handler" acknowledges the event and sets r5, ending the wait loop. */
++    while (g_spu_trampoline_fn && !returned) {
++        void (*fn)(spu_context*) = g_spu_trampoline_fn;
++        g_spu_trampoline_fn = 0;
++        if (c.int_enable && (c.event_status & c.event_mask)) {
++            taken_at = c.pc; c.event_status = 0; c.gpr[5]._u32[0] = 1;
++        }
++        fn(&c);
++    }
++    printf("%x %u %u %u %u %d\n", taken_at, c.gpr[3]._u32[0], c.gpr[5]._u32[0],
++           c.gpr[8]._u32[0], seen6, indirect);
++    return 0;
++}
++'''
++
++
++def lift(fixture, merge=False, local_regs=False, const_bi=False):
++    words, bounds = fixture
++    insns = disassemble_spu(b''.join(struct.pack('>I', w) for w in words), 0)
++    lifter = SPULifter()
++    lifter.func_starts = {s for s, _ in bounds}
++    lifter.local_regs = local_regs
++    if const_bi:
++        lifter.const_bi = compute_const_bi_targets(insns, bounds)
++    groups = merge_chunk_groups(insns, bounds, 4096, entry_points={0}) if merge else {}
++    for s, e in bounds:
++        lifter.lift_function(insns, s, groups.get(s, e))
++    return lifter
++
++
++class LocalRegs(unittest.TestCase):
++
++    def run_program(self, lifter, irq):
++        cc = shutil.which('clang') or shutil.which('cc')
++        if not cc:
++            if os.environ.get('CI'):
++                self.fail('C compiler required in CI')
++            self.skipTest('C compiler unavailable')
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            context = (RUNTIME / 'spu_context.h').as_posix()
++            helpers = (RUNTIME / 'spu_helpers.h').as_posix()
++            (root / 'lifted.h').write_text(lifter.emit_header().replace(
++                '../../runtime/spu/spu_context.h', context))
++            src = lifter.emit_source('lifted.h').replace('../../runtime/spu/spu_helpers.h', helpers)
++            (root / 'lifted.c').write_text(src)
++            (root / 'driver.c').write_text(DRIVER)
++            exe = root / ('proof.exe' if sys.platform == 'win32' else 'proof')
++            built = subprocess.run([cc, '-O2', '-std=gnu11', f'-DFIXTURE_IRQ={irq}',
++                                    '-I', str(RUNTIME), '-o', str(exe),
++                                    str(root / 'lifted.c'), str(root / 'driver.c')],
++                                   capture_output=True, text=True)
++            self.assertEqual(built.returncode, 0, built.stderr + src)
++            ran = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++            self.assertEqual(ran.returncode, 0, ran.stderr)
++            return ran.stdout.split(), src
++
++    def test_interrupt_loop_same_with_local_regs(self):
++        base, _ = self.run_program(lift(LOOP, merge=True), 1)
++        lr, src = self.run_program(lift(LOOP, merge=True, local_regs=True), 1)
++        self.assertEqual(base[:2], ['4', '1'])
++        self.assertEqual(lr, base)
++        self.assertIn('spu_v4u sr3', src)
++
++    def test_const_bi_goto_and_ls_round_trip(self):
++        base, _ = self.run_program(lift(CONSTBI), 0)
++        lr, src = self.run_program(lift(CONSTBI, local_regs=True, const_bi=True), 0)
++        # Without --const-bi, `bi $4` leaves through spu_indirect_branch (the
++        # driver's stub ends the run there); with it, a goto reaches 0x18 (the
++        # one indirect left is the final `bi $0` at host depth 0).
++        self.assertEqual(base[2], '0')
++        self.assertEqual(base[5], '1')
++        self.assertEqual(lr[2], '6')                    # r5 = LS[0x100] + 1
++        self.assertEqual(lr[1], '5')                    # r3 written back at the exit
++        self.assertIn('goto loc_00000018;', src)
++        self.assertIn('spu_irq_pending(ctx)', src)
++
++    def test_runtime_call_sees_and_returns_registers(self):
++        base, _ = self.run_program(lift(SYNC), 0)
++        lr, src = self.run_program(lift(SYNC, local_regs=True), 0)
++        self.assertEqual(base[3:5], ['56', '13'])       # r8 = 42 + 1 + 13; wrch saw r6 = 13
++        self.assertEqual(lr, base)
++        self.assertIn('ctx->gpr[6] = spu_v2u(sr6);', src)
++
++    def test_control_transfer_in_ctx_statement_is_refused(self):
++        with self.assertRaises(ValueError):
++            localize_registers(['    ctx->gpr[1] = spu_il(1);',
++                                '    if (spu_rdch(ctx, 0)._u32[0]) goto loc_00000010;'])
++
++
++if __name__ == '__main__':
++    unittest.main()

@@ -46,6 +46,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>     /* clock_gettime: PS3RECOMP_FLIPLOG */
+#include <string>
+#ifdef _WIN32
+#include <direct.h>   /* _mkdir: the shader cache directory */
+#else
+#include <sys/stat.h> /* mkdir: the shader cache directory */
+#endif
 
 #ifndef _WIN32
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
@@ -494,7 +500,52 @@ int main(int argc, char** argv)
      * MFC channel access takes a rwlock and walks the engine list, ~20% of the
      * race's SPU job thread. Race 8.4 -> 10.6 fps with it. */
     setenv("SPU_MFC_LOOKUP_CACHE", "1", 0);
+    /* SPU single precision on native SSE ops (runtime/spu/spu_helpers.h,
+     * spu_float_mode_enter): SPU code runs with MXCSR at round toward zero,
+     * FTZ and DAZ, so fa/fm/fma are one native op plus a range check instead
+     * of the exact f64 emulation. Bit-identical (test_spu_float_exact under
+     * the mode). Race job CPU per frame ~-19%, race +6-15% fps.
+     * SPU_FLOAT_RZ=0 restores the exact forms. */
+    setenv("SPU_FLOAT_RZ", "1", 0);
+    /* DEVIATION FROM HARDWARE: the game adds its three WWS job lists (Wws_Job,
+     * EvoDefault, EvoHigh) with maxContention=1, so each list runs on one SPU
+     * and every race job runs serially. The WWS job manager claims jobs
+     * atomically and orders them with its own barriers, so a list can be
+     * shared; let each run on up to 3 virtual SPUs (libs/spurs/cellSpurs.c).
+     * Race 7.9 -> 13.5 fps, visuals and a 3-minute race soak clean; 4 and 5
+     * gave no more. SPURS_MAXCONT_MIN=1 restores the hardware behaviour. */
+    setenv("SPURS_MAXCONT_MIN", "3", 0);
 #endif
+
+    /* Translated guest shaders kept on disk (rsx_shader_spirv.cpp's cache:
+     * one file per shader, keyed by stage + the whole HLSL text, which
+     * carries every piece of state the translation baked in, and checked
+     * against the glslang version and the translator's build). glslang plus
+     * the SPIR-V legaliser take 20-150 ms per new shader on the FIFO thread,
+     * so the first race showed a hitch for each one; from the second run on
+     * they load from <user dir>/shader_cache. PS3RECOMP_SPIRV_CACHE=<dir>
+     * picks another directory; PS3RECOMP_SPIRV_CACHE=0 turns it off. */
+    {
+        const char* sc = getenv("PS3RECOMP_SPIRV_CACHE");
+        if (sc && !strcmp(sc, "0")) {
+#ifdef _WIN32
+            _putenv_s("PS3RECOMP_SPIRV_CACHE", "");
+#else
+            unsetenv("PS3RECOMP_SPIRV_CACHE");
+#endif
+        } else if (!sc || !*sc) {
+            const char* u = getenv("PS3_USER_DIR");
+            std::string dir = std::string(u && *u ? u : "user");
+            std::string cache = dir + "/shader_cache";
+#ifdef _WIN32
+            _mkdir(dir.c_str()); _mkdir(cache.c_str());
+            _putenv_s("PS3RECOMP_SPIRV_CACHE", cache.c_str());
+#else
+            mkdir(dir.c_str(), 0755); mkdir(cache.c_str(), 0755);
+            setenv("PS3RECOMP_SPIRV_CACHE", cache.c_str(), 1);
+#endif
+        }
+    }
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
