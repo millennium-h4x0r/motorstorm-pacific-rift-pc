@@ -1,0 +1,187 @@
+diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
+index 2ab88b8e..cad0afb9 100644
+--- a/libs/misc/cellAvconfExt.c
++++ b/libs/misc/cellAvconfExt.c
+@@ -21,6 +21,7 @@ extern u8* vm_base;
+ #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+ #include <stdio.h>
+ #include <string.h>
++#include <stddef.h>
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
+@@ -28,6 +29,20 @@ extern u8* vm_base;
+ 
+ static float s_gamma = 1.0f;
+ 
++/* The audio mode the title last configured. GetState and GetConfiguration
++ * report it back: a title that configures 5.1 and then polls GetState until
++ * the output shows 5.1 (MotorStorm: Pacific Rift) quits if it keeps seeing
++ * the stereo default. */
++static u8 s_audio_channel = CELL_AUDIO_OUT_CHNUM_2;
++static u8 s_audio_encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
++
++static u32 audio_layout_for(u8 ch)
++{
++    return ch == CELL_AUDIO_OUT_CHNUM_8 ? CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy
++         : ch == CELL_AUDIO_OUT_CHNUM_6 ? CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr
++         : CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH;
++}
++
+ /* ---------------------------------------------------------------------------
+  * API implementations
+  * -----------------------------------------------------------------------*/
+@@ -90,18 +105,27 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
+      *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
+      * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
+      * self-inconsistent, and middleware (FMOD) validates these against each other. */
++    /* The device struct has a u16 latency and 8-byte modes ending in a u32
++     * speaker layout, all big-endian. The old 4-byte-mode layout put every
++     * mode two bytes early, so a title reading the real layout (MotorStorm:
++     * Pacific Rift) saw no LPCM mode at all and quit at boot with "CAN'T FIND
++     * A SUPPORTED AUDIO RESOLUTION". state 1 is AVAILABLE (2 is not a state). */
++    static const u8  ch[3]  = { CELL_AUDIO_OUT_CHNUM_2, CELL_AUDIO_OUT_CHNUM_6, CELL_AUDIO_OUT_CHNUM_8 };
++    static const u32 lay[3] = { CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH,
++                                CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr,
++                                CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy };
+     info->portType = 0; /* HDMI */
+-    info->state = 2;    /* connected */
++    info->state = CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE;
+     info->availableModeCount = 3;
+-    info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
+-    info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
+-    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
+-    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
++    info->latency = 0;
++    for (int i = 0; i < 3; i++) {
++        uint32_t m = (uint32_t)(uintptr_t)info - (uint32_t)(uintptr_t)vm_base
++                   + (uint32_t)offsetof(CellAudioOutDeviceInfo, availableModes) + 8u * i;
++        info->availableModes[i].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
++        info->availableModes[i].channel = ch[i];
++        info->availableModes[i].fs      = CELL_AUDIO_OUT_FS_48KHZ;
++        vm_write32(m + 4, lay[i]);
++    }
+ 
+     return CELL_OK;
+ }
+@@ -121,8 +145,8 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
+     config = GUEST_PTR(config, CellAudioOutConfiguration*);
+ 
+     memset(config, 0, sizeof(CellAudioOutConfiguration));
+-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+-    config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
++    config->channel = s_audio_channel;
++    config->encoder = s_audio_encoder;
+ 
+     return CELL_OK;
+ }
+@@ -144,16 +168,17 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
+     if (!ea)
+         return CELL_EINVAL;
+ 
++    /* { u8 state; u8 encoder; u8 reserved[6]; u32 downMixer;
++     *   CellAudioOutSoundMode soundMode (8 bytes) } -- 20 bytes. */
+     vm_write8(ea + 0, 0);                                   /* ENABLED        */
+-    vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
+-    vm_write8(ea + 2, 0);
+-    vm_write8(ea + 3, 0);
+-    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
+-    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
+-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+-    vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
+-    vm_write8(ea + 11, 0);
+-    vm_write32(ea + 12, 0);
++    vm_write8(ea + 1, s_audio_encoder);
++    for (int i = 2; i < 8; i++) vm_write8(ea + i, 0);
++    vm_write32(ea + 8, 0);                                  /* no down-mixer  */
++    vm_write8(ea + 12, s_audio_encoder);                    /* soundMode      */
++    vm_write8(ea + 13, s_audio_channel);
++    vm_write8(ea + 14, CELL_AUDIO_OUT_FS_48KHZ);
++    vm_write8(ea + 15, 0);
++    vm_write32(ea + 16, audio_layout_for(s_audio_channel));
+     return CELL_OK;
+ }
+ 
+@@ -218,7 +243,15 @@ float cellAvconfExt_display_gamma(void)
+  * the title queries availability separately. NID 0x4692AB35. */
+ s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
+ {
+-    (void)config; (void)option; (void)waitForEvent;
+-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
++    (void)option; (void)waitForEvent;
++    uint32_t ea = (uint32_t)(uintptr_t)config;
++    if (ea) {   /* { u8 channel; u8 encoder; u8 reserved[10]; u32 downMixer } */
++        u8 ch = vm_read8(ea + 0), enc = vm_read8(ea + 1);
++        if (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8)
++            s_audio_channel = ch;
++        s_audio_encoder = enc;
++    }
++    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, ch=%u, enc=%u) -> ok\n",
++           audioOut, s_audio_channel, s_audio_encoder);
+     return 0;
+ }
+diff --git a/libs/misc/cellAvconfExt.h b/libs/misc/cellAvconfExt.h
+index 9ab90ee1..d3c697c4 100644
+--- a/libs/misc/cellAvconfExt.h
++++ b/libs/misc/cellAvconfExt.h
+@@ -44,11 +44,16 @@ extern "C" {
+  * Types
+  * -----------------------------------------------------------------------*/
+ 
++/* Guest layouts (big-endian). CellAudioOutSoundMode is 8 bytes: the SDK's
++ * struct ends in a u32 speaker layout. CellAudioOutDeviceInfo has a u16
++ * latency before the modes, so they start at offset 8. Multi-byte fields
++ * are stored byte-swapped (see cellAvconfExt.c). */
+ typedef struct CellAudioOutSoundMode {
+     u8  type;
+     u8  channel;
+     u8  fs;
+     u8  reserved;
++    u32 layout;          /* big-endian CELL_AUDIO_OUT_SPEAKER_LAYOUT_* */
+ } CellAudioOutSoundMode;
+ 
+ typedef struct CellAudioOutDeviceInfo {
+@@ -56,9 +61,16 @@ typedef struct CellAudioOutDeviceInfo {
+     u8  availableModeCount;
+     u8  state;
+     u8  reserved[3];
++    u16 latency;         /* big-endian */
+     CellAudioOutSoundMode availableModes[16];
+ } CellAudioOutDeviceInfo;
+ 
++#define CELL_AUDIO_OUT_DEVICE_STATE_UNAVAILABLE  0
++#define CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE    1
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH            0x00000001u
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr     0x00010000u
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy   0x40000000u
++
+ typedef struct CellAudioOutConfiguration {
+     u8  channel;
+     u8  encoder;
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 15d4ef60..ebb5bce3 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -254,8 +254,16 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
+-    if (const hle_fast_fn f = hle_fast(nid))
++    if (const hle_fast_fn f = hle_fast(nid)) {
++        /* The import-stub TOC save (`std r2,40(r1)`) has to happen on the fast
++         * path too: the caller reloads r2 from 0x28(r1) right after the call.
++         * Without it a fast lwmutex lock/unlock left whatever was in that slot
++         * -- 0 in a fresh frame -- and MotorStorm: Pacific Rift's CRT came back
++         * from its heap lock with r2 = 0, read its malloc state through a null
++         * TOC and quit at boot with an out-of-memory exit. */
++        vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+         if (f(ctx)) return;
++    }
+ 
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an

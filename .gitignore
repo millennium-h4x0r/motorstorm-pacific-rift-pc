@@ -1,0 +1,22 @@
+# Allowlist: everything is ignored unless named below. The game, the dump,
+# anything generated from it (lifted code, builds, logs, saves) and the
+# toolkit clone never reach the repository.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/CREDITS.md
+!/version.txt
+!/docs/
+!/scripts/
+!/work/
+
+/work/*
+!/work/port/
+!/work/tools/
+!/work/tests/
+!/work/patches/
+/work/port/build*/
+/work/port/spu/
+
+__pycache__/
