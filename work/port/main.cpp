@@ -483,6 +483,19 @@ int main(int argc, char** argv)
     setenv("SPU_INTERP_UNLIFTED", "1", 0);
 #endif
 
+    /* Vulkan draw batching on by default. Without it every engine draw is its
+     * own vkQueueSubmit + fence wait; a race frame has ~2200 of them and ran
+     * at 1-3 fps (FIFO thread parked in vkWaitForFences). VK_DRAW_BATCH=0
+     * turns it off. */
+#ifndef _WIN32
+    setenv("VK_DRAW_BATCH", "1", 0);
+    /* The toolkit's per-thread memo of the SPU context -> MFC engine lookup
+     * (runtime/spu/spu_channels.c, mfc_for). Off upstream; without it every
+     * MFC channel access takes a rwlock and walks the engine list, ~20% of the
+     * race's SPU job thread. Race 8.4 -> 10.6 fps with it. */
+    setenv("SPU_MFC_LOOKUP_CACHE", "1", 0);
+#endif
+
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
         return 1;
