@@ -1,3 +1,16 @@
+diff --git a/docs/BUILDING.md b/docs/BUILDING.md
+index 3bbabf62..823d16e0 100644
+--- a/docs/BUILDING.md
++++ b/docs/BUILDING.md
+@@ -284,6 +284,8 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+ | `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
+ | `RSX_ENGINE_COHERENCE_LOG=<n>` | Log the first *n* syncs between guest memory and the engine's surfaces around NV3089 transfers, with how many non-zero pixels moved |
+ | `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
++| `RSX_ENGINE_PASS_DUMP_TRIGGER=<file>` | With `RSX_ENGINE_PASS_DUMP`: start the capture once *file* exists (checked at most once a second) instead of by time or draw count, for a scene reached by hand. When the capture ends the file is removed, and creating it again starts a new capture over the same files |
++| `RSX_ENGINE_DROP_LOG=1` | Every 300 frames, print how many draw groups reached the engine, how many it drew, and how many it dropped at each early exit of `sink_end` (numbered `#n` in source order) |
+ | `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
+ 
+ Without a GPU, Mesa's lavapipe runs every check, e.g.
 diff --git a/libs/font/cellFont.c b/libs/font/cellFont.c
 index 4e239b55..c82b1c29 100644
 --- a/libs/font/cellFont.c
@@ -2879,10 +2892,10 @@ index 8dff6011..963c01ff 100644
      g.guest_draws = 0;
  }
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index cfb9685b..627f2504 100644
+index cfb9685b..4cd6af2c 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
-@@ -398,6 +398,100 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
+@@ -398,6 +398,98 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
      else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
  }
  
@@ -2897,9 +2910,9 @@ index cfb9685b..627f2504 100644
 + * velocity buffer was noise and the motion blur smeared it over the frame.
 + *
 + * Only the registers a program actually crosses get the sync: one written
-+ * in one file whose alias is read in the other. Bit n of *sync_r: a write to
-+ * r[n] must refresh h[2n]/h[2n+1]; bit m of *sync_h: a write to h[m] must
-+ * refresh r[m/2]. Sources are counted whether or not the opcode reads them,
++ * in one file whose alias is read in the other. Bit m of *sync_r: a write to
++ * r[m/2] must refresh h[m]; bit m of *sync_h: a write to h[m] must refresh
++ * r[m/2]. Sources are counted whether or not the opcode reads them,
 + * which can only add a sync, never lose one. Same walk as the emitter: an
 + * instruction with a constant source is followed by its 16-byte literal. */
 +static void fp_alias_sync_sets(const u8* ucode, u32 max_bytes, u64* sync_r, u64* sync_h)
@@ -2932,12 +2945,10 @@ index cfb9685b..627f2504 100644
 +        if (w0 & FP_END) break;
 +    }
 +    *sync_r = 0; *sync_h = 0;
-+    for (u32 n = 0; n < 48; n++) {
-+        const u64 halves = (n < 32) ? (3ull << (2 * n)) : 0;
-+        if ((wr_r >> n & 1) && (rd_h & halves)) *sync_r |= 1ull << n;
-+    }
-+    for (u32 m = 0; m < 64; m++)
++    for (u32 m = 0; m < 64; m++) {
++        if ((rd_h >> m & 1) && (wr_r >> (m / 2) & 1)) *sync_r |= 1ull << m;
 +        if ((wr_h >> m & 1) && (rd_r >> (m / 2) & 1)) *sync_h |= 1ull << m;
++    }
 +}
 +
 +/* The statements that carry a write to one file over to its alias in the
@@ -2965,13 +2976,13 @@ index cfb9685b..627f2504 100644
 +            out_puts(o, line);
 +        }
 +    } else {
-+        if (idx >= 48 || !(sync_r >> idx & 1)) return;
++        if (idx >= 32) return;
 +        static const char* hp[4] = { "xy", "zw", "xy", "zw" };
 +        static const char rc[4] = { 'x', 'y', 'z', 'w' };
 +        const int has[4] = { has_x, has_y, has_z, has_w };
 +        for (u32 c = 0; c < 4; c++) {
 +            const u32 hi = idx * 2u + (c >> 1);
-+            if (!has[c] || hi >= 48) continue;
++            if (!has[c] || hi >= 48 || !(sync_r >> hi & 1)) continue;
 +            snprintf(line, sizeof line,
 +                     "    h[%u].%s = f16tof32(uint2(asuint(r[%u].%c) & 0xFFFFu, asuint(r[%u].%c) >> 16));\n",
 +                     hi, hp[c], idx, rc[c], idx, rc[c]);
@@ -2983,7 +2994,7 @@ index cfb9685b..627f2504 100644
  /* Dest write-mask letters from OPDEST bits 9..12 (X..W). */
  static void dest_mask(u32 op0, char* m)
  {
-@@ -666,6 +760,8 @@ static int rsx_fp_decompile_internal(
+@@ -666,6 +758,8 @@ static int rsx_fp_decompile_internal(
       * Emitting the preamble here would mean guessing it. */
      Out o = { out, out_size, 0, 1 };
      out[0] = '\0';
@@ -2992,7 +3003,7 @@ index cfb9685b..627f2504 100644
      int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
      out_puts(&o,
          "    float4 r[48]; float4 h[48];\n"
-@@ -1161,6 +1257,8 @@ static int rsx_fp_decompile_internal(
+@@ -1161,6 +1255,8 @@ static int rsx_fp_decompile_internal(
              }
  
              if (has_dest) {
@@ -3001,6 +3012,44 @@ index cfb9685b..627f2504 100644
                  const int target = fp_export_target(dst_idx, dst_half);
                  if (target >= 0) wrote[dst_half][target] = 1;
              }
+diff --git a/libs/video/tests/test_fp_decompiler.c b/libs/video/tests/test_fp_decompiler.c
+index 033d2528..370e7dae 100644
+--- a/libs/video/tests/test_fp_decompiler.c
++++ b/libs/video/tests/test_fp_decompiler.c
+@@ -591,6 +591,33 @@ int main(void)
+ 
+     }
+ 
++    /* R[n] and H[2n]/H[2n+1] are one register: a program that packs two
++     * halves by writing h0.xy and reading r0.x (UP4UB) must see the halves'
++     * bits there, and an fp32 write read back through its halves must split. */
++    {
++        u8 prog[48];
++        const u32 mask_xy = (1u << 9) | (1u << 10);
++        put_word(prog + 0, OPC(0x01) | mask_xy | OUTHALF | INSRC(1));  /* MOV h0.xy, COL0 */
++        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
++        put_word(prog + 8, T_INPUT | SWZ_IDENT);
++        put_word(prog + 12, T_INPUT | SWZ_IDENT);
++        put_word(prog + 16, OPC(0x28) | OUTMASK_ALL | OUTREG(2));      /* UP4UB r2, r0.x */
++        put_word(prog + 20, T_TEMP | REG(0) | EXEC_ALWAYS);
++        put_word(prog + 24, T_INPUT | SWZ_IDENT);
++        put_word(prog + 28, T_INPUT | SWZ_IDENT);
++        put_word(prog + 32, OPC(0x01) | OUTMASK_ALL | OUTHALF | OUTREG(4) | END); /* MOV h4, h5 */
++        put_word(prog + 36, T_TEMP | REG(5) | (1u << 8) | SWZ_IDENT | EXEC_ALWAYS);
++        put_word(prog + 40, T_INPUT | SWZ_IDENT);
++        put_word(prog + 44, T_INPUT | SWZ_IDENT);
++        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
++        check("alias_h_to_r", hlsl,
++              "    r[0].x = asfloat(f32tof16(h[0].x) | (f32tof16(h[0].y) << 16));\n");
++        check("alias_r_to_h", hlsl,
++              "    h[5].zw = f16tof32(uint2(asuint(r[2].w) & 0xFFFFu, asuint(r[2].w) >> 16));\n");
++        check_absent("alias_unread_halves", hlsl, "h[4].xy = f16tof32");
++        check_absent("alias_unread_full", hlsl, "r[2].x = asfloat");
++    }
++
+     printf("\n===========================================\n");
+     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
+     return g_fail ? 1 : 0;
 diff --git a/runtime/host/host_stubs.c b/runtime/host/host_stubs.c
 index 6e79ec31..3c66fda1 100644
 --- a/runtime/host/host_stubs.c

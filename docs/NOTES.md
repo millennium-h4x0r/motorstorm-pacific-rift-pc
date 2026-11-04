@@ -51,3 +51,29 @@ Useful switches: `PS3_HLE_TRACE=<n>`, `PS3_HLE_TOP=<secs>`, `PS3_SCTRACE=1`,
 gdb: `gdb -p $(pgrep -x PacificRiftReco)`; lifted functions take the
 `ppu_context*` in `$rdi`, `gpr[i] = ((unsigned long*)$rdi)[i]`, guest memory
 at `(*(unsigned char**)&vm_base)+ea`.
+
+## In-race rendering (2026-11-04)
+
+- **Missing scene geometry**: the game fetches cellGcmGetOffsetTable at boot,
+  maps its SPU command-list buffers (0x17100000 / 0x17500000) later, and turns
+  list EAs into IO offsets through `ioAddress[ea >> 20]` itself. The guest copy
+  of the table was published only by the GetOffsetTable call, so it read 0xFFFF
+  and every CALL into an SPU-built draw list became 0xFFFFFFFF, which the walker
+  skips. Fixed in `libs/video/cellGcmSys.c`: map and unmap now update the
+  published copy as well. Draws per race frame went from about 55 to 1000-2900.
+- **Noise**: the RSX fragment registers R[n] and H[2n]/H[2n+1] share storage. The
+  velocity pass writes h0.xy and then does UP4UB r0.x. The decompiler kept the
+  two files apart, so the velocity buffer came out as random bytes and the
+  motion blur smeared them across the frame. Fixed in
+  `libs/video/rsx_fp_decompiler.c` (alias sync for registers that cross files).
+- **Still open, overexposure**: VP constant c[33].x is the scene exposure; the
+  G-buffer pass multiplies colour by it, via tc6.y. It starts near 4 and climbs
+  to about 35.3 within a few seconds, so the RGBA8 colour target saturates. The
+  G-buffer target that gets colour/16 looks right. The loading screen whites
+  out the same way: c[59].w is about -35.3 and is used as a lerp factor. The
+  value is computed by PPU code. No CPU, SPU or vertex read of the 16x16 FP16
+  luminance target (0x07EBA600) showed up under read watchpoints.
+- Diagnostics: `RSX_ENGINE_PASS_DUMP_TRIGGER=<file>` (start or re-arm a pass dump
+  by creating the file), `RSX_ENGINE_DROP_LOG=1` (draw drop reasons),
+  `RSX_CONST_LOG=33,33` (exposure constant uploads), `GCM_WORD_STATS=10`
+  (call/ret counts in the FIFO).
