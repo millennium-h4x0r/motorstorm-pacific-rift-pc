@@ -74,8 +74,17 @@ at `(*(unsigned char**)&vm_base)+ea`.
   colour targets of at most `PS3RECOMP_ENG_SMALL_WRITEBACK` pixels (default
   1024) that were rendered in the frame are stored to guest memory at present.
   c[33].x now settles around 0.76.
-- Still open: a band of horizontal streaks on the right side of the frame while
-  racing (motion blur or velocity?); not investigated.
+- **Right/bottom smear**: the game scales its 3D resolution with load (1270x714
+  down to about 725x408 while racing). It renders into the top-left corner of
+  full-size targets and samples them as textures of the rendered size, at the
+  target's pitch. The engine viewed the whole host target, so the image came
+  out stretched, with the unrendered margins smeared across it. Fixed in
+  `libs/video/rsx_draw_engine.c` (`eng_surface_corner`) together with a new
+  optional backend hook `color_snapshot_rect`, implemented for Vulkan: a
+  pitch-matched linear texture smaller than its surface samples a copy of that
+  corner.
+- Still open: the first race's loading screen still whites out over time, even
+  with the exposure fix. The pause menu in a race now looks right.
 - Diagnostics: `RSX_ENGINE_PASS_DUMP_TRIGGER=<file>` (start or re-arm a pass dump
   by creating the file), `RSX_ENGINE_DROP_LOG=1` (draw drop reasons),
   `RSX_CONST_LOG=33,33` (exposure constant uploads), `GCM_WORD_STATS=10`

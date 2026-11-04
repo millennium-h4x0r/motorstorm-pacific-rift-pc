@@ -2902,10 +2902,16 @@ index 298ee7de..24ac166b 100644
      /* The guest struct is two 4-byte EAs, not two host pointers. */
      vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff6011..356c6edd 100644
+index 8dff6011..fa6f7205 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -109,6 +109,7 @@ typedef struct {
+@@ -106,9 +106,13 @@ typedef struct {
+     rsx_be_format fmt;
+     u32 handle;
+     u32 feedback;          /* last immutable own-target copy, engine-owned */
++    u32 sub;               /* copy of a top-left corner (eng_surface_corner) */
++    u32 sub_w, sub_h;
++    u64 sub_serial;        /* color_serial the copy was taken at            */
      u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
      int guest_dirty;        /* rendered since guest memory last got a copy   */
      u32 last_use;           /* g.frames when last bound, sampled or presented */
@@ -2913,7 +2919,15 @@ index 8dff6011..356c6edd 100644
  } eng_surface;
  
  typedef struct {
-@@ -1579,6 +1580,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+@@ -699,6 +703,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+ 
+     eng_surface* s = &g.surfaces[slot];
+     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
++    if (s->sub) { g.be->texture_release(g.be->user, s->sub); s->sub = 0; }
+     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+     s->location = location; s->offset = offset;
+     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
+@@ -1579,6 +1584,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
      for (u32 i = 0; i < n_targets; i++) {
          g.surfaces[targets[i]].color_serial = serial;
          g.surfaces[targets[i]].guest_dirty = 1;
@@ -2921,7 +2935,58 @@ index 8dff6011..356c6edd 100644
      }
  }
  
-@@ -2672,6 +2674,7 @@ static int pd_open_index(void)
+@@ -2465,6 +2471,34 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+     return ENG_INVALID;
+ }
+ 
++/* A texture that names only the top-left corner of a colour target, at the
++ * target's own pitch. On RSX the texture IS that memory, so its normalised
++ * coordinates run over its own width and height -- the corner -- while a view
++ * of the whole host target would stretch them over the full surface.
++ * MotorStorm: Pacific Rift scales its 3D resolution with load (1280x720 down
++ * to well under it), renders into the corner of full-size targets and samples
++ * them as textures of the rendered size; viewed whole, the frame came out
++ * stretched with the unrendered right and bottom margins smeared over it.
++ * Returns a copy of the corner, refreshed when the target has been written
++ * since, or 0 to view the whole target as before. */
++static u32 eng_surface_corner(eng_surface* s, const rsx_dsp_texture* t)
++{
++    if (!g.be->color_snapshot_rect || !(t->format & RSX_TEX_FMT_LINEAR) ||
++        t->cubemap || t->dimension == 3 || t->pitch != s->pitch ||
++        !t->width || !t->height || t->width > s->w || t->height > s->h ||
++        (t->width == s->w && t->height == s->h))
++        return 0;
++    if (!s->sub || s->sub_w != t->width || s->sub_h != t->height ||
++        s->sub_serial != s->color_serial) {
++        const u32 copy = g.be->color_snapshot_rect(g.be->user, s->handle, t->width, t->height);
++        if (!copy) return 0;
++        if (s->sub) g.be->texture_release(g.be->user, s->sub);
++        s->sub = copy; s->sub_w = t->width; s->sub_h = t->height;
++        s->sub_serial = s->color_serial;
++    }
++    return s->sub;
++}
++
+ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                               u32 current_zslot, u32 tex_used,
+                               u32 textures[RSX_BE_MAX_TEXTURES],
+@@ -2575,11 +2609,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             continue;
+         }
+         if (sampled >= 0) {
++            const u32 corner = eng_surface_corner(&g.surfaces[sampled], &t);
++            const u32 src = corner ? corner : g.surfaces[sampled].handle;
+             const u32 view = g.be->surface_view
+-                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+-                                     t.remap & 0xFFFFu, t.format)
++                ? g.be->surface_view(g.be->user, src, t.remap & 0xFFFFu, t.format)
+                 : 0;
+-            textures[u] = view ? view : g.surfaces[sampled].handle;
++            textures[u] = view ? view : src;
+             continue;
+         }
+         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
+@@ -2672,6 +2707,7 @@ static int pd_open_index(void)
      }
      s_pd.state = 2;
      s_pd.open = 0;
@@ -2929,7 +2994,7 @@ index 8dff6011..356c6edd 100644
      return 1;
  }
  
-@@ -2691,6 +2694,22 @@ static int pd_capturing(void)
+@@ -2691,6 +2727,22 @@ static int pd_capturing(void)
      if (s_pd.state == 1 && s_pd.after_s &&
          difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
          fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
@@ -2952,7 +3017,7 @@ index 8dff6011..356c6edd 100644
      return s_pd.state == 2;
  }
  
-@@ -2829,6 +2848,10 @@ static void pd_close_pass(void)
+@@ -2829,6 +2881,10 @@ static void pd_close_pass(void)
          s_pd.state = 3;
          fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
                  s_pd.pass, s_pd.dir);
@@ -2963,7 +3028,7 @@ index 8dff6011..356c6edd 100644
      }
  }
  
-@@ -2941,7 +2964,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2941,7 +2997,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
  static void pd_present(u32 presented)
  {
      if (s_pd.state == 0) pd_capturing();
@@ -2973,7 +3038,7 @@ index 8dff6011..356c6edd 100644
          if (pd_open_index())
              fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                      g.frames + 1, g.guest_draws);
-@@ -3022,14 +3046,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+@@ -3022,14 +3079,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                  what, rc[0], rc[1], rc[2], rc[3], w, h);
  }
  
@@ -3008,7 +3073,7 @@ index 8dff6011..356c6edd 100644
  
      const u32 prim = g.rsx.current_primitive;
      /* Everything that becomes triangles -- lists, strips, fans, quads, quad
-@@ -3044,33 +3086,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3044,33 +3119,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
      int scratch = 0;
      const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
      if (!rebuild) {
@@ -3048,7 +3113,7 @@ index 8dff6011..356c6edd 100644
      const u32 target = targets[0];
  
      rsx_dsp_surface sf;
-@@ -3091,8 +3133,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3091,8 +3166,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                            eng_surface_format(sf.color_format),
                                            n_targets, &pipeline_is_fixed, &tex_used,
                                            &fp_hash);
@@ -3059,7 +3124,7 @@ index 8dff6011..356c6edd 100644
  
      /* Textures before any pipeline or target binding: a cache refresh can
       * replace a resource, and the backend is free to submit while doing it. */
-@@ -3106,12 +3148,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3106,12 +3181,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
      memset(vsamplers, 0, sizeof vsamplers);
      const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                              textures, samplers);
@@ -3074,7 +3139,7 @@ index 8dff6011..356c6edd 100644
          rsx_draw_engine_write_topology_indices(
              prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
              dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
-@@ -3145,7 +3187,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3145,7 +3220,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      const u32 fp_bytes = (nslots + 1u) * 16u;
      if (g.fp_cb_cap < fp_bytes) {
          u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
@@ -3083,7 +3148,7 @@ index 8dff6011..356c6edd 100644
          g.fp_cb = n;
          g.fp_cb_cap = fp_bytes;
      }
-@@ -3231,6 +3273,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3231,6 +3306,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
       * the test hook means: a draw through the built-in pair is a draw, not
       * evidence that the decompile-translate-compile path worked. */
      if (!pipeline_is_fixed) g.guest_draws++;
@@ -3091,7 +3156,7 @@ index 8dff6011..356c6edd 100644
  
      if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
      if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-@@ -3360,6 +3403,40 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -3360,6 +3436,40 @@ static u32 eng_present_surface(u32 buffer_id)
      return eng_current_surface();
  }
  
@@ -3132,7 +3197,7 @@ index 8dff6011..356c6edd 100644
  static void eng_present(u32 buffer_id)
  {
      if (!g.ready) return;
-@@ -3376,9 +3453,11 @@ static void eng_present(u32 buffer_id)
+@@ -3376,9 +3486,11 @@ static void eng_present(u32 buffer_id)
                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
      }
      pd_present(target);
@@ -3144,6 +3209,33 @@ index 8dff6011..356c6edd 100644
      g.last_guest_draws = g.guest_draws;
      g.guest_draws = 0;
  }
+@@ -3466,6 +3578,7 @@ void rsx_draw_engine_shutdown(void)
+         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
++        if (g.surfaces[i].sub) g.be->texture_release(g.be->user, g.surfaces[i].sub);
+         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
+     }
+     for (u32 i = 0; i < g.n_zdepths; i++) {
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index a25ecc29..7b192b9e 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -296,6 +296,14 @@ typedef struct rsx_draw_backend {
+                                      float depth_value, u8 stencil,
+                                      u32 x, u32 y, u32 w, u32 h);
+ 
++    /* Optional. A copy of the top-left w x h of a colour target (w, h at
++     * most its size), in command order like color_snapshot, for a texture
++     * that names only part of a target: RSX addresses such a texture inside
++     * the target's memory, so normalised coordinates span the w x h corner,
++     * not the whole target. The engine owns the handle. 0 or NULL keeps a
++     * view of the whole target. */
++    u32 (*color_snapshot_rect)(void* user, u32 surface, u32 w, u32 h);
++
+ } rsx_draw_backend;
+ 
+ /* ---- the engine --------------------------------------------------------- */
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
 index cfb9685b..4cd6af2c 100644
 --- a/libs/video/rsx_fp_decompiler.c
@@ -3265,6 +3357,73 @@ index cfb9685b..4cd6af2c 100644
                  const int target = fp_export_target(dst_idx, dst_half);
                  if (target >= 0) wrote[dst_half][target] = 1;
              }
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index db64302e..da347b10 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2622,23 +2622,33 @@ static void vk_eng_snapshot_pool_drain(void)
+     vk_destroy_buffer(&s_snap_st);
+ }
+ 
++static u32 vk_eng_color_snapshot_rect(void* user, u32 surface, u32 w, u32 h);
+ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+ {
+-    (void)user;
+     const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+     if (!t || t->snapshot) return 0;
++    return vk_eng_color_snapshot_rect(user, surface, t->w, t->h);
++}
++
++/* The top-left w x h of a colour target as its own w x h image: a texture
++ * naming a corner of a target (rsx_draw_backend.color_snapshot_rect). */
++static u32 vk_eng_color_snapshot_rect(void* user, u32 surface, u32 w, u32 h)
++{
++    (void)user;
++    const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
++    if (!t || t->snapshot || !w || !h || w > t->w || h > t->h) return 0;
+     const u32 hd = vk_eng_alloc();
+     if (!hd) return 0;
+     vk_eng_obj* o = &s_eobj[hd];
+     int reused = 0;
+     for (u32 i = 0; i < s_snap_pool_n; i++)
+-        if (s_snap_pool[i].fmt == t->fmt && s_snap_pool[i].w == t->w && s_snap_pool[i].h == t->h) {
++        if (s_snap_pool[i].fmt == t->fmt && s_snap_pool[i].w == w && s_snap_pool[i].h == h) {
+             o->im = s_snap_pool[i].im;
+             s_snap_pool[i] = s_snap_pool[--s_snap_pool_n];
+             reused = 1;
+             break;
+         }
+-    if (!reused && vk_create_image(&o->im, t->fmt, t->w, t->h,
++    if (!reused && vk_create_image(&o->im, t->fmt, w, h,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT)) {
+         vk_destroy_image(&o->im);
+@@ -2646,7 +2656,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+         return 0;
+     }
+     o->kind = VK_ENG_COLOR; o->snapshot = 1;
+-    o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
++    o->fmt = t->fmt; o->bpp = t->bpp; o->w = w; o->h = h;
+     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
+@@ -2654,7 +2664,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+     VkImageCopy c = {
+         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+-        .extent = { t->w, t->h, 1 },
++        .extent = { w, h, 1 },
+     };
+     pvkCmdCopyImage(s_vk.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+@@ -3764,6 +3774,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .depth_target_release = vk_eng_release,
+     .depth_snapshot       = vk_eng_depth_snapshot,
+     .color_snapshot       = vk_eng_color_snapshot,
++    .color_snapshot_rect  = vk_eng_color_snapshot_rect,
+     .pipeline_create      = vk_eng_pipeline_create,
+     .pipeline_release     = vk_eng_pipeline_release,
+     .bind_targets         = vk_eng_bind_targets,
 diff --git a/libs/video/tests/test_fp_decompiler.c b/libs/video/tests/test_fp_decompiler.c
 index 033d2528..370e7dae 100644
 --- a/libs/video/tests/test_fp_decompiler.c
