@@ -10,6 +10,7 @@ export PS3_TITLE="${PS3_TITLE:-MotorStorm: Pacific Rift}"
 export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$HOME/.config/rpcs3/dev_flash}"
 export PS3_HDD0_ROOT="${PS3_HDD0_ROOT:-$ROOT/hdd0}"
 export PS3_STDIO_UNBUFFERED=1
+export PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}"
 for kv in "$@"; do export "$kv"; done
 log="$ROOT/work/runs/$(date +%Y%m%d-%H%M%S).log"
 ln -sfn "$log" "$ROOT/work/runs/latest.log"
