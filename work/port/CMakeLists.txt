@@ -194,7 +194,17 @@ if(SPU_SOURCES)
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        # -msse4.1: spu_helpers.h picks the pshufb/blendv forms of shufb/selb
+        # only under __SSE4_1__ (the runtime target already builds with it);
+        # without it the lifted SPU code ran the byte-loop shufb out of line,
+        # pinning a core per Bink decode thread and stuttering the FMV.
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag(-msse4.1 PORT_HAS_MSSE41)
+        if(PORT_HAS_MSSE41)
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1")
+        else()
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        endif()
     endif()
 endif()
 

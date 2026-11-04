@@ -80,3 +80,24 @@ at `(*(unsigned char**)&vm_base)+ea`.
   by creating the file), `RSX_ENGINE_DROP_LOG=1` (draw drop reasons),
   `RSX_CONST_LOG=33,33` (exposure constant uploads), `GCM_WORD_STATS=10`
   (call/ret counts in the FIFO).
+
+## Parallel test instances
+
+`INST=<name> work/run.sh` runs an isolated, offscreen instance. Each one gets its own:
+- log: `work/inst/<name>/run.log`
+- pad file: `work/inst/<name>/pad.txt`
+- frame dump: `work/inst/<name>/frame.ppm`, written every 30 frames
+- save directory: `work/inst/<name>/hdd0`, copied from `hdd0` on first use
+
+Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `work/port/build-<name>/` if that build exists, so you can A/B builds or env switches side by side:
+
+    BUILD_DIR=work/port/build-exp JOBS=8 scripts/build.sh
+    TIMEOUT=120 INST=exp  work/run.sh >/dev/null &
+    TIMEOUT=120 INST=base BIN=work/port/build/PacificRiftRecomp work/run.sh >/dev/null &
+    INST=exp work/tools/pad.sh cross 3      # -> work/inst/exp/now.png
+
+`perf` isn't installed. As a sampling profiler, run gdb `thread apply all bt 1` in a loop and count the top frames.
+
+## Performance
+
+- The lifted SPU sources must be built with `-msse4.1` (work/port/CMakeLists.txt). Without it, `spu_helpers.h` falls back to the byte-loop `spu_shufb` called out of line. That was the top hotspot of the Bink decode threads and made the FMV stutter.
