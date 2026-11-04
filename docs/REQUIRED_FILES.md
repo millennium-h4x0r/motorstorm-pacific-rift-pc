@@ -26,6 +26,10 @@ size   19047304 bytes
 SRC=~/Games/PS3/BCES00129/PS3_GAME
 mkdir -p disc/PS3_GAME/USRDIR
 for f in "$SRC"/*; do [ "$(basename "$f")" = USRDIR ] || ln -sfn "$f" disc/PS3_GAME/; done
-for f in "$SRC"/USRDIR/*; do case "$(basename "$f")" in EBOOT.*) ;; *) ln -sfn "$f" disc/PS3_GAME/USRDIR/;; esac; done
+for f in "$SRC"/USRDIR/*; do case "$(basename "$f")" in EBOOT.*|ms2.psarc.*) ;; *) ln -sfn "$f" disc/PS3_GAME/USRDIR/;; esac; done
 cp "$SRC/USRDIR/EBOOT.elf" disc/PS3_GAME/USRDIR/
+# The game opens one /ms2.psarc. Dumps made for FAT32 split it into 1 GB
+# pieces (ms2.psarc.66600 ... .66604): join them, in order.
+rm -f disc/PS3_GAME/USRDIR/ms2.psarc.666*
+cat "$SRC"/USRDIR/ms2.psarc.666* > disc/PS3_GAME/USRDIR/ms2.psarc   # 4,811,608,561 bytes, starts "PSAR"
 ```

@@ -11,9 +11,9 @@ runs on the SPUs and how the port's runtime dispatches each kind:
     handling (job-code buffer base at LS[0x1320], signature match of the
     staged module, job return path) is keyed to image id 2. It is found by its
     `stqa $r3,0x1320`, walking back to its 4-`ila` header. Its size is the data
-    word after the word that holds its EA. Whether the PPU rounds that size up
-    to 128 bytes (as MotorStorm Apocalypse does) was not traced, so the lift is
-    registered under both fingerprints.
+    word after the word that holds its EA (0x2CB0); the game passes it rounded
+    up to 128 bytes (sizePm=11520=0x2D00 in the runtime log, as in MotorStorm
+    Apocalypse), so the fingerprint covers the rounded size.
   * WWS job modules (`4 ila | entry | size | 0 | 0 | C0DEC0DE`, linked at
     LS 0x4000), uncompressed in the EBOOT. The PM streams one into its job-code
     buffer and the runtime picks the lift by the module's 16-byte header. They
@@ -74,8 +74,10 @@ def be32(b, o):
 
 
 def fnv1a64(b):
-    # runtime/spu/spu_workload.c spu_workload_fingerprint()
-    h = 0xCBF29CE484222325
+    # runtime/spu/spu_workload.c spu_workload_fingerprint(). NOTE: its basis is
+    # the decimal 1469598103934665603 (0x14650FB0739D0383), not the canonical
+    # FNV-1a basis 0xCBF29CE484222325; the registry must use the runtime's.
+    h = 1469598103934665603
     for x in b:
         h = ((h ^ x) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
@@ -297,7 +299,7 @@ def main():
     pm = pms[0]
     rounded = (pm["raw_size"] + 127) & ~127
     pm_bytes = eb.read(pm["ea"], rounded)           # lift the larger span
-    fps = sorted({fnv1a64(pm_bytes[:pm["raw_size"]]), fnv1a64(pm_bytes)})
+    fps = [fnv1a64(pm_bytes)]                       # over sizePm = rounded size
     extra = pm_extra_entries(pm_bytes[:pm["raw_size"]])
     print(f"[lift_spu] WWS PM at EA 0x{pm['ea']:X} (EA word at 0x{pm['ref']:X}), size 0x{pm['raw_size']:X}"
           f" (0x{rounded:X} rounded), fps {[f'0x{f:016X}' for f in fps]}, extra entries {[hex(a) for a in extra]}")
@@ -321,8 +323,8 @@ def main():
 /* ---- appended by work/tools/lift_spu.py ----------------------------------------
  * WWS Job Manager policy module: EA 0x{pm['ea']:X}, 0x{pm['raw_size']:X} bytes (0x{rounded:X}
  * rounded to 128), run by cellSpurs at LS 0x{PM_LSA:X}. Registered as image {PM_IMAGE_ID} (the
- * runtime's WWS job handling is keyed to it) under the fingerprint of both sizes,
- * because cellSpurs hashes exactly the sizePm the game passes. */
+ * runtime's WWS job handling is keyed to it) under the fingerprint of the rounded
+ * size, which is the sizePm the game passes and cellSpurs hashes. */
 extern void wws_pm_spu_recomp_register(void);
 extern void wws_pm_spu_func_{PM_LSA:08X}(spu_context*);
 
