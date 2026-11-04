@@ -2641,6 +2641,366 @@ index 07a3d2e4..75b05941 100644
  
  s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
  s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7de..24ac166b 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -409,6 +409,26 @@ static int s_gcm_syscall_mode = 0;
+  * Internal helpers
+  * -----------------------------------------------------------------------*/
+ 
++/* Set once cellGcmGetOffsetTable has handed the guest its copy of the tables
++ * (GCM_OFFSET_TABLE_IO_ADDR / _EA_ADDR). From then on every map and unmap
++ * must update that copy too: libgcm's table is the live one, and a title is
++ * entitled to keep the pointers and index them for every later mapping.
++ * MotorStorm: Pacific Rift fetches the table at boot, maps its SPU
++ * command-list buffers (cellGcmMapMainMemory 0x17100000/0x17500000) after
++ * that, and converts each list's EA through ioAddress[ea >> 20] itself. The
++ * stale copy said 0xFFFF (unmapped) there, so every CALL into an SPU-built
++ * list went out as 0xFFFFFFFF -- an invalid word the walker skips -- and the
++ * terrain, vehicles and most of the race scene were never drawn. */
++static int s_offset_tables_published = 0;
++static void gcm_offset_table_entry_publish(u32 ea_page, u32 io_page)
++{
++    if (!s_offset_tables_published) return;
++    if (ea_page < GCM_OFFSET_TABLE_PAGES)
++        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + ea_page * 2, s_io_address_table[ea_page]);
++    if (io_page < GCM_OFFSET_TABLE_PAGES)
++        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + io_page * 2, s_ea_address_table[io_page]);
++}
++
+ /* Populate the offset table entries for an IO mapping */
+ static void populate_offset_table(u32 ea, u32 io, u32 size)
+ {
+@@ -429,6 +449,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
+     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
+         s_io_address_table[ea_page + i] = (u16)(io_page + i);
+         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
++        gcm_offset_table_entry_publish(ea_page + i, io_page + i);
+     }
+ }
+ 
+@@ -442,6 +463,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
+     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
+         s_io_address_table[ea_page + i] = 0xFFFF;
+         s_ea_address_table[io_page + i] = 0xFFFF;
++        gcm_offset_table_entry_publish(ea_page + i, io_page + i);
+     }
+ }
+ 
+@@ -3312,6 +3334,7 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
+     gcm_publish_offset_tables();
++    s_offset_tables_published = 1;
+ 
+     /* The guest struct is two 4-byte EAs, not two host pointers. */
+     vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 8dff6011..963c01ff 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2672,6 +2672,7 @@ static int pd_open_index(void)
+     }
+     s_pd.state = 2;
+     s_pd.open = 0;
++    s_pd.pass = 0;
+     return 1;
+ }
+ 
+@@ -2691,6 +2692,22 @@ static int pd_capturing(void)
+     if (s_pd.state == 1 && s_pd.after_s &&
+         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
+         fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
++    /* RSX_ENGINE_PASS_DUMP_TRIGGER=<path>: start once that file exists
++     * (polled at most once a second), for scenes reached interactively. */
++    if (s_pd.state == 1) {
++        static time_t last_poll;
++        const char* trig = getenv("RSX_ENGINE_PASS_DUMP_TRIGGER");
++        time_t now = time(NULL);
++        if (trig && *trig && now != last_poll) {
++            last_poll = now;
++            FILE* tf = fopen(trig, "r");
++            if (tf) {
++                fclose(tf);
++                if (pd_open_index())
++                    fprintf(s_pd.index, "from a draw of frame %u, on trigger\n", g.frames);
++            }
++        }
++    }
+     return s_pd.state == 2;
+ }
+ 
+@@ -2829,6 +2846,10 @@ static void pd_close_pass(void)
+         s_pd.state = 3;
+         fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
+                 s_pd.pass, s_pd.dir);
++        /* Trigger mode re-arms: the trigger file is removed, and creating it
++         * again starts a fresh capture over the same files. */
++        { const char* trig = getenv("RSX_ENGINE_PASS_DUMP_TRIGGER");
++          if (trig && *trig) { remove(trig); s_pd.state = 1; } }
+     }
+ }
+ 
+@@ -2941,7 +2962,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+ static void pd_present(u32 presented)
+ {
+     if (s_pd.state == 0) pd_capturing();
+-    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
++    if (s_pd.state == 1 && !s_pd.after_s && !getenv("RSX_ENGINE_PASS_DUMP_TRIGGER") &&
++        g.guest_draws >= s_pd.min_draws) {
+         if (pd_open_index())
+             fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
+                     g.frames + 1, g.guest_draws);
+@@ -3022,14 +3044,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+                 what, rc[0], rc[1], rc[2], rc[3], w, h);
+ }
+ 
++/* RSX_ENGINE_DROP_LOG=1 (diagnostic): count each early exit of sink_end by
++ * site and print the tally every 300 frames, to see which draws never reach
++ * the backend and why. */
++static u32 s_drop[64], s_drop_end, s_drop_ok;
++static int s_drop_on = -1;
++#define DROPR(n) do { s_drop[(n)]++; return; } while (0)
++static void eng_drop_log(void)
++{
++    if (s_drop_on < 0) s_drop_on = getenv("RSX_ENGINE_DROP_LOG") ? 1 : 0;
++    if (!s_drop_on || g.frames % 300u) return;
++    fprintf(stderr, "[rsx engine] frame %u: sink_end %u, drawn %u, drops:", g.frames,
++            s_drop_end, s_drop_ok);
++    for (u32 i = 0; i < 64; i++) if (s_drop[i]) fprintf(stderr, " #%u=%u", i, s_drop[i]);
++    fprintf(stderr, "\n");
++    memset(s_drop, 0, sizeof s_drop); s_drop_end = s_drop_ok = 0;
++}
++
+ static void sink_end(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+-    if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
++    s_drop_end++;
++    if (!g.ready || !dc.n_packets || !dc.fetch_ok) DROPR(1);
+     /* Mixed geometry sources have no defined concatenation here. Reject the
+      * whole group instead of drawing partial/misordered geometry. */
+     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
+-                          r->inline_dropped != dc.inline_dropped_at_begin)) return;
++                          r->inline_dropped != dc.inline_dropped_at_begin)) DROPR(2);
+ 
+     const u32 prim = g.rsx.current_primitive;
+     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
+@@ -3044,33 +3084,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     int scratch = 0;
+     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
+     if (!rebuild) {
+-        if (rsx_primitive_needs_expansion(prim)) return;
++        if (rsx_primitive_needs_expansion(prim)) DROPR(3);
+         topology = rsx_primitive_topology(prim);
+-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
++        if (topology == RSX_TOPOLOGY_UNSUPPORTED) DROPR(4);
+     }
+ 
+     rsx_vertex_layout_plan layout;
+     eng_vertex_layout(&layout);
+     dc_fetch(&layout, rebuild);
+-    if (!dc.n_verts || !dc.fetch_ok) return;
++    if (!dc.n_verts || !dc.fetch_ok) DROPR(5);
+ 
+     int indexed = 0;
+     u32 n_draw = dc.n_source_refs;
+     if (rebuild) {
+-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
++        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) DROPR(6);
+         n_draw = indexed
+             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
+                                                    dc.cuts, dc.n_cuts)
+             : dc.n_source_refs - dc.n_source_refs % 3u;
+     }
+-    if (!n_draw) return;
++    if (!n_draw) DROPR(7);
+ 
+     rsx_be_render_state rs;
+     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
+ 
+     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+     const u32 n_targets = eng_current_target_set(targets);
+-    if (!n_targets) return;
++    if (!n_targets) DROPR(8);
+     const u32 target = targets[0];
+ 
+     rsx_dsp_surface sf;
+@@ -3091,8 +3131,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
+                                           eng_surface_format(sf.color_format),
+                                           n_targets, &pipeline_is_fixed, &tex_used,
+                                           &fp_hash);
+-    if (!pipeline) return;
+-    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
++    if (!pipeline) DROPR(9);
++    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) DROPR(10);
+ 
+     /* Textures before any pipeline or target binding: a cache refresh can
+      * replace a resource, and the backend is free to submit while doing it. */
+@@ -3106,12 +3146,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     memset(vsamplers, 0, sizeof vsamplers);
+     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
+                                             textures, samplers);
+-    if (tex_mask == ENG_INVALID) return;
++    if (tex_mask == ENG_INVALID) DROPR(11);
+     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+                                                     vsamplers);
+ 
+     if (indexed) {
+-        if (!dc_reserve_indices(n_draw)) return;
++        if (!dc_reserve_indices(n_draw)) DROPR(12);
+         rsx_draw_engine_write_topology_indices(
+             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
+             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
+@@ -3145,7 +3185,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     const u32 fp_bytes = (nslots + 1u) * 16u;
+     if (g.fp_cb_cap < fp_bytes) {
+         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
+-        if (!n) return;
++        if (!n) DROPR(13);
+         g.fp_cb = n;
+         g.fp_cb_cap = fp_bytes;
+     }
+@@ -3231,6 +3271,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+      * the test hook means: a draw through the built-in pair is a draw, not
+      * evidence that the decompile-translate-compile path worked. */
+     if (!pipeline_is_fixed) g.guest_draws++;
++    s_drop_ok++;
+ 
+     if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
+     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
+@@ -3379,6 +3420,7 @@ static void eng_present(u32 buffer_id)
+     g.last_present_surface = target;
+     g.be->present(g.be->user, g.surfaces[target].handle);
+     g.frames++;
++    eng_drop_log();
+     g.last_guest_draws = g.guest_draws;
+     g.guest_draws = 0;
+ }
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index cfb9685b..627f2504 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -398,6 +398,100 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
+     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
+ }
+ 
++/* RSX fragment temps alias: the fp32 register R[n] and the fp16 registers
++ * H[2n], H[2n+1] are the same 128 bits. R[n].x holds H[2n].x (low half) and
++ * H[2n].y (high half), R[n].y H[2n].zw, R[n].z H[2n+1].xy, R[n].w
++ * H[2n+1].zw (RPCS3 FragmentProgramDecompiler's gather/split). The
++ * translation keeps two separate arrays, so a program that writes one file
++ * and reads the other read zeros. MotorStorm: Pacific Rift packs its motion
++ * vectors that way -- velocity into h0.xy, then UP4UB of r0.x into an RGBA8
++ * target -- and read the bytes of an unrelated fp32 temp instead: the
++ * velocity buffer was noise and the motion blur smeared it over the frame.
++ *
++ * Only the registers a program actually crosses get the sync: one written
++ * in one file whose alias is read in the other. Bit n of *sync_r: a write to
++ * r[n] must refresh h[2n]/h[2n+1]; bit m of *sync_h: a write to h[m] must
++ * refresh r[m/2]. Sources are counted whether or not the opcode reads them,
++ * which can only add a sync, never lose one. Same walk as the emitter: an
++ * instruction with a constant source is followed by its 16-byte literal. */
++static void fp_alias_sync_sets(const u8* ucode, u32 max_bytes, u64* sync_r, u64* sync_h)
++{
++    u64 wr_r = 0, wr_h = 0, rd_r = 0, rd_h = 0;
++    u32 off = 0;
++    while (off + 16 <= max_bytes) {
++        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        off += 16;
++        const u32 srcw[3] = { w1, w2, w3 };
++        int has_k = 0;
++        for (int i = 0; i < 3; i++) {
++            Src sr;
++            decode_src(srcw[i], 0, &sr);
++            if (sr.type == FP_REG_TYPE_CONST) has_k = 1;
++            if (!(w2 & FP_BRANCH) && sr.type == FP_REG_TYPE_TEMP && sr.index < 64) {
++                if (sr.half) rd_h |= 1ull << sr.index;
++                else         rd_r |= 1ull << sr.index;
++            }
++        }
++        if (has_k && off + 16 <= max_bytes) off += 16;
++        if (!(w2 & FP_BRANCH) && !(w0 & FP_OUT_NONE)) {
++            const u32 d = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
++            if (w0 & FP_OUT_HALF) wr_h |= 1ull << d;
++            else                  wr_r |= 1ull << d;
++        }
++        if (w0 & FP_END) break;
++    }
++    *sync_r = 0; *sync_h = 0;
++    for (u32 n = 0; n < 48; n++) {
++        const u64 halves = (n < 32) ? (3ull << (2 * n)) : 0;
++        if ((wr_r >> n & 1) && (rd_h & halves)) *sync_r |= 1ull << n;
++    }
++    for (u32 m = 0; m < 64; m++)
++        if ((wr_h >> m & 1) && (rd_r >> (m / 2) & 1)) *sync_h |= 1ull << m;
++}
++
++/* The statements that carry a write to one file over to its alias in the
++ * other, for the components in `mask` (see fp_alias_sync_sets). */
++static void fp_emit_alias_sync(Out* o, int half, u32 idx, const char* mask,
++                               u64 sync_r, u64 sync_h)
++{
++    char line[256];
++    const int has_x = strchr(mask, 'x') != NULL, has_y = strchr(mask, 'y') != NULL;
++    const int has_z = strchr(mask, 'z') != NULL, has_w = strchr(mask, 'w') != NULL;
++    if (half) {
++        if (idx >= 64 || !(sync_h >> idx & 1) || idx / 2 >= 48) return;
++        static const char rc[4] = { 'x', 'y', 'z', 'w' };
++        const u32 n = idx / 2, base = (idx & 1u) * 2u;
++        if (has_x || has_y) {
++            snprintf(line, sizeof line,
++                     "    r[%u].%c = asfloat(f32tof16(h[%u].x) | (f32tof16(h[%u].y) << 16));\n",
++                     n, rc[base], idx, idx);
++            out_puts(o, line);
++        }
++        if (has_z || has_w) {
++            snprintf(line, sizeof line,
++                     "    r[%u].%c = asfloat(f32tof16(h[%u].z) | (f32tof16(h[%u].w) << 16));\n",
++                     n, rc[base + 1], idx, idx);
++            out_puts(o, line);
++        }
++    } else {
++        if (idx >= 48 || !(sync_r >> idx & 1)) return;
++        static const char* hp[4] = { "xy", "zw", "xy", "zw" };
++        static const char rc[4] = { 'x', 'y', 'z', 'w' };
++        const int has[4] = { has_x, has_y, has_z, has_w };
++        for (u32 c = 0; c < 4; c++) {
++            const u32 hi = idx * 2u + (c >> 1);
++            if (!has[c] || hi >= 48) continue;
++            snprintf(line, sizeof line,
++                     "    h[%u].%s = f16tof32(uint2(asuint(r[%u].%c) & 0xFFFFu, asuint(r[%u].%c) >> 16));\n",
++                     hi, hp[c], idx, rc[c], idx, rc[c]);
++            out_puts(o, line);
++        }
++    }
++}
++
+ /* Dest write-mask letters from OPDEST bits 9..12 (X..W). */
+ static void dest_mask(u32 op0, char* m)
+ {
+@@ -666,6 +760,8 @@ static int rsx_fp_decompile_internal(
+      * Emitting the preamble here would mean guessing it. */
+     Out o = { out, out_size, 0, 1 };
+     out[0] = '\0';
++    u64 alias_sync_r = 0, alias_sync_h = 0;
++    fp_alias_sync_sets(ucode, max_bytes, &alias_sync_r, &alias_sync_h);
+     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
+     out_puts(&o,
+         "    float4 r[48]; float4 h[48];\n"
+@@ -1161,6 +1257,8 @@ static int rsx_fp_decompile_internal(
+             }
+ 
+             if (has_dest) {
++                if (!is_never)
++                    fp_emit_alias_sync(&o, dst_half, dst_idx, m, alias_sync_r, alias_sync_h);
+                 const int target = fp_export_target(dst_idx, dst_half);
+                 if (target >= 0) wrote[dst_half][target] = 1;
+             }
 diff --git a/runtime/host/host_stubs.c b/runtime/host/host_stubs.c
 index 6e79ec31..3c66fda1 100644
 --- a/runtime/host/host_stubs.c
