@@ -1,3 +1,2147 @@
+diff --git a/libs/font/cellFont.c b/libs/font/cellFont.c
+index 4e239b55..c82b1c29 100644
+--- a/libs/font/cellFont.c
++++ b/libs/font/cellFont.c
+@@ -1,616 +1,986 @@
+ /*
+- * ps3recomp - cellFont HLE implementation
++ * ps3recomp - cellFont / cellFontFT HLE implementation
+  *
+- * Font system with optional stb_truetype.h backend for actual TTF rendering.
+- * Without stb_truetype, returns valid (but empty) glyph data so games
+- * don't crash.
++ * The firmware font library as a title links it: libfont (cellFont*) with the
++ * FreeType-backed font library from libfontFT
++ * (cellFontInitLibraryFreeTypeWithRevision). Everything the title hands us is
++ * a guest address, and every struct is read and written big-endian at its SDK
++ * offset (cellFont.h). Glyphs are rasterized with FreeType when the build has
++ * it (PS3RECOMP_HAS_FREETYPE), else with the bundled stb_truetype.
++ *
++ * Memory: the library objects the SDK says the library allocates (the
++ * CellFontLibrary, a renderer's glyph buffer) come from the title's own
++ * allocator, the MemoryIF callbacks in CellFontLibraryConfigFT, called as
++ * guest functions through ppu_guest_call. Font file data and rasterizer state
++ * stay on the host; the title cannot see them, the same way it cannot see
++ * libfont's internals.
++ *
++ * Ported from the MotorStorm Apocalypse port's toolkit patch. MotorStorm:
++ * Pacific Rift imports exactly the same seventeen entry points. They are all
++ * implemented here (cellFontOpenFontset and a few other siblings are extras):
++ *   cellFontInitializeWithRevision  cellFontEnd
++ *   cellFontInitLibraryFreeTypeWithRevision (cellFontFT)  cellFontEndLibrary
++ *   cellFontOpenFontFile  cellFontCloseFont
++ *   cellFontCreateRenderer  cellFontDestroyRenderer  cellFontBindRenderer
++ *   cellFontSetScalePixel  cellFontSetupRenderScalePoint
++ *   cellFontGetHorizontalLayout  cellFontGetCharGlyphMetrics  cellFontGetKerning
++ *   cellFontRenderSurfaceInit  cellFontRenderSurfaceSetScissor
++ *   cellFontRenderCharGlyphImage
++ * It draws each glyph through a surface whose buffer is NULL and copies the
++ * bitmap out of CellFontImageTransInfo, i.e. out of the renderer's buffer.
++ *
++ * Behavioural reference: RPCS3's rpcs3/Emu/Cell/Modules/cellFont.cpp (GPL);
++ * no code taken. Where it and the title disagree the title wins -- e.g. the
++ * render position is the glyph origin on the baseline, which is how the title
++ * centres each glyph in a 4x-size scratch surface.
+  */
+ 
+ #include "cellFont.h"
+-#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
++#include "../../runtime/ppu/ppu_memory.h"
++#include "../../runtime/ppu/ppu_context.h"
++#include "ps3emu/nid.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
+ 
+-/* Try to include stb_truetype */
+-#if __has_include("stb_truetype.h")
+-  #define FONT_HAS_STB 1
+-  #ifndef STB_TRUETYPE_IMPLEMENTATION
+-    #define STB_TRUETYPE_IMPLEMENTATION
++#if defined(PS3RECOMP_HAS_FREETYPE)
++  #include <ft2build.h>
++  #include FT_FREETYPE_H
++  #define FONT_BACKEND "FreeType"
++#else
++  #define STB_TRUETYPE_IMPLEMENTATION
++  #define STBTT_STATIC
++  #if defined(__GNUC__)
++    #pragma GCC diagnostic push
++    #pragma GCC diagnostic ignored "-Wunused-function"   /* static stb API we don't call */
+   #endif
+   #include "stb_truetype.h"
+-#elif defined(PS3RECOMP_HAS_STB_TRUETYPE)
+-  #define FONT_HAS_STB 1
+-  #include "stb_truetype.h"
+-#else
+-  #define FONT_HAS_STB 0
++  #if defined(__GNUC__)
++    #pragma GCC diagnostic pop
++  #endif
++  #define FONT_BACKEND "stb_truetype"
+ #endif
+ 
++/* Guest calls (runtime/ppu/ppu_loader.cpp) and the cellFs path translation
++ * (runtime/ppu/ppu_fs.cpp). */
++extern uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
++                               uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
++                               uint64_t a7);
++extern void ppu_fs_host_path(const char* guest, char* out, size_t cap);
++extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
++                                 void (*fn)(ppu_context*));
++
++#define FONT_MAX_LIBS      4
++#define FONT_MAX_FONTS     64
++#define FONT_MAX_RENDERERS 16
++
++#define MAGIC_LIB      0x464C4942u   /* 'FLIB' */
++#define MAGIC_FONT     0x46464E54u   /* 'FFNT' */
++#define MAGIC_RENDERER 0x4652454Eu   /* 'FREN' */
++
+ /* ---------------------------------------------------------------------------
+- * Internal state
++ * State
+  * -----------------------------------------------------------------------*/
++typedef struct {
++    int in_use;
++    u32 ea;                         /* the CellFontLibrary we allocated */
++    u32 mif_obj, mif_malloc, mif_free, mif_realloc, mif_calloc;
++} FontLib;
+ 
+ typedef struct {
+-    int     in_use;
+-    u32     type;
+-    float   scale_x;
+-    float   scale_y;
+-    float   effect_weight;
+-    float   effect_slant;
+-    u32     renderer;       /* bound renderer index, or 0xFFFFFFFF */
+-    /* Font data */
+-    u8*     font_data;      /* TTF file data (owned if loaded from file) */
+-    u32     font_data_size;
+-    int     font_data_owned;
+-#if FONT_HAS_STB
+-    stbtt_fontinfo stb_info;
+-    int     stb_valid;
+-#endif
+-} FontSlot;
++    int in_use;
++    u32 ea;                         /* title's CellFontRenderer */
++    int lib;
++    u32 buf, cap;                   /* glyph buffer (guest) */
++    int buf_owned;                  /* allocated through the lib's Malloc */
++} FontRenderer;
++
++typedef struct {
++    float width, height, hbx, hby, hadv, vbx, vby, vadv;
++} GlyphMetrics;
+ 
+ typedef struct {
+     int in_use;
+-} RendererSlot;
++    u32 ea;                         /* title's CellFont */
++    int lib;
++    u8* data; u32 size;             /* host copy of the font file */
++    float sx, sy;                   /* font scale, pixels per em */
++    float rsx, rsy;                 /* render scale, pixels per em */
++    float weight, slant;
++    int renderer;                   /* bound renderer slot, -1 if none */
++#if defined(PS3RECOMP_HAS_FREETYPE)
++    FT_Face face;
++    float face_w, face_h;           /* size last set on the face */
++#else
++    stbtt_fontinfo stb;
++    u8* stb_bitmap;
++#endif
++} FontSlot;
+ 
+-static int          s_font_initialized = 0;
+-static u32          s_open_mode = CELL_FONT_OPEN_MODE_DEFAULT;
+-static FontSlot     s_fonts[CELL_FONT_MAX_OPENED];
+-static RendererSlot s_renderers[CELL_FONT_MAX_RENDERERS];
++static int          s_initialized;
++static u64          s_revision;
++static FontLib      s_libs[FONT_MAX_LIBS];
++static FontSlot     s_fonts[FONT_MAX_FONTS];
++static FontRenderer s_renderers[FONT_MAX_RENDERERS];
++#if defined(PS3RECOMP_HAS_FREETYPE)
++static FT_Library   s_ft;
++#endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Helpers
+- * -----------------------------------------------------------------------*/
++/* Guards slot claims and the rasterizer's open/close (FreeType's library
++ * object is not thread-safe). Never held across a guest call: a guest
++ * allocator may block, and its thread may be the one that wants this lock. */
++static volatile int s_lock;
++static void font_lock(void)   { while (__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) {} }
++static void font_unlock(void) { __atomic_store_n(&s_lock, 0, __ATOMIC_RELEASE); }
+ 
+-static FontSlot* font_alloc_slot(void)
++static int s_log_renders = -1;
++static int font_verbose(void)
+ {
+-    for (int i = 0; i < CELL_FONT_MAX_OPENED; i++) {
+-        if (!s_fonts[i].in_use) {
+-            memset(&s_fonts[i], 0, sizeof(FontSlot));
+-            s_fonts[i].in_use = 1;
+-            s_fonts[i].scale_x = 1.0f;
+-            s_fonts[i].scale_y = 1.0f;
+-            s_fonts[i].renderer = 0xFFFFFFFF;
+-            return &s_fonts[i];
+-        }
+-    }
+-    return NULL;
++    if (s_log_renders < 0) s_log_renders = getenv("PS3_FONT_LOG") ? 1 : 0;
++    return s_log_renders;
+ }
+ 
+-
+ /* ---------------------------------------------------------------------------
+- * Guest struct marshalling
+- *
+- * The structs in cellFont.h are HOST layout and are not what the title has in
+- * memory: CellFontRenderSurface and CellFontGlyphImage lead with an 8-byte host
+- * pointer where the guest has 4, and every u32/float field is big-endian on the
+- * guest side. So a pointer translation alone is not enough -- casting a guest EA
+- * to CellFontGlyphMetrics* and storing floats through it writes little-endian
+- * values at the wrong offsets, which is how a title reads a glyph advance of
+- * 4.6e-41 and lays every string out on top of itself.
+- *
+- * The render/metrics bodies keep working on host structs; these move them in and
+- * out. Offsets are the guest ABI, listed explicitly so they cannot drift with a
+- * host compiler's padding.
++ * Guest allocator (CellFontMemoryInterface)
+  * -----------------------------------------------------------------------*/
+-enum {
+-    FONT_O_HANDLE = 0,  FONT_O_TYPE = 4,  FONT_O_SCALEX = 8, FONT_O_SCALEY = 12,
+-    SURF_O_BUFFER = 0,  SURF_O_WIDTHBYTE = 4, SURF_O_PIXELSIZE = 8,
+-    SURF_O_WIDTH  = 12, SURF_O_HEIGHT = 16,
+-    IMG_O_BUFFER  = 0,  IMG_O_WIDTHBYTE = 4,  IMG_O_PIXELSIZE = 8,
+-    IMG_O_WIDTH   = 12, IMG_O_HEIGHT = 16,
+-    LAY_O_BASELINEY = 0, LAY_O_LINEHEIGHT = 4, LAY_O_EFFECTHEIGHT = 8
+-};
+-
+-#define FONT_EA(p) ((u32)(uintptr_t)(p))
+-
+-/* CellFontGlyphMetrics is eight consecutive floats in guest order. */
+-static void font_metrics_store(CellFontGlyphMetrics* guest_ea,
+-                               const CellFontGlyphMetrics* h)
+-{
+-    u32 ea = FONT_EA(guest_ea);
+-    if (!ea) return;
+-    vm_write_f32(ea +  0, h->width);
+-    vm_write_f32(ea +  4, h->height);
+-    vm_write_f32(ea +  8, h->h_bearing_x);
+-    vm_write_f32(ea + 12, h->h_bearing_y);
+-    vm_write_f32(ea + 16, h->h_advance);
+-    vm_write_f32(ea + 20, h->v_bearing_x);
+-    vm_write_f32(ea + 24, h->v_bearing_y);
+-    vm_write_f32(ea + 28, h->v_advance);
+-}
+-
+-static void font_surface_load(CellFontRenderSurface* h,
+-                              const CellFontRenderSurface* guest_ea)
++static u32 lib_malloc(const FontLib* L, u32 size)
+ {
+-    u32 ea = FONT_EA(guest_ea);
+-    memset(h, 0, sizeof(*h));
+-    if (!ea) return;
+-    u32 buf = vm_read32(ea + SURF_O_BUFFER);
+-    h->buffer        = buf ? (u8*)(vm_base + buf) : NULL;
+-    h->widthByte     = (s32)vm_read32(ea + SURF_O_WIDTHBYTE);
+-    h->pixelSizeByte = (s32)vm_read32(ea + SURF_O_PIXELSIZE);
+-    h->width         = (s32)vm_read32(ea + SURF_O_WIDTH);
+-    h->height        = (s32)vm_read32(ea + SURF_O_HEIGHT);
++    if (!L || !L->mif_malloc) return 0;
++    return (u32)ppu_guest_call(L->mif_malloc, L->mif_obj, size, 0, 0, 0, 0, 0, 0);
+ }
+ 
+-/* buffer is left as the title set it -- we render into the surface, never
+- * hand back a buffer of our own. */
+-static void font_image_store(CellFontGlyphImage* guest_ea,
+-                             s32 widthByte, s32 pixelSizeByte, s32 w, s32 hgt)
++static void lib_free(const FontLib* L, u32 p)
+ {
+-    u32 ea = FONT_EA(guest_ea);
+-    if (!ea) return;
+-    vm_write32(ea + IMG_O_BUFFER,    0);
+-    vm_write32(ea + IMG_O_WIDTHBYTE, (u32)widthByte);
+-    vm_write32(ea + IMG_O_PIXELSIZE, (u32)pixelSizeByte);
+-    vm_write32(ea + IMG_O_WIDTH,     (u32)w);
+-    vm_write32(ea + IMG_O_HEIGHT,    (u32)hgt);
++    if (!L || !L->mif_free || !p) return;
++    ppu_guest_call(L->mif_free, L->mif_obj, p, 0, 0, 0, 0, 0, 0);
+ }
+ 
+-static void font_store(CellFont* guest_ea, u32 handle, u32 type,
+-                       float sx, float sy)
++/* ---------------------------------------------------------------------------
++ * Handle lookup: our words in the title's opaque structs
++ * -----------------------------------------------------------------------*/
++static FontLib* lib_get(u32 ea)
+ {
+-    u32 ea = FONT_EA(guest_ea);
+-    if (!ea) return;
+-    vm_write32(ea + FONT_O_HANDLE, handle);
+-    vm_write32(ea + FONT_O_TYPE,   type);
+-    vm_write_f32(ea + FONT_O_SCALEX, sx);
+-    vm_write_f32(ea + FONT_O_SCALEY, sy);
++    if (!ea || vm_read32(ea + CELL_FONT_O_LIB_MAGIC) != MAGIC_LIB) return NULL;
++    u32 i = vm_read32(ea + CELL_FONT_O_LIB_SLOT);
++    if (i >= FONT_MAX_LIBS || !s_libs[i].in_use || s_libs[i].ea != ea) return NULL;
++    return &s_libs[i];
+ }
+ 
+-static FontSlot* font_get_slot(CellFont* font)
++static FontSlot* font_get(u32 ea)
+ {
+-    /* font is a guest EA; the handle is the big-endian word at +0. */
+-    u32 ea = FONT_EA(font);
+-    if (!ea)
+-        return NULL;
+-    u32 handle = vm_read32(ea + FONT_O_HANDLE);
+-    if (handle >= CELL_FONT_MAX_OPENED)
+-        return NULL;
+-    FontSlot* slot = &s_fonts[handle];
+-    if (!slot->in_use)
+-        return NULL;
+-    return slot;
++    if (!ea || vm_read32(ea + CELL_FONT_O_OBJ_MAGIC) != MAGIC_FONT) return NULL;
++    u32 i = vm_read32(ea + CELL_FONT_O_OBJ_SLOT);
++    if (i >= FONT_MAX_FONTS || !s_fonts[i].in_use || s_fonts[i].ea != ea) return NULL;
++    return &s_fonts[i];
+ }
+ 
+-#if FONT_HAS_STB
+-static float font_get_stb_scale(FontSlot* slot)
++static FontRenderer* renderer_get(u32 ea)
+ {
+-    if (!slot->stb_valid) return 0.0f;
+-    return stbtt_ScaleForPixelHeight(&slot->stb_info, slot->scale_y);
++    if (!ea || vm_read32(ea + CELL_FONT_O_OBJ_MAGIC) != MAGIC_RENDERER) return NULL;
++    u32 i = vm_read32(ea + CELL_FONT_O_OBJ_SLOT);
++    if (i >= FONT_MAX_RENDERERS || !s_renderers[i].in_use || s_renderers[i].ea != ea)
++        return NULL;
++    return &s_renderers[i];
+ }
+-#endif
+ 
+ /* ---------------------------------------------------------------------------
+- * API implementations
++ * Rasterizer backend
+  * -----------------------------------------------------------------------*/
++#if defined(PS3RECOMP_HAS_FREETYPE)
+ 
+-s32 cellFontInit(const CellFontConfig* config)
++static int be_open(FontSlot* f, u32 subNum)
+ {
+-    (void)config;
+-    printf("[cellFont] Init()\n");
+-
+-    if (s_font_initialized)
+-        return CELL_FONT_ERROR_ALREADY_INITIALIZED;
+-
+-    memset(s_fonts, 0, sizeof(s_fonts));
+-    memset(s_renderers, 0, sizeof(s_renderers));
+-    s_font_initialized = 1;
+-    return CELL_OK;
++    if (!s_ft && FT_Init_FreeType(&s_ft)) { s_ft = NULL; return -1; }
++    if (FT_New_Memory_Face(s_ft, f->data, (FT_Long)f->size, (FT_Long)subNum, &f->face))
++        { f->face = NULL; return -1; }
++    FT_Select_Charmap(f->face, FT_ENCODING_UNICODE);
++    f->face_w = f->face_h = -1.0f;
++    return 0;
+ }
+ 
+-/* cellFontInitializeWithRevision(revisionFlags, config): the entry point titles built with a newer SDK use instead of
+- * cellFontInit (NID 0xF03DCC29). Without it every later cellFont call returns CELL_FONT_ERROR_UNINITIALIZED, which
+- * a title that ignores the result never notices. */
+-s32 cellFontInitializeWithRevision(u64 revisionFlags, const CellFontConfig* config)
++static void be_close(FontSlot* f)
+ {
+-    (void)revisionFlags;
+-    return cellFontInit(config);
++    if (f->face) FT_Done_Face(f->face);
++    f->face = NULL;
+ }
+ 
+-s32 cellFontEnd(void)
++static void be_size(FontSlot* f, float w, float h)
+ {
+-    printf("[cellFont] End()\n");
+-
+-    if (!s_font_initialized)
+-        return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    for (int i = 0; i < CELL_FONT_MAX_OPENED; i++) {
+-        if (s_fonts[i].in_use && s_fonts[i].font_data_owned && s_fonts[i].font_data)
+-            free(s_fonts[i].font_data);
+-        s_fonts[i].in_use = 0;
+-    }
++    if (w == f->face_w && h == f->face_h) return;
++    if (w <= 0.0f) w = h;
++    if (h <= 0.0f) h = w;
++    if (w <= 0.0f) w = h = 1.0f;
++    FT_Set_Char_Size(f->face, (FT_F26Dot6)lroundf(w * 64.0f),
++                     (FT_F26Dot6)lroundf(h * 64.0f), 72, 72);
++    f->face_w = w; f->face_h = h;
++}
+ 
+-    s_font_initialized = 0;
+-    return CELL_OK;
++static u32 be_glyph(FontSlot* f, u32 code)
++{
++    return f->face ? (u32)FT_Get_Char_Index(f->face, (FT_ULong)code) : 0;
+ }
+ 
+-s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 uniqueId)
++static int be_metrics(FontSlot* f, float w, float h, u32 gi, GlyphMetrics* m)
+ {
+-    (void)subNum;
+-    (void)uniqueId;
+-    fontPath = GUEST_PTR(fontPath, const char*);
+-    printf("[cellFont] OpenFontFile(%s)\n", fontPath ? fontPath : "(null)");
++    be_size(f, w, h);
++    if (FT_Load_Glyph(f->face, gi, FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP)) return -1;
++    const FT_Glyph_Metrics* g = &f->face->glyph->metrics;
++    m->width  = (float)g->width / 64.0f;
++    m->height = (float)g->height / 64.0f;
++    m->hbx    = (float)g->horiBearingX / 64.0f;
++    m->hby    = (float)g->horiBearingY / 64.0f;
++    m->hadv   = (float)g->horiAdvance / 64.0f;
++    m->vbx    = (float)g->vertBearingX / 64.0f;
++    m->vby    = (float)g->vertBearingY / 64.0f;
++    m->vadv   = (float)g->vertAdvance / 64.0f;
++    return 0;
++}
+ 
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (!font || !fontPath)  return CELL_FONT_ERROR_INVALID_PARAMETER;
++static void be_vmetrics(FontSlot* f, float w, float h,
++                        float* ascent, float* descent, float* line)
++{
++    be_size(f, w, h);
++    const FT_Size_Metrics* s = &f->face->size->metrics;
++    *ascent  = (float)s->ascender / 64.0f;
++    *descent = (float)s->descender / 64.0f;     /* negative */
++    *line    = (float)s->height / 64.0f;
++}
+ 
+-    FontSlot* slot = font_alloc_slot();
+-    if (!slot) return CELL_FONT_ERROR_ALLOCATION_FAILED;
++static float be_kerning(FontSlot* f, float w, float h, u32 g1, u32 g2)
++{
++    if (!FT_HAS_KERNING(f->face)) return 0.0f;
++    be_size(f, w, h);
++    FT_Vector v;
++    if (FT_Get_Kerning(f->face, g1, g2, FT_KERNING_UNFITTED, &v)) return 0.0f;
++    return (float)v.x / 64.0f;
++}
+ 
+-    /* Load TTF file */
+-    FILE* f = fopen(fontPath, "rb");
+-    if (!f) {
+-        slot->in_use = 0;
+-        printf("[cellFont] Cannot open font file: %s\n", fontPath);
+-        return CELL_FONT_ERROR_OPEN_FAILED;
++/* The bitmap stays valid until the next call on this font. */
++static const u8* be_render(FontSlot* f, float w, float h, u32 gi,
++                           int* bw, int* bh, int* pitch, int* left, int* top)
++{
++    be_size(f, w, h);
++    if (FT_Load_Glyph(f->face, gi, FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP)) return NULL;
++    if (FT_Render_Glyph(f->face->glyph, FT_RENDER_MODE_NORMAL)) return NULL;
++    const FT_GlyphSlot g = f->face->glyph;
++    *left = g->bitmap_left; *top = g->bitmap_top;
++    if (!g->bitmap.width || !g->bitmap.rows || !g->bitmap.buffer) {   /* a space */
++        *bw = *bh = *pitch = 0;
++        return (const u8*)"";
+     }
++    if (g->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY) return NULL;
++    *bw = (int)g->bitmap.width; *bh = (int)g->bitmap.rows;
++    *pitch = g->bitmap.pitch;
++    *left = g->bitmap_left; *top = g->bitmap_top;
++    return g->bitmap.buffer;
++}
+ 
+-    fseek(f, 0, SEEK_END);
+-    long size = ftell(f);
+-    fseek(f, 0, SEEK_SET);
+-
+-    slot->font_data = (u8*)malloc((size_t)size);
+-    if (!slot->font_data) {
+-        fclose(f);
+-        slot->in_use = 0;
+-        return CELL_FONT_ERROR_ALLOCATION_FAILED;
+-    }
++#else   /* stb_truetype */
+ 
+-    slot->font_data_size = (u32)fread(slot->font_data, 1, (size_t)size, f);
+-    slot->font_data_owned = 1;
+-    fclose(f);
++static int be_open(FontSlot* f, u32 subNum)
++{
++    int off = stbtt_GetFontOffsetForIndex(f->data, (int)subNum);
++    if (off < 0 || !stbtt_InitFont(&f->stb, f->data, off)) return -1;
++    return 0;
++}
+ 
+-#if FONT_HAS_STB
+-    if (stbtt_InitFont(&slot->stb_info, slot->font_data,
+-                       stbtt_GetFontOffsetForIndex(slot->font_data, 0))) {
+-        slot->stb_valid = 1;
+-    } else {
+-        printf("[cellFont] stbtt_InitFont failed for: %s\n", fontPath);
+-        slot->stb_valid = 0;
+-    }
+-#endif
++static void be_close(FontSlot* f)
++{
++    if (f->stb_bitmap) stbtt_FreeBitmap(f->stb_bitmap, NULL);
++    f->stb_bitmap = NULL;
++}
+ 
+-    font_store(font, (u32)(slot - s_fonts), 0, 1.0f, 1.0f);
++static u32 be_glyph(FontSlot* f, u32 code) { return (u32)stbtt_FindGlyphIndex(&f->stb, (int)code); }
+ 
+-    return CELL_OK;
++static void be_scale(FontSlot* f, float w, float h, float* kx, float* ky)
++{
++    if (w <= 0.0f) w = h;
++    if (h <= 0.0f) h = w;
++    *kx = stbtt_ScaleForMappingEmToPixels(&f->stb, w);
++    *ky = stbtt_ScaleForMappingEmToPixels(&f->stb, h);
+ }
+ 
+-s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 subNum, s32 uniqueId)
++static int be_metrics(FontSlot* f, float w, float h, u32 gi, GlyphMetrics* m)
+ {
+-    (void)subNum;
+-    (void)uniqueId;
+-    printf("[cellFont] OpenFontMemory(size=%u)\n", dataSize);
++    float kx, ky; be_scale(f, w, h, &kx, &ky);
++    int adv, lsb, x0, y0, x1, y1, a, d, g;
++    stbtt_GetGlyphHMetrics(&f->stb, (int)gi, &adv, &lsb);
++    if (!stbtt_GetGlyphBox(&f->stb, (int)gi, &x0, &y0, &x1, &y1)) x0 = y0 = x1 = y1 = 0;
++    stbtt_GetFontVMetrics(&f->stb, &a, &d, &g);
++    m->width  = (float)(x1 - x0) * kx;
++    m->height = (float)(y1 - y0) * ky;
++    m->hbx    = (float)x0 * kx;
++    m->hby    = (float)y1 * ky;
++    m->hadv   = (float)adv * kx;
++    m->vadv   = (float)(a - d) * ky;
++    m->vbx    = -m->width * 0.5f;
++    m->vby    = (m->vadv - m->height) * 0.5f;
++    return 0;
++}
+ 
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (!font || !data || dataSize == 0) return CELL_FONT_ERROR_INVALID_PARAMETER;
++static void be_vmetrics(FontSlot* f, float w, float h,
++                        float* ascent, float* descent, float* line)
++{
++    float kx, ky; be_scale(f, w, h, &kx, &ky);
++    int a, d, g;
++    stbtt_GetFontVMetrics(&f->stb, &a, &d, &g);
++    *ascent = (float)a * ky; *descent = (float)d * ky; *line = (float)(a - d + g) * ky;
++}
+ 
+-    FontSlot* slot = font_alloc_slot();
+-    if (!slot) return CELL_FONT_ERROR_ALLOCATION_FAILED;
++static float be_kerning(FontSlot* f, float w, float h, u32 g1, u32 g2)
++{
++    float kx, ky; be_scale(f, w, h, &kx, &ky);
++    return (float)stbtt_GetGlyphKernAdvance(&f->stb, (int)g1, (int)g2) * kx;
++}
+ 
+-    slot->font_data = GUEST_PTR(data, u8*); /* borrowed guest buffer */
+-    slot->font_data_size = dataSize;
+-    slot->font_data_owned = 0;
++static const u8* be_render(FontSlot* f, float w, float h, u32 gi,
++                           int* bw, int* bh, int* pitch, int* left, int* top)
++{
++    float kx, ky; be_scale(f, w, h, &kx, &ky);
++    be_close(f);
++    int xo = 0, yo = 0;
++    f->stb_bitmap = stbtt_GetGlyphBitmap(&f->stb, kx, ky, (int)gi, bw, bh, &xo, &yo);
++    *pitch = *bw; *left = xo; *top = -yo;
++    if (!f->stb_bitmap) *bw = *bh = 0;
++    return f->stb_bitmap ? f->stb_bitmap : (const u8*)"";
++}
+ 
+-#if FONT_HAS_STB
+-    if (stbtt_InitFont(&slot->stb_info, slot->font_data,
+-                       stbtt_GetFontOffsetForIndex(slot->font_data, 0))) {
+-        slot->stb_valid = 1;
+-    } else {
+-        slot->stb_valid = 0;
+-    }
+ #endif
+ 
+-    font_store(font, (u32)(slot - s_fonts), 0, 1.0f, 1.0f);
+-
++/* ---------------------------------------------------------------------------
++ * Library
++ * -----------------------------------------------------------------------*/
++s32 cellFontInitializeWithRevision(u64 revisionFlags, u32 config)
++{
++    printf("[cellFont] InitializeWithRevision(rev=0x%llX, config=0x%08X) backend=%s\n",
++           (unsigned long long)revisionFlags, config, FONT_BACKEND);
++    if (s_initialized) return CELL_FONT_ERROR_ALREADY_INITIALIZED;
++    if (!config) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    /* The file cache (FileCache.buffer/size) and the user font entry table
++     * are the library's working memory on the PS3; the host needs neither. */
++    s_revision = revisionFlags;
++    memset(s_libs, 0, sizeof s_libs);
++    memset(s_renderers, 0, sizeof s_renderers);
++    for (int i = 0; i < FONT_MAX_FONTS; i++) s_fonts[i].in_use = 0;
++    s_initialized = 1;
+     return CELL_OK;
+ }
+ 
+-s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* font)
++/* Pre-revision entry point: the same, with no revision flags. */
++s32 cellFontInit(u32 config)
+ {
+-    (void)lib;
+-    u32 want_type = fontType ? vm_read32(FONT_EA(fontType)) : 0;
+-    printf("[cellFont] OpenFontset(type=0x%X)\n", want_type);
+-
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (!font) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    /* System fonts are not available in recomp. Allocate a slot anyway
+-     * so the game can proceed with empty glyphs. */
+-    FontSlot* slot = font_alloc_slot();
+-    if (!slot) return CELL_FONT_ERROR_ALLOCATION_FAILED;
+-
+-    slot->type = want_type;
++    return cellFontInitializeWithRevision(0, config);
++}
+ 
+-    font_store(font, (u32)(slot - s_fonts), slot->type, 1.0f, 1.0f);
++static void font_release(FontSlot* f)
++{
++    font_lock();
++    be_close(f);
++    free(f->data);
++    f->data = NULL;
++    f->in_use = 0;
++    font_unlock();
++}
+ 
++s32 cellFontEnd(void)
++{
++    printf("[cellFont] End()\n");
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    for (int i = 0; i < FONT_MAX_FONTS; i++)
++        if (s_fonts[i].in_use) font_release(&s_fonts[i]);
++    s_initialized = 0;
+     return CELL_OK;
+ }
+ 
+-s32 cellFontCloseFont(CellFont* font)
++s32 cellFontInitLibraryFreeTypeWithRevision(u64 revisionFlags, u32 config, u32 libOut)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    if (slot->font_data_owned && slot->font_data)
+-        free(slot->font_data);
+-
+-    slot->in_use = 0;
++    printf("[cellFont] InitLibraryFreeTypeWithRevision(rev=0x%llX, config=0x%08X, lib=0x%08X)\n",
++           (unsigned long long)revisionFlags, config, libOut);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    if (!config || !libOut) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    FontLib tmp;
++    memset(&tmp, 0, sizeof tmp);
++    const u32 mif = config + CELL_FONT_O_FTCFG_MIF;
++    tmp.mif_obj     = vm_read32(mif + CELL_FONT_O_MIF_OBJECT);
++    tmp.mif_malloc  = vm_read32(mif + CELL_FONT_O_MIF_MALLOC);
++    tmp.mif_free    = vm_read32(mif + CELL_FONT_O_MIF_FREE);
++    tmp.mif_realloc = vm_read32(mif + CELL_FONT_O_MIF_REALLOC);
++    tmp.mif_calloc  = vm_read32(mif + CELL_FONT_O_MIF_CALLOC);
++    if (!tmp.mif_malloc || !tmp.mif_free) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    int slot = -1;
++    font_lock();
++    for (int i = 0; i < FONT_MAX_LIBS; i++)
++        if (!s_libs[i].in_use) { s_libs[i].in_use = 1; slot = i; break; }
++    font_unlock();
++    if (slot < 0) return CELL_FONT_ERROR_ALLOCATION_FAILED;
++
++    const u32 ea = lib_malloc(&tmp, CELL_FONT_LIBRARY_SIZE);
++    if (!ea) { s_libs[slot].in_use = 0; return CELL_FONT_ERROR_ALLOCATION_FAILED; }
++    vm_memset(ea, 0, CELL_FONT_LIBRARY_SIZE);
++    /* libraryType/libraryVersion 0, as RPCS3 reports them. */
++    vm_write32(ea + CELL_FONT_O_LIB_TYPE, 0);
++    vm_write32(ea + CELL_FONT_O_LIB_VERSION, 0);
++    vm_write32(ea + CELL_FONT_O_LIB_MAGIC, MAGIC_LIB);
++    vm_write32(ea + CELL_FONT_O_LIB_SLOT, (u32)slot);
++    tmp.in_use = 1;
++    tmp.ea = ea;
++    s_libs[slot] = tmp;
++    vm_write32(libOut, ea);
++    printf("[cellFont]   library 0x%08X (Malloc OPD 0x%08X, Free OPD 0x%08X)\n",
++           ea, tmp.mif_malloc, tmp.mif_free);
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetFontOpenMode(u32 openMode)
++s32 cellFontEndLibrary(u32 lib)
+ {
+-    s_open_mode = openMode;
++    printf("[cellFont] EndLibrary(0x%08X)\n", lib);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    FontLib* L = lib_get(lib);
++    if (!L) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    const int li = (int)(L - s_libs);
++    for (int i = 0; i < FONT_MAX_FONTS; i++)
++        if (s_fonts[i].in_use && s_fonts[i].lib == li) font_release(&s_fonts[i]);
++    for (int i = 0; i < FONT_MAX_RENDERERS; i++)
++        if (s_renderers[i].in_use && s_renderers[i].lib == li) {
++            if (s_renderers[i].buf_owned) lib_free(L, s_renderers[i].buf);
++            s_renderers[i].in_use = 0;
++        }
++    const FontLib copy = *L;
++    vm_write32(lib + CELL_FONT_O_LIB_MAGIC, 0);
++    L->in_use = 0;
++    lib_free(&copy, lib);
+     return CELL_OK;
+ }
+ 
+-s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer)
++/* ---------------------------------------------------------------------------
++ * Fonts
++ * -----------------------------------------------------------------------*/
++static s32 font_open(u32 lib, u8* data, u32 size, u32 subNum, u32 font, const char* what)
+ {
+-    (void)lib;
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (!renderer) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    FontLib* L = lib_get(lib);
++    if (!L) { free(data); return CELL_FONT_ERROR_INVALID_PARAMETER; }
++    int slot = -1;
++    font_lock();
++    for (int i = 0; i < FONT_MAX_FONTS; i++)
++        if (!s_fonts[i].in_use) { slot = i; break; }
++    if (slot < 0) { font_unlock(); free(data); return CELL_FONT_ERROR_FONT_OPEN_MAX; }
++    FontSlot* f = &s_fonts[slot];
++    memset(f, 0, sizeof *f);
++    f->data = data; f->size = size;
++    if (be_open(f, subNum) != 0) {
++        font_unlock();
++        free(data); f->data = NULL;
++        printf("[cellFont]   %s: not a font the rasterizer can read\n", what);
++        return CELL_FONT_ERROR_FONT_OPEN_FAILED;
++    }
++    f->in_use = 1;
++    f->ea = font;
++    f->lib = (int)(L - s_libs);
++    f->sx = f->sy = f->rsx = f->rsy = 16.0f;
++    f->weight = 1.0f;
++    f->renderer = -1;
++    font_unlock();
++
++    vm_memset(font, 0, CELL_FONT_OPAQUE_SIZE);
++    vm_write32(font + CELL_FONT_O_OBJ_MAGIC, MAGIC_FONT);
++    vm_write32(font + CELL_FONT_O_OBJ_SLOT, (u32)slot);
++    vm_write_f32(font + CELL_FONT_O_FONT_SCALE_X, f->sx);
++    vm_write_f32(font + CELL_FONT_O_FONT_SCALE_Y, f->sy);
++    return CELL_OK;
++}
+ 
+-    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; i++) {
+-        if (!s_renderers[i].in_use) {
+-            s_renderers[i].in_use = 1;
+-            vm_write32(FONT_EA(renderer), i);
+-            return CELL_OK;
++s32 cellFontOpenFontFile(u32 lib, u32 fontPath, u32 subNum, s32 uniqueId, u32 font)
++{
++    char guest[1024];
++    size_t n = 0;
++    if (fontPath)
++        for (; n < sizeof guest - 1; n++) {
++            guest[n] = (char)vm_read8(fontPath + (u32)n);
++            if (!guest[n]) break;
+         }
++    guest[n] = 0;
++    printf("[cellFont] OpenFontFile(lib=0x%08X, '%s', sub=%u, id=%d, font=0x%08X)\n",
++           lib, guest, subNum, uniqueId, font);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    if (!fontPath || !font || !guest[0]) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    char host[1024];
++    ppu_fs_host_path(guest, host, sizeof host);
++    FILE* fp = fopen(host, "rb");
++    if (!fp) {
++        printf("[cellFont]   cannot open %s\n", host);
++        return CELL_FONT_ERROR_FONT_OPEN_FAILED;
++    }
++    fseek(fp, 0, SEEK_END);
++    long size = ftell(fp);
++    fseek(fp, 0, SEEK_SET);
++    u8* data = size > 0 ? (u8*)malloc((size_t)size) : NULL;
++    if (!data || fread(data, 1, (size_t)size, fp) != (size_t)size) {
++        fclose(fp); free(data);
++        return CELL_FONT_ERROR_READ_FAILED;
+     }
++    fclose(fp);
++    s32 rc = font_open(lib, data, (u32)size, subNum, font, host);
++    if (rc == CELL_OK) printf("[cellFont]   opened %s (%ld bytes)\n", host, size);
++    return rc;
++}
+ 
+-    return CELL_FONT_ERROR_ALLOCATION_FAILED;
++s32 cellFontOpenFontMemory(u32 lib, u32 fontAddr, u32 fontSize, u32 subNum,
++                           s32 uniqueId, u32 font)
++{
++    (void)uniqueId;
++    printf("[cellFont] OpenFontMemory(lib=0x%08X, 0x%08X, %u bytes, font=0x%08X)\n",
++           lib, fontAddr, fontSize, font);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    if (!fontAddr || !fontSize || !font) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    /* A host copy: the rasterizer keeps pointers into it, and guest memory
++     * is big-endian bytes either way. */
++    u8* data = (u8*)malloc(fontSize);
++    if (!data) return CELL_FONT_ERROR_ALLOCATION_FAILED;
++    vm_memcpy_from(data, fontAddr, fontSize);
++    return font_open(lib, data, fontSize, subNum, font, "memory font");
+ }
+ 
+-s32 cellFontDestroyRenderer(CellFontRenderer renderer)
++/* Firmware fonts. The type -> file table is the part of the fontset map
++ * that is certain; any other type gets the default Rodin Latin face rather
++ * than a failure, which is what a title that only wants "a system font"
++ * needs. */
++s32 cellFontOpenFontset(u32 lib, u32 fontType, u32 font)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (renderer >= CELL_FONT_MAX_RENDERERS) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    static const struct { u32 type; const char* file; } map[] = {
++        { 0x00000000u, "SCE-PS3-RD-R-LATIN.TTF"  },   /* RODIN_SANS_SERIF_LATIN */
++        { 0x00000001u, "SCE-PS3-RD-L-LATIN.TTF"  },   /* ..._LIGHT_LATIN */
++        { 0x00000002u, "SCE-PS3-RD-B-LATIN.TTF"  },   /* ..._BOLD_LATIN */
++        { 0x00000008u, "SCE-PS3-NR-R-JPN.TTF"    },   /* NEWRODIN_GOTHIC_JAPANESE */
++        { 0x00000009u, "SCE-PS3-NR-L-JPN.TTF"    },
++        { 0x0000000Au, "SCE-PS3-NR-B-JPN.TTF"    },
++        { 0x00000018u, "SCE-PS3-RD-R-LATIN2.TTF" },   /* RODIN_SANS_SERIF_LATIN2 */
++        { 0x00000019u, "SCE-PS3-RD-L-LATIN2.TTF" },
++        { 0x0000001Au, "SCE-PS3-RD-B-LATIN2.TTF" },
++        { 0x00000100u, "SCE-PS3-VR-R-LATIN.TTF"  },   /* SEURAT_MARU_GOTHIC_LATIN */
++        { 0x00000118u, "SCE-PS3-VR-R-LATIN2.TTF" },   /* SEURAT_MARU_GOTHIC_LATIN2 */
++    };
++    const u32 type = fontType ? vm_read32(fontType) : 0;
++    const char* file = map[0].file;
++    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
++        if (map[i].type == type) { file = map[i].file; break; }
++    printf("[cellFont] OpenFontset(lib=0x%08X, type=0x%X -> %s, font=0x%08X)\n",
++           lib, type, file, font);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    if (!fontType || !font) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    char guest[128], host[1024];
++    snprintf(guest, sizeof guest, "/dev_flash/data/font/%s", file);
++    ppu_fs_host_path(guest, host, sizeof host);
++    FILE* fp = fopen(host, "rb");
++    if (!fp) {
++        printf("[cellFont]   cannot open %s\n", host);
++        return CELL_FONT_ERROR_NO_SUPPORT_FONTSET;
++    }
++    fseek(fp, 0, SEEK_END);
++    long size = ftell(fp);
++    fseek(fp, 0, SEEK_SET);
++    u8* data = size > 0 ? (u8*)malloc((size_t)size) : NULL;
++    if (!data || fread(data, 1, (size_t)size, fp) != (size_t)size) {
++        fclose(fp); free(data);
++        return CELL_FONT_ERROR_READ_FAILED;
++    }
++    fclose(fp);
++    return font_open(lib, data, (u32)size, 0, font, host);
++}
+ 
+-    s_renderers[renderer].in_use = 0;
++s32 cellFontCloseFont(u32 font)
++{
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    vm_write32(font + CELL_FONT_O_OBJ_MAGIC, 0);
++    font_release(f);
+     return CELL_OK;
+ }
+ 
+-s32 cellFontBindRenderer(CellFont* font, CellFontRenderer renderer)
++s32 cellFontSetScalePixel(u32 font, float w, float h)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    if (renderer >= CELL_FONT_MAX_RENDERERS || !s_renderers[renderer].in_use)
+-        return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    if (slot->renderer != 0xFFFFFFFF)
+-        return CELL_FONT_ERROR_RENDERER_ALREADY_BIND;
+-
+-    slot->renderer = renderer;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    f->sx = w; f->sy = h;
++    vm_write_f32(font + CELL_FONT_O_FONT_SCALE_X, w);
++    vm_write_f32(font + CELL_FONT_O_FONT_SCALE_Y, h);
+     return CELL_OK;
+ }
+ 
+-s32 cellFontUnbindRenderer(CellFont* font)
++s32 cellFontSetEffectWeight(u32 font, float weight)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    slot->renderer = 0xFFFFFFFF;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    f->weight = weight;
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetScalePixel(CellFont* font, float w, float h)
++s32 cellFontSetEffectSlant(u32 font, float slant)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    slot->scale_x = w;
+-    slot->scale_y = h;
+-    vm_write_f32(FONT_EA(font) + FONT_O_SCALEX, w);
+-    vm_write_f32(FONT_EA(font) + FONT_O_SCALEY, h);
+-
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    f->slant = slant;
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetEffectWeight(CellFont* font, float weight)
++/* Render scale. Points are 1/72 inch, and the library's default resolution
++ * is 72 dpi, so a point is a pixel. */
++s32 cellFontSetupRenderScalePoint(u32 font, float w, float h)
+ {
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    slot->effect_weight = weight;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    f->rsx = w; f->rsy = h;
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetEffectSlant(CellFont* font, float slant)
++s32 cellFontSetupRenderScalePixel(u32 font, float w, float h)
+ {
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    slot->effect_slant = slant;
+-    return CELL_OK;
++    return cellFontSetupRenderScalePoint(font, w, h);
+ }
+ 
+-s32 cellFontGetHorizontalLayout(CellFont* font, CellFontHorizontalLayout* layout)
++s32 cellFontGetHorizontalLayout(u32 font, u32 layout)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+     if (!layout) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-#if FONT_HAS_STB
+-    if (slot->stb_valid) {
+-        float scale = font_get_stb_scale(slot);
+-        int ascent, descent, lineGap;
+-        stbtt_GetFontVMetrics(&slot->stb_info, &ascent, &descent, &lineGap);
+-        vm_write_f32(FONT_EA(layout) + LAY_O_BASELINEY, (float)ascent * scale);
+-        vm_write_f32(FONT_EA(layout) + LAY_O_LINEHEIGHT,
+-                     (float)(ascent - descent + lineGap) * scale);
+-        vm_write_f32(FONT_EA(layout) + LAY_O_EFFECTHEIGHT,
+-                     (float)(ascent - descent) * scale);
+-        return CELL_OK;
+-    }
+-#endif
+-
+-    /* Fallback: reasonable defaults based on scale */
+-    vm_write_f32(FONT_EA(layout) + LAY_O_BASELINEY,    slot->scale_y * 0.8f);
+-    vm_write_f32(FONT_EA(layout) + LAY_O_LINEHEIGHT,   slot->scale_y * 1.2f);
+-    vm_write_f32(FONT_EA(layout) + LAY_O_EFFECTHEIGHT, slot->scale_y);
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    float a, d, line;
++    be_vmetrics(f, f->sx, f->sy, &a, &d, &line);
++    vm_write_f32(layout + CELL_FONT_O_HL_BASELINE, a);
++    vm_write_f32(layout + CELL_FONT_O_HL_LINEHEIGHT, line);
++    vm_write_f32(layout + CELL_FONT_O_HL_EFFECT, 0.0f);   /* no weight effect */
+     return CELL_OK;
+ }
+ 
+-/* Fills a HOST metrics struct. cellFontGetRenderCharGlyphMetrics is the
+- * marshalling wrapper; cellFontRenderCharGlyphImage wants the host copy
+- * anyway and would otherwise write the guest struct then read it back. */
+-static s32 font_metrics_host(CellFont* font, u32 code,
+-                             CellFontGlyphMetrics* metrics)
++static void metrics_store(u32 ea, const GlyphMetrics* m)
+ {
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    memset(metrics, 0, sizeof(CellFontGlyphMetrics));
++    if (!ea) return;
++    vm_write_f32(ea + CELL_FONT_O_GM_WIDTH,  m->width);
++    vm_write_f32(ea + CELL_FONT_O_GM_HEIGHT, m->height);
++    vm_write_f32(ea + CELL_FONT_O_GM_H_BX,   m->hbx);
++    vm_write_f32(ea + CELL_FONT_O_GM_H_BY,   m->hby);
++    vm_write_f32(ea + CELL_FONT_O_GM_H_ADV,  m->hadv);
++    vm_write_f32(ea + CELL_FONT_O_GM_V_BX,   m->vbx);
++    vm_write_f32(ea + CELL_FONT_O_GM_V_BY,   m->vby);
++    vm_write_f32(ea + CELL_FONT_O_GM_V_ADV,  m->vadv);
++}
+ 
+-#if FONT_HAS_STB
+-    if (slot->stb_valid) {
+-        float scale = font_get_stb_scale(slot);
+-        int glyph = stbtt_FindGlyphIndex(&slot->stb_info, (int)code);
+-        if (glyph == 0) {
+-            /* Glyph not found -- return space-like metrics */
+-            metrics->h_advance = slot->scale_x * 0.5f;
+-            return CELL_OK;
+-        }
++/* A code the font has no glyph for is CELL_FONT_ERROR_NO_SUPPORT_GLYPH with
++ * zeroed metrics; MotorStorm Apocalypse tests for exactly that code (its call at 0x5012CC). */
++static s32 glyph_metrics(u32 font, u32 code, u32 metrics, int render_scale)
++{
++    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    GlyphMetrics m;
++    memset(&m, 0, sizeof m);
++    const u32 gi = be_glyph(f, code);
++    s32 rc = CELL_OK;
++    if (!gi) rc = CELL_FONT_ERROR_NO_SUPPORT_GLYPH;
++    else if (be_metrics(f, render_scale ? f->rsx : f->sx, render_scale ? f->rsy : f->sy,
++                        gi, &m) != 0) {
++        memset(&m, 0, sizeof m);
++        rc = CELL_FONT_ERROR_NO_SUPPORT_GLYPH;
++    }
++    metrics_store(metrics, &m);
++    return rc;
++}
+ 
+-        int advanceWidth, leftSideBearing;
+-        stbtt_GetGlyphHMetrics(&slot->stb_info, glyph, &advanceWidth, &leftSideBearing);
++s32 cellFontGetCharGlyphMetrics(u32 font, u32 code, u32 metrics)
++{
++    return glyph_metrics(font, code, metrics, 0);
++}
+ 
+-        int x0, y0, x1, y1;
+-        stbtt_GetGlyphBitmapBox(&slot->stb_info, glyph, scale, scale, &x0, &y0, &x1, &y1);
++s32 cellFontGetRenderCharGlyphMetrics(u32 font, u32 code, u32 metrics)
++{
++    return glyph_metrics(font, code, metrics, 1);
++}
+ 
+-        metrics->width      = (float)(x1 - x0);
+-        metrics->height     = (float)(y1 - y0);
+-        metrics->h_bearing_x = (float)leftSideBearing * scale;
+-        metrics->h_bearing_y = (float)(-y0);
+-        metrics->h_advance  = (float)advanceWidth * scale;
+-        metrics->v_advance  = metrics->height;
++s32 cellFontGetKerning(u32 font, u32 preCode, u32 code, u32 kerning)
++{
++    if (!kerning) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    float kx = 0.0f;
++    const u32 g1 = preCode ? be_glyph(f, preCode) : 0;
++    const u32 g2 = be_glyph(f, code);
++    if (g1 && g2) kx = be_kerning(f, f->sx, f->sy, g1, g2);
++    vm_write_f32(kerning + CELL_FONT_O_KERN_X, kx);
++    vm_write_f32(kerning + CELL_FONT_O_KERN_Y, 0.0f);
++    return CELL_OK;
++}
+ 
+-        return CELL_OK;
++/* ---------------------------------------------------------------------------
++ * Renderers
++ * -----------------------------------------------------------------------*/
++s32 cellFontCreateRenderer(u32 lib, u32 config, u32 renderer)
++{
++    printf("[cellFont] CreateRenderer(lib=0x%08X, config=0x%08X, renderer=0x%08X)\n",
++           lib, config, renderer);
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    FontLib* L = lib_get(lib);
++    if (!L || !renderer) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    int slot = -1;
++    font_lock();
++    for (int i = 0; i < FONT_MAX_RENDERERS; i++)
++        if (!s_renderers[i].in_use) { slot = i; s_renderers[i].in_use = 1; break; }
++    font_unlock();
++    if (slot < 0) return CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED;
++    FontRenderer* r = &s_renderers[slot];
++    r->ea = renderer; r->lib = (int)(L - s_libs);
++    r->buf = 0; r->cap = 0; r->buf_owned = 0;
++    /* BufferingPolicy: a title-supplied buffer is used as is; otherwise the
++     * glyph buffer comes from the library's allocator on first use. */
++    if (config) {
++        const u32 b = vm_read32(config + CELL_FONT_O_RCFG_BUFFER);
++        const u32 sz = vm_read32(config + CELL_FONT_O_RCFG_INIT_SIZE);
++        if (b && sz) { r->buf = b; r->cap = sz; }
+     }
+-#endif
++    vm_memset(renderer, 0, CELL_FONT_OPAQUE_SIZE);
++    vm_write32(renderer + CELL_FONT_O_OBJ_MAGIC, MAGIC_RENDERER);
++    vm_write32(renderer + CELL_FONT_O_OBJ_SLOT, (u32)slot);
++    return CELL_OK;
++}
+ 
+-    /* Fallback: monospace-like metrics */
+-    metrics->width       = slot->scale_x * 0.6f;
+-    metrics->height      = slot->scale_y * 0.8f;
+-    metrics->h_bearing_x = 0.0f;
+-    metrics->h_bearing_y = slot->scale_y * 0.7f;
+-    metrics->h_advance   = slot->scale_x * 0.6f;
+-    metrics->v_advance   = slot->scale_y;
++s32 cellFontDestroyRenderer(u32 renderer)
++{
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    FontRenderer* r = renderer_get(renderer);
++    if (!r) return CELL_FONT_ERROR_RENDERER_INVALID;
++    const int ri = (int)(r - s_renderers);
++    for (int i = 0; i < FONT_MAX_FONTS; i++)
++        if (s_fonts[i].in_use && s_fonts[i].renderer == ri) s_fonts[i].renderer = -1;
++    if (r->buf_owned) lib_free(&s_libs[r->lib], r->buf);
++    vm_write32(renderer + CELL_FONT_O_OBJ_MAGIC, 0);
++    r->in_use = 0;
++    return CELL_OK;
++}
+ 
++s32 cellFontBindRenderer(u32 font, u32 renderer)
++{
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    FontRenderer* r = renderer_get(renderer);
++    if (!r) return CELL_FONT_ERROR_RENDERER_INVALID;
++    if (f->renderer >= 0) return CELL_FONT_ERROR_RENDERER_ALREADY_BIND;
++    f->renderer = (int)(r - s_renderers);
+     return CELL_OK;
+ }
+ 
+-s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
+-                                       CellFontGlyphMetrics* metrics)
++s32 cellFontUnbindRenderer(u32 font)
+ {
+-    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    CellFontGlyphMetrics h;
+-    s32 rc = font_metrics_host(font, code, &h);
+-    if (rc == (s32)CELL_OK) font_metrics_store(metrics, &h);
+-    return rc;
++    FontSlot* f = font_get(font);
++    if (!f) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    if (f->renderer < 0) return CELL_FONT_ERROR_RENDERER_UNBIND;
++    f->renderer = -1;
++    return CELL_OK;
+ }
+ 
+-s32 cellFontGetRenderCharGlyphMetricsVertical(CellFont* font, u32 code,
+-                                               CellFontGlyphMetrics* metrics)
++/* ---------------------------------------------------------------------------
++ * Render surfaces and glyph images
++ * -----------------------------------------------------------------------*/
++void cellFontRenderSurfaceInit(u32 surface, u32 buffer, s32 bufferWidthByte,
++                               s32 pixelSizeByte, s32 w, s32 h)
+ {
+-    /* Vertical metrics: use horizontal metrics as base, swap axes */
+-    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    CellFontGlyphMetrics h;
+-    s32 rc = font_metrics_host(font, code, &h);
+-    if (rc != (s32)CELL_OK) return rc;
++    if (!surface) return;
++    vm_write32(surface + CELL_FONT_O_SURF_BUFFER, buffer);
++    vm_write32(surface + CELL_FONT_O_SURF_WIDTHBYTE, (u32)bufferWidthByte);
++    vm_write32(surface + CELL_FONT_O_SURF_PIXELSIZE, (u32)pixelSizeByte);
++    vm_write32(surface + CELL_FONT_O_SURF_WIDTH, (u32)w);
++    vm_write32(surface + CELL_FONT_O_SURF_HEIGHT, (u32)h);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_X0, 0);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_Y0, 0);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_X1, (u32)(w > 0 ? w : 0));
++    vm_write32(surface + CELL_FONT_O_SURF_SC_Y1, (u32)(h > 0 ? h : 0));
++}
+ 
+-    /* Swap horizontal/vertical bearings for vertical layout */
+-    float tmp;
+-    tmp = h.h_bearing_x; h.h_bearing_x = h.v_bearing_x; h.v_bearing_x = tmp;
+-    tmp = h.h_bearing_y; h.h_bearing_y = h.v_bearing_y; h.v_bearing_y = tmp;
+-    tmp = h.h_advance;   h.h_advance   = h.v_advance;   h.v_advance   = tmp;
++/* The scissor is stored as a rectangle [x0,x1) x [y0,y1), clipped to the
++ * surface. */
++void cellFontRenderSurfaceSetScissor(u32 surface, s32 x0, s32 y0, s32 w, s32 h)
++{
++    if (!surface) return;
++    const s32 sw = (s32)vm_read32(surface + CELL_FONT_O_SURF_WIDTH);
++    const s32 sh = (s32)vm_read32(surface + CELL_FONT_O_SURF_HEIGHT);
++    s32 x1 = x0 + w, y1 = y0 + h;
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > sw) x1 = sw;
++    if (y1 > sh) y1 = sh;
++    if (x1 < x0) x1 = x0;
++    if (y1 < y0) y1 = y0;
++    vm_write32(surface + CELL_FONT_O_SURF_SC_X0, (u32)x0);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_Y0, (u32)y0);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_X1, (u32)x1);
++    vm_write32(surface + CELL_FONT_O_SURF_SC_Y1, (u32)y1);
++}
+ 
+-    font_metrics_store(metrics, &h);
+-    return CELL_OK;
++static void trans_store(u32 ti, u32 image, u32 iwb, u32 iw, u32 ih, u32 surf, u32 swb)
++{
++    if (!ti) return;
++    vm_write32(ti + CELL_FONT_O_TI_IMAGE, image);
++    vm_write32(ti + CELL_FONT_O_TI_IMAGE_WBYTE, iwb);
++    vm_write32(ti + CELL_FONT_O_TI_IMAGE_WIDTH, iw);
++    vm_write32(ti + CELL_FONT_O_TI_IMAGE_HEIGHT, ih);
++    vm_write32(ti + CELL_FONT_O_TI_SURFACE, surf);
++    vm_write32(ti + CELL_FONT_O_TI_SURF_WBYTE, swb);
+ }
+ 
+-s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
+-                                  CellFontRenderSurface* surface,
+-                                  float x, float y,
+-                                  CellFontGlyphMetrics* metrics,
+-                                  CellFontGlyphImage* image)
+-{
+-    if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-
+-    FontSlot* slot = font_get_slot(font);
+-    if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-
+-    /* Work from a host copy; hand the title its own if it asked. */
+-    CellFontGlyphMetrics hm;
+-    font_metrics_host(font, code, &hm);
+-    if (metrics) font_metrics_store(metrics, &hm);
+-
+-    CellFontRenderSurface hs;
+-    font_surface_load(&hs, surface);
+-
+-#if FONT_HAS_STB
+-    if (slot->stb_valid && hs.buffer) {
+-        float scale = font_get_stb_scale(slot);
+-        int glyph = stbtt_FindGlyphIndex(&slot->stb_info, (int)code);
+-        if (glyph == 0) goto done;
+-
+-        int bw, bh, bx, by;
+-        u8* bitmap = stbtt_GetGlyphBitmap(&slot->stb_info, scale, scale,
+-                                           glyph, &bw, &bh, &bx, &by);
+-        if (!bitmap) goto done;
+-
+-        /* Blit glyph bitmap to surface */
+-        int dx = (int)(x + hm.h_bearing_x);
+-        int dy = (int)(y - hm.h_bearing_y);
+-
+-        for (int row = 0; row < bh; row++) {
+-            int sy = dy + row;
+-            if (sy < 0 || sy >= hs.height) continue;
+-            for (int col = 0; col < bw; col++) {
+-                int sx = dx + col;
+-                if (sx < 0 || sx >= hs.width) continue;
+-                u8 alpha = bitmap[row * bw + col];
+-                if (alpha > 0) {
+-                    int offset = sy * hs.widthByte + sx * hs.pixelSizeByte;
+-                    /* Alpha-blend (simple overwrite for alpha-only surface) */
+-                    hs.buffer[offset] = alpha;
+-                }
+-            }
+-        }
++/* Draws the glyph for `code` with its origin (pen position on the baseline)
++ * at (x, y) of the surface, clipped to the surface's scissor, as 8-bit
++ * coverage. The whole clipped glyph box is written, zeros included.
++ *
++ * With a surface buffer the glyph lands in it and transInfo points at the
++ * box inside it. With a NULL buffer the surface is only the coordinate frame:
++ * the box is drawn into the bound renderer's buffer and transInfo points
++ * there, imageWidthByte being the box's row length. MotorStorm draws every
++ * glyph this way and copies imageHeight rows of imageWidth bytes out. */
++s32 cellFontRenderCharGlyphImage(u32 font, u32 code, u32 surface, float x, float y,
++                                 u32 metrics, u32 transInfo)
++{
++    if (!s_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
++    FontSlot* f = font_get(font);
++    if (!f || !surface) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    const u32 sbuf = vm_read32(surface + CELL_FONT_O_SURF_BUFFER);
++    const s32 swb  = (s32)vm_read32(surface + CELL_FONT_O_SURF_WIDTHBYTE);
++    s32 ps         = (s32)vm_read32(surface + CELL_FONT_O_SURF_PIXELSIZE);
++    const s32 sw   = (s32)vm_read32(surface + CELL_FONT_O_SURF_WIDTH);
++    const s32 sh   = (s32)vm_read32(surface + CELL_FONT_O_SURF_HEIGHT);
++    s32 cx0 = (s32)vm_read32(surface + CELL_FONT_O_SURF_SC_X0);
++    s32 cy0 = (s32)vm_read32(surface + CELL_FONT_O_SURF_SC_Y0);
++    s32 cx1 = (s32)vm_read32(surface + CELL_FONT_O_SURF_SC_X1);
++    s32 cy1 = (s32)vm_read32(surface + CELL_FONT_O_SURF_SC_Y1);
++    if (ps <= 0) ps = 1;
++    if (cx0 < 0) cx0 = 0;
++    if (cy0 < 0) cy0 = 0;
++    if (cx1 > sw) cx1 = sw;
++    if (cy1 > sh) cy1 = sh;
++
++    trans_store(transInfo, 0, 0, 0, 0, sbuf, (u32)swb);
++    GlyphMetrics m;
++    memset(&m, 0, sizeof m);
++    const u32 gi = be_glyph(f, code);
++    if (!gi || be_metrics(f, f->rsx, f->rsy, gi, &m) != 0) {
++        memset(&m, 0, sizeof m);
++        metrics_store(metrics, &m);
++        return CELL_FONT_ERROR_NO_SUPPORT_GLYPH;
++    }
++    metrics_store(metrics, &m);
+ 
+-        stbtt_FreeBitmap(bitmap, NULL);
++    int bw = 0, bh = 0, pitch = 0, left = 0, top = 0;
++    const u8* bmp = be_render(f, f->rsx, f->rsy, gi, &bw, &bh, &pitch, &left, &top);
++    if (!bmp) return CELL_FONT_ERROR_NO_SUPPORT_GLYPH;
+ 
+-        /* Fill image output if requested */
+-        if (image)
+-            font_image_store(image, bw, 1, bw, bh);
++    /* Glyph box in surface coordinates, then clipped. */
++    const s32 gx0 = (s32)floorf(x) + left, gy0 = (s32)floorf(y) - top;
++    s32 x0 = gx0 > cx0 ? gx0 : cx0, y0 = gy0 > cy0 ? gy0 : cy0;
++    s32 x1 = gx0 + bw < cx1 ? gx0 + bw : cx1, y1 = gy0 + bh < cy1 ? gy0 + bh : cy1;
++    const s32 cw = x1 > x0 ? x1 - x0 : 0, ch = y1 > y0 ? y1 - y0 : 0;
+ 
+-        return CELL_OK;
++    u8 row[4096];
++    if (cw * ps > (s32)sizeof row) return CELL_FONT_ERROR_BUFFER_SIZE_NOT_ENOUGH;
++
++    u32 dst, dst_wb;
++    if (sbuf) {
++        dst = sbuf + (u32)(y0 * swb + x0 * ps);
++        dst_wb = (u32)swb;
++    } else {
++        if (f->renderer < 0) return CELL_FONT_ERROR_RENDERER_UNBIND;
++        FontRenderer* r = &s_renderers[f->renderer];
++        const u32 need = (u32)(cw * ps * ch);
++        if (need > r->cap) {
++            if (r->buf && !r->buf_owned) return CELL_FONT_ERROR_ENOUGH_RENDERING_BUFFER;
++            const FontLib* L = &s_libs[r->lib];
++            u32 cap = r->cap ? r->cap : 0x1000;
++            while (cap < need) cap *= 2;
++            const u32 nb = lib_malloc(L, cap);
++            if (!nb) return CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED;
++            if (r->buf_owned) lib_free(L, r->buf);
++            r->buf = nb; r->cap = cap; r->buf_owned = 1;
++        }
++        dst = r->buf;
++        dst_wb = (u32)(cw * ps);
+     }
+-#endif
+ 
+-done:
+-    /* Fallback: empty glyph */
+-    if (image) {
+-        font_image_store(image, (s32)hm.width, 1,
+-                         (s32)hm.width, (s32)hm.height);
++    for (s32 yy = 0; yy < ch; yy++) {
++        const u8* src = bmp + (size_t)(y0 - gy0 + yy) * (size_t)pitch + (size_t)(x0 - gx0);
++        if (ps == 1) memcpy(row, src, (size_t)cw);
++        else for (s32 xx = 0; xx < cw; xx++) memset(row + xx * ps, src[xx], (size_t)ps);
++        vm_memcpy_to(dst + (u32)yy * dst_wb, row, (size_t)(cw * ps));
+     }
++    trans_store(transInfo, dst, dst_wb, (u32)cw, (u32)ch, sbuf, (u32)swb);
+ 
++    if (font_verbose()) {
++        static int n;
++        if (n++ < 200)
++            printf("[cellFont] glyph U+%04X scale %.1f at (%.1f,%.1f): box %dx%d at (%d,%d) "
++                   "adv %.2f -> 0x%08X\n", code, f->rsy, x, y, cw, ch, x0, y0, m.hadv, dst);
++    }
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetupRenderScalePixel(CellFont* font, float w, float h)
++/* ---------------------------------------------------------------------------
++ * ctx handlers: the float arguments are in f1/f2. In the PPC64 ELF ABI a
++ * float argument also takes its GPR slot, so after (font, code, surface,
++ * x, y) the next integer argument is r8, not r6.
++ * -----------------------------------------------------------------------*/
++static void h_SetScalePixel(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontSetScalePixel((u32)c->gpr[3], (float)c->fpr[1],
++                                                (float)c->fpr[2]);
++}
++static void h_SetupRenderScalePoint(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontSetupRenderScalePoint((u32)c->gpr[3], (float)c->fpr[1],
++                                                        (float)c->fpr[2]);
++}
++static void h_SetupRenderScalePixel(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontSetupRenderScalePixel((u32)c->gpr[3], (float)c->fpr[1],
++                                                        (float)c->fpr[2]);
++}
++static void h_SetEffectWeight(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontSetEffectWeight((u32)c->gpr[3], (float)c->fpr[1]);
++}
++static void h_SetEffectSlant(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontSetEffectSlant((u32)c->gpr[3], (float)c->fpr[1]);
++}
++static void h_RenderCharGlyphImage(ppu_context* c)
++{
++    c->gpr[3] = (u64)(s64)cellFontRenderCharGlyphImage(
++        (u32)c->gpr[3], (u32)c->gpr[4], (u32)c->gpr[5],
++        (float)c->fpr[1], (float)c->fpr[2], (u32)c->gpr[8], (u32)c->gpr[9]);
++}
++static void h_RenderSurfaceInit(ppu_context* c)
++{
++    cellFontRenderSurfaceInit((u32)c->gpr[3], (u32)c->gpr[4], (s32)c->gpr[5],
++                              (s32)c->gpr[6], (s32)c->gpr[7], (s32)c->gpr[8]);
++}
++static void h_RenderSurfaceSetScissor(ppu_context* c)
++{
++    cellFontRenderSurfaceSetScissor((u32)c->gpr[3], (s32)c->gpr[4], (s32)c->gpr[5],
++                                    (s32)c->gpr[6], (s32)c->gpr[7]);
++}
++
++void ps3_font_register_ctx(void)
+ {
+-    return cellFontSetScalePixel(font, w, h);
++    static const struct { const char* name; void (*fn)(ppu_context*); } tab[] = {
++        { "cellFontSetScalePixel",          h_SetScalePixel },
++        { "cellFontSetupRenderScalePoint",  h_SetupRenderScalePoint },
++        { "cellFontSetupRenderScalePixel",  h_SetupRenderScalePixel },
++        { "cellFontSetEffectWeight",        h_SetEffectWeight },
++        { "cellFontSetEffectSlant",         h_SetEffectSlant },
++        { "cellFontRenderCharGlyphImage",   h_RenderCharGlyphImage },
++        /* void: keep r3 as the title left it rather than host garbage. */
++        { "cellFontRenderSurfaceInit",      h_RenderSurfaceInit },
++        { "cellFontRenderSurfaceSetScissor", h_RenderSurfaceSetScissor },
++    };
++    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
++        ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
+ }
+diff --git a/libs/font/cellFont.h b/libs/font/cellFont.h
+index 6a107a2f..4c720fc9 100644
+--- a/libs/font/cellFont.h
++++ b/libs/font/cellFont.h
+@@ -1,8 +1,18 @@
+ /*
+- * ps3recomp - cellFont HLE
++ * ps3recomp - cellFont / cellFontFT HLE
+  *
+- * Font system: TTF loading, glyph rendering, metrics.
+- * Uses stb_truetype.h if available (place in include/).
++ * The firmware font library (libfont + libfontFT) as the title sees it: every
++ * pointer argument is a 32-bit GUEST address and every struct lives in guest
++ * memory, big-endian, in the SDK layout. The entry points below take those
++ * addresses as u32; nothing here is a host struct. The layouts are spelled out
++ * as byte offsets (CELL_FONT_O_*) so no host compiler padding can move them.
++ *
++ * Glyphs are rasterized with FreeType when the build found it
++ * (PS3RECOMP_HAS_FREETYPE), else with stb_truetype.
++ *
++ * Layouts and error codes follow the SDK headers as RPCS3 reproduces them
++ * (rpcs3/Emu/Cell/Modules/cellFont.h, GPL; used as a behavioural reference
++ * only, no code taken).
+  */
+ 
+ #ifndef PS3RECOMP_CELL_FONT_H
+@@ -16,148 +26,203 @@ extern "C" {
+ #endif
+ 
+ /* ---------------------------------------------------------------------------
+- * Error codes
+- * -----------------------------------------------------------------------*/
+-
+-#define CELL_FONT_ERROR_FATAL               (CELL_ERROR_BASE_FONT | 0x01)
+-#define CELL_FONT_ERROR_INVALID_PARAMETER   (CELL_ERROR_BASE_FONT | 0x02)
+-#define CELL_FONT_ERROR_UNINITIALIZED       (CELL_ERROR_BASE_FONT | 0x03)
+-#define CELL_FONT_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_FONT | 0x04)
+-#define CELL_FONT_ERROR_ALLOCATION_FAILED   (CELL_ERROR_BASE_FONT | 0x05)
+-#define CELL_FONT_ERROR_NO_SUPPORT_FUNCTION (CELL_ERROR_BASE_FONT | 0x06)
+-#define CELL_FONT_ERROR_OPEN_FAILED         (CELL_ERROR_BASE_FONT | 0x07)
+-#define CELL_FONT_ERROR_NOT_FOUND           (CELL_ERROR_BASE_FONT | 0x08)
+-#define CELL_FONT_ERROR_FILE_DECOMPRESSION  (CELL_ERROR_BASE_FONT | 0x09)
+-#define CELL_FONT_ERROR_NO_SUPPORT_FONTSET  (CELL_ERROR_BASE_FONT | 0x0A)
+-#define CELL_FONT_ERROR_RENDERER            (CELL_ERROR_BASE_FONT | 0x10)
+-#define CELL_FONT_ERROR_RENDERER_ALREADY_BIND (CELL_ERROR_BASE_FONT | 0x11)
+-#define CELL_FONT_ERROR_RENDERER_UNBIND     (CELL_ERROR_BASE_FONT | 0x12)
+-
+-/* ---------------------------------------------------------------------------
+- * Constants
++ * Error codes (CELL_ERROR_BASE_FONT = 0x80540000)
+  * -----------------------------------------------------------------------*/
+-
+-#define CELL_FONT_MAX_OPENED        8
+-#define CELL_FONT_MAX_RENDERERS     4
+-
+-/* Font type constants */
+-#define CELL_FONT_TYPE_RODIN_SANS_SERIF_LATIN      0x00000000
+-#define CELL_FONT_TYPE_RODIN_SANS_SERIF_LIGHT_LATIN 0x00000001
+-#define CELL_FONT_TYPE_RODIN_SANS_SERIF_BOLD_LATIN  0x00000002
+-#define CELL_FONT_TYPE_RODIN_SANS_SERIF_LATIN2     0x00000018
+-#define CELL_FONT_TYPE_SEURAT_MARU_GOTHIC_LATIN    0x00000100
+-#define CELL_FONT_TYPE_SEURAT_MARU_GOTHIC_LATIN2   0x00000118
+-
+-/* Open mode flags */
+-#define CELL_FONT_OPEN_MODE_DEFAULT         0
++#define CELL_FONT_OK                              0
++#define CELL_FONT_ERROR_FATAL                     (CELL_ERROR_BASE_FONT | 0x01)
++#define CELL_FONT_ERROR_INVALID_PARAMETER         (CELL_ERROR_BASE_FONT | 0x02)
++#define CELL_FONT_ERROR_UNINITIALIZED             (CELL_ERROR_BASE_FONT | 0x03)
++#define CELL_FONT_ERROR_INITIALIZE_FAILED         (CELL_ERROR_BASE_FONT | 0x04)
++#define CELL_FONT_ERROR_INVALID_CACHE_BUFFER      (CELL_ERROR_BASE_FONT | 0x05)
++#define CELL_FONT_ERROR_ALREADY_INITIALIZED       (CELL_ERROR_BASE_FONT | 0x06)
++#define CELL_FONT_ERROR_ALLOCATION_FAILED         (CELL_ERROR_BASE_FONT | 0x07)
++#define CELL_FONT_ERROR_NO_SUPPORT_FONTSET        (CELL_ERROR_BASE_FONT | 0x08)
++#define CELL_FONT_ERROR_OPEN_FAILED               (CELL_ERROR_BASE_FONT | 0x09)
++#define CELL_FONT_ERROR_READ_FAILED               (CELL_ERROR_BASE_FONT | 0x0A)
++#define CELL_FONT_ERROR_FONT_OPEN_FAILED          (CELL_ERROR_BASE_FONT | 0x0B)
++#define CELL_FONT_ERROR_FONT_NOT_FOUND            (CELL_ERROR_BASE_FONT | 0x0C)
++#define CELL_FONT_ERROR_FONT_OPEN_MAX             (CELL_ERROR_BASE_FONT | 0x0D)
++#define CELL_FONT_ERROR_FONT_CLOSE_FAILED         (CELL_ERROR_BASE_FONT | 0x0E)
++#define CELL_FONT_ERROR_ALREADY_OPENED            (CELL_ERROR_BASE_FONT | 0x0F)
++#define CELL_FONT_ERROR_NO_SUPPORT_FUNCTION       (CELL_ERROR_BASE_FONT | 0x10)
++#define CELL_FONT_ERROR_NO_SUPPORT_CODE           (CELL_ERROR_BASE_FONT | 0x11)
++#define CELL_FONT_ERROR_NO_SUPPORT_GLYPH          (CELL_ERROR_BASE_FONT | 0x12)
++#define CELL_FONT_ERROR_BUFFER_SIZE_NOT_ENOUGH    (CELL_ERROR_BASE_FONT | 0x16)
++#define CELL_FONT_ERROR_RENDERER_ALREADY_BIND     (CELL_ERROR_BASE_FONT | 0x20)
++#define CELL_FONT_ERROR_RENDERER_UNBIND           (CELL_ERROR_BASE_FONT | 0x21)
++#define CELL_FONT_ERROR_RENDERER_INVALID          (CELL_ERROR_BASE_FONT | 0x22)
++#define CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED (CELL_ERROR_BASE_FONT | 0x23)
++#define CELL_FONT_ERROR_ENOUGH_RENDERING_BUFFER   (CELL_ERROR_BASE_FONT | 0x24)
++#define CELL_FONT_ERROR_NO_SUPPORT_SURFACE        (CELL_ERROR_BASE_FONT | 0x40)
+ 
+ /* ---------------------------------------------------------------------------
+- * Structures
++ * Guest struct layouts (byte offsets, big-endian fields)
+  * -----------------------------------------------------------------------*/
+ 
+-/* Opaque library handle */
+-typedef u32 CellFontLibrary;
+-
+-/* Font handle */
+-typedef struct CellFont {
+-    u32 handle;         /* internal index */
+-    u32 type;           /* font type constant */
+-    float scale_x;
+-    float scale_y;
+-} CellFont;
+-
+-/* Font type descriptor */
+-typedef struct CellFontType {
+-    u32 type;
+-    u32 map;
+-} CellFontType;
+-
+-/* Glyph metrics */
+-typedef struct CellFontGlyphMetrics {
+-    float width;
+-    float height;
+-    float h_bearing_x;
+-    float h_bearing_y;
+-    float h_advance;
+-    float v_bearing_x;
+-    float v_bearing_y;
+-    float v_advance;
+-} CellFontGlyphMetrics;
+-
+-/* Horizontal layout info */
+-typedef struct CellFontHorizontalLayout {
+-    float baseLineY;
+-    float lineHeight;
+-    float effectHeight;
+-} CellFontHorizontalLayout;
+-
+-/* Render surface (destination for glyph rendering) */
+-typedef struct CellFontRenderSurface {
+-    u8*  buffer;        /* pixel buffer */
+-    s32  widthByte;     /* bytes per row */
+-    s32  pixelSizeByte; /* bytes per pixel (1 for alpha-only) */
+-    s32  width;         /* surface width in pixels */
+-    s32  height;        /* surface height in pixels */
+-} CellFontRenderSurface;
+-
+-/* Image glyph output */
+-typedef struct CellFontGlyphImage {
+-    u8*  buffer;
+-    s32  widthByte;
+-    s32  pixelSizeByte;
+-    s32  width;
+-    s32  height;
+-} CellFontGlyphImage;
+-
+-/* Renderer handle */
+-typedef u32 CellFontRenderer;
+-
+-/* Init configuration */
+-typedef struct CellFontConfig {
+-    u32  fc_size;       /* buffer size for font cache */
+-    void* FileCache;
+-    u32  userFontEntryMax;
+-} CellFontConfig;
++/* CellFontMemoryInterface: { void* Object; Malloc; Free; Realloc; Calloc }
++ * Each callback is a guest OPD:
++ *   void* Malloc (void* obj, u32 size)
++ *   void  Free   (void* obj, void* p)
++ *   void* Realloc(void* obj, void* p, u32 size)
++ *   void* Calloc (void* obj, u32 num, u32 size) */
++enum {
++    CELL_FONT_O_MIF_OBJECT  = 0x00,
++    CELL_FONT_O_MIF_MALLOC  = 0x04,
++    CELL_FONT_O_MIF_FREE    = 0x08,
++    CELL_FONT_O_MIF_REALLOC = 0x0C,
++    CELL_FONT_O_MIF_CALLOC  = 0x10,
++    CELL_FONT_MIF_SIZE      = 0x14,
++};
++
++/* CellFontConfig: { struct { u32* buffer; u32 size; } FileCache;
++ *                   u32 userFontEntryMax; CellFontEntry* userFontEntrys;
++ *                   u32 flags; } */
++enum {
++    CELL_FONT_O_CFG_CACHE_BUFFER = 0x00,
++    CELL_FONT_O_CFG_CACHE_SIZE   = 0x04,
++    CELL_FONT_O_CFG_ENTRY_MAX    = 0x08,
++    CELL_FONT_O_CFG_ENTRYS       = 0x0C,
++    CELL_FONT_O_CFG_FLAGS        = 0x10,
++    CELL_FONT_CONFIG_SIZE        = 0x14,
++};
++
++/* CellFontLibraryConfigFT: { void* library; CellFontMemoryInterface MemoryIF; } */
++enum {
++    CELL_FONT_O_FTCFG_LIBRARY = 0x00,
++    CELL_FONT_O_FTCFG_MIF     = 0x04,
++    CELL_FONT_FTCONFIG_SIZE   = 0x18,
++};
++
++/* CellFontLibrary (allocated by the library through MemoryIF.Malloc):
++ * { u32 libraryType; u32 libraryVersion; u32 SystemClosed[]; } */
++enum {
++    CELL_FONT_O_LIB_TYPE    = 0x00,
++    CELL_FONT_O_LIB_VERSION = 0x04,
++    CELL_FONT_O_LIB_MAGIC   = 0x08,   /* SystemClosed[0]: ours */
++    CELL_FONT_O_LIB_SLOT    = 0x0C,   /* SystemClosed[1]: ours */
++    CELL_FONT_LIBRARY_SIZE  = 0x20,
++};
++
++/* CellFontRendererConfig: { struct { void* buffer; u32 initSize, maxSize,
++ *                           expandSize, resetSize; } BufferingPolicy; } */
++enum {
++    CELL_FONT_O_RCFG_BUFFER      = 0x00,
++    CELL_FONT_O_RCFG_INIT_SIZE   = 0x04,
++    CELL_FONT_O_RCFG_MAX_SIZE    = 0x08,
++    CELL_FONT_O_RCFG_EXPAND_SIZE = 0x0C,
++    CELL_FONT_O_RCFG_RESET_SIZE  = 0x10,
++};
++
++/* CellFontRenderer: { void* systemReserved[64]; } (256 bytes, title-owned).
++ * CellFont:         { void* SystemReserved[64]; } (256 bytes, title-owned).
++ * Both are opaque to the title; the words we keep in them are ours. */
++enum {
++    CELL_FONT_O_OBJ_MAGIC  = 0x00,
++    CELL_FONT_O_OBJ_SLOT   = 0x04,
++    CELL_FONT_O_FONT_SCALE_X = 0x08,   /* informational copies */
++    CELL_FONT_O_FONT_SCALE_Y = 0x0C,
++    CELL_FONT_OPAQUE_SIZE  = 0x100,
++};
++
++/* CellFontRenderSurface: { void* buffer; s32 widthByte; s32 pixelSizeByte;
++ *                          s32 width, height;
++ *                          struct { u32 x0, y0, x1, y1; } Scissor; } */
++enum {
++    CELL_FONT_O_SURF_BUFFER    = 0x00,
++    CELL_FONT_O_SURF_WIDTHBYTE = 0x04,
++    CELL_FONT_O_SURF_PIXELSIZE = 0x08,
++    CELL_FONT_O_SURF_WIDTH     = 0x0C,
++    CELL_FONT_O_SURF_HEIGHT    = 0x10,
++    CELL_FONT_O_SURF_SC_X0     = 0x14,
++    CELL_FONT_O_SURF_SC_Y0     = 0x18,
++    CELL_FONT_O_SURF_SC_X1     = 0x1C,
++    CELL_FONT_O_SURF_SC_Y1     = 0x20,
++    CELL_FONT_SURFACE_SIZE     = 0x24,
++};
++
++/* CellFontGlyphMetrics: { f32 width, height;
++ *   struct { f32 bearingX, bearingY, advance; } Horizontal, Vertical; } */
++enum {
++    CELL_FONT_O_GM_WIDTH    = 0x00,
++    CELL_FONT_O_GM_HEIGHT   = 0x04,
++    CELL_FONT_O_GM_H_BX     = 0x08,
++    CELL_FONT_O_GM_H_BY     = 0x0C,
++    CELL_FONT_O_GM_H_ADV    = 0x10,
++    CELL_FONT_O_GM_V_BX     = 0x14,
++    CELL_FONT_O_GM_V_BY     = 0x18,
++    CELL_FONT_O_GM_V_ADV    = 0x1C,
++    CELL_FONT_GLYPH_METRICS_SIZE = 0x20,
++};
++
++/* CellFontImageTransInfo: { u8* Image; u32 imageWidthByte; u32 imageWidth;
++ *                           u32 imageHeight; void* Surface; u32 surfWidthByte; } */
++enum {
++    CELL_FONT_O_TI_IMAGE        = 0x00,
++    CELL_FONT_O_TI_IMAGE_WBYTE  = 0x04,
++    CELL_FONT_O_TI_IMAGE_WIDTH  = 0x08,
++    CELL_FONT_O_TI_IMAGE_HEIGHT = 0x0C,
++    CELL_FONT_O_TI_SURFACE      = 0x10,
++    CELL_FONT_O_TI_SURF_WBYTE   = 0x14,
++    CELL_FONT_TRANS_INFO_SIZE   = 0x18,
++};
++
++/* CellFontHorizontalLayout: { f32 baseLineY; f32 lineHeight; f32 effectHeight; } */
++enum {
++    CELL_FONT_O_HL_BASELINE   = 0x00,
++    CELL_FONT_O_HL_LINEHEIGHT = 0x04,
++    CELL_FONT_O_HL_EFFECT     = 0x08,
++};
++
++/* CellFontKerning: { f32 offsetX; f32 offsetY; } */
++enum {
++    CELL_FONT_O_KERN_X = 0x00,
++    CELL_FONT_O_KERN_Y = 0x04,
++};
+ 
+ /* ---------------------------------------------------------------------------
+- * Functions
++ * Entry points (every pointer is a guest EA)
++ *
++ * The functions with float arguments (SetScalePixel, SetupRenderScalePoint,
++ * RenderCharGlyphImage) take them in f1/f2 on the PPU, which the generic
++ * 8-GPR HLE adapter does not pass; ps3_font_register_ctx() registers ctx
++ * handlers for them that read the FPRs and call these.
+  * -----------------------------------------------------------------------*/
+-
+-s32 cellFontInit(const CellFontConfig* config);
+-s32 cellFontInitializeWithRevision(u64 revisionFlags, const CellFontConfig* config);
++s32 cellFontInitializeWithRevision(u64 revisionFlags, u32 config);
++s32 cellFontInit(u32 config);
+ s32 cellFontEnd(void);
+-
+-s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 uniqueId);
+-s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 subNum, s32 uniqueId);
+-s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* font);
+-s32 cellFontCloseFont(CellFont* font);
+-
+-s32 cellFontSetFontOpenMode(u32 openMode);
+-
+-s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer);
+-s32 cellFontDestroyRenderer(CellFontRenderer renderer);
+-s32 cellFontBindRenderer(CellFont* font, CellFontRenderer renderer);
+-s32 cellFontUnbindRenderer(CellFont* font);
+-
+-s32 cellFontSetScalePixel(CellFont* font, float w, float h);
+-s32 cellFontSetEffectWeight(CellFont* font, float weight);
+-s32 cellFontSetEffectSlant(CellFont* font, float slant);
+-
+-s32 cellFontGetHorizontalLayout(CellFont* font, CellFontHorizontalLayout* layout);
+-
+-s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
+-                                  CellFontRenderSurface* surface,
+-                                  float x, float y,
+-                                  CellFontGlyphMetrics* metrics,
+-                                  CellFontGlyphImage* image);
+-
+-s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
+-                                       CellFontGlyphMetrics* metrics);
+-
+-s32 cellFontGetRenderCharGlyphMetricsVertical(CellFont* font, u32 code,
+-                                               CellFontGlyphMetrics* metrics);
+-
+-s32 cellFontSetupRenderScalePixel(CellFont* font, float w, float h);
++s32 cellFontInitLibraryFreeTypeWithRevision(u64 revisionFlags, u32 config, u32 libOut);
++s32 cellFontEndLibrary(u32 lib);
++
++s32 cellFontOpenFontFile(u32 lib, u32 fontPath, u32 subNum, s32 uniqueId, u32 font);
++s32 cellFontOpenFontMemory(u32 lib, u32 fontAddr, u32 fontSize, u32 subNum,
++                           s32 uniqueId, u32 font);
++/* CellFontType: { u32 type; u32 map; } -- a firmware font from /dev_flash/data/font. */
++s32 cellFontOpenFontset(u32 lib, u32 fontType, u32 font);
++s32 cellFontCloseFont(u32 font);
++
++s32 cellFontCreateRenderer(u32 lib, u32 config, u32 renderer);
++s32 cellFontDestroyRenderer(u32 renderer);
++s32 cellFontBindRenderer(u32 font, u32 renderer);
++s32 cellFontUnbindRenderer(u32 font);
++
++s32 cellFontSetScalePixel(u32 font, float w, float h);
++s32 cellFontSetupRenderScalePoint(u32 font, float w, float h);
++s32 cellFontSetupRenderScalePixel(u32 font, float w, float h);
++s32 cellFontSetEffectWeight(u32 font, float weight);
++s32 cellFontSetEffectSlant(u32 font, float slant);
++s32 cellFontGetHorizontalLayout(u32 font, u32 layout);
++s32 cellFontGetCharGlyphMetrics(u32 font, u32 code, u32 metrics);
++s32 cellFontGetRenderCharGlyphMetrics(u32 font, u32 code, u32 metrics);
++s32 cellFontGetKerning(u32 font, u32 preCode, u32 code, u32 kerning);
++
++void cellFontRenderSurfaceInit(u32 surface, u32 buffer, s32 bufferWidthByte,
++                               s32 pixelSizeByte, s32 w, s32 h);
++void cellFontRenderSurfaceSetScissor(u32 surface, s32 x0, s32 y0, s32 w, s32 h);
++s32 cellFontRenderCharGlyphImage(u32 font, u32 code, u32 surface, float x, float y,
++                                 u32 metrics, u32 transInfo);
++
++/* Registers the float-argument entry points as ctx handlers (ppu_hle_init). */
++void ps3_font_register_ctx(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/font/tests/test_cellfont.c b/libs/font/tests/test_cellfont.c
+new file mode 100644
+index 00000000..f72f6e8c
+--- /dev/null
++++ b/libs/font/tests/test_cellfont.c
+@@ -0,0 +1,268 @@
++/*
++ * ps3recomp - cellFont HLE test: guest struct layouts, allocator callbacks,
++ * the f1/f2 ctx handlers and real glyph rendering.
++ *
++ * Drives the library the way MotorStorm Apocalypse does (fn 0x4FE524 init,
++ * fn 0x500700 glyph cache fill): InitializeWithRevision, the FreeType library
++ * with a MemoryIF whose Malloc/Free are guest OPDs, OpenFontFile on a
++ * /dev_bdvd path, SetScalePixel / GetHorizontalLayout / GetCharGlyphMetrics /
++ * GetKerning, a renderer, a NULL-buffer surface and RenderCharGlyphImage with
++ * the glyph read back through CellFontImageTransInfo. Every result is read
++ * back from guest memory as big-endian at the SDK offset.
++ *
++ * Usage: test_cellfont <font.ttf>   (the TTF stands in for /dev_bdvd/test.ttf)
++ *   The size sanity bounds assume an ordinary Latin face. Pacific Rift's
++ *   gui/fonts/framdcn.ttf passes them; kab_plain.ttf has an ascender of about
++ *   two ems, so its layout/'A' bound checks fail without anything being wrong.
++ *
++ * Build (from the ps3recomp root), FreeType:
++ *   cc -std=gnu17 -O1 -DPS3RECOMP_HAS_FREETYPE -Iinclude -Ilibs/font \
++ *      $(pkg-config --cflags freetype2) libs/font/tests/test_cellfont.c \
++ *      $(pkg-config --libs freetype2) -lm -o /tmp/test_cellfont
++ * stb_truetype: the same without -DPS3RECOMP_HAS_FREETYPE and pkg-config.
++ */
++#include "../cellFont.c"
++#include <assert.h>
++
++/* ---- runtime stubs ---- */
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++unsigned char g_spu_coh_bitmap[1];
++int g_spu_coh_armed;   /* 0: no SPU reservations, so the coherency paths stay cold */
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_coh_notify_write_from_ppu(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len) { (void)ea; (void)len; return 0; }
++void spu_lockline_lock_mask(uint64_t m) { (void)m; }
++void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
++
++static const char* g_font_host;
++void ppu_fs_host_path(const char* guest, char* out, size_t cap)
++{
++    snprintf(out, cap, "%s", strcmp(guest, "/dev_bdvd/test.ttf") ? "/nonexistent" : g_font_host);
++}
++
++static struct { uint32_t nid; void (*fn)(ppu_context*); } g_ctx[16];
++static int g_nctx;
++void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
++{
++    (void)name; g_ctx[g_nctx].nid = nid; g_ctx[g_nctx].fn = fn; g_nctx++;
++}
++static void (*ctx_fn(const char* name))(ppu_context*)
++{
++    const uint32_t nid = ps3_compute_nid(name);
++    for (int i = 0; i < g_nctx; i++) if (g_ctx[i].nid == nid) return g_ctx[i].fn;
++    return NULL;
++}
++
++/* Guest allocator: a bump heap; Malloc/Free are the OPDs the MemoryIF names,
++ * called with (Object, ...) the way the title's callbacks are. */
++enum { OPD_MALLOC = 0x1000, OPD_FREE = 0x1008, MIF_OBJ = 0xABCD0000u,
++       HEAP = 0x400000, HEAP_END = 0x800000 };
++static uint32_t g_heap = HEAP;
++static int g_mallocs, g_frees;
++uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++                        uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
++{
++    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
++    assert(a0 == MIF_OBJ);
++    if (opd == OPD_MALLOC) {
++        g_mallocs++;
++        uint32_t p = (g_heap + 15) & ~15u;
++        g_heap = p + (uint32_t)a1;
++        assert(g_heap < HEAP_END);
++        return p;
++    }
++    if (opd == OPD_FREE) { assert(a1 >= HEAP && a1 < HEAP_END); g_frees++; return 0; }
++    assert(!"unexpected guest call");
++    return 0;
++}
++
++static int g_fail, g_pass;
++#define CHECK(c) do { if (c) g_pass++; else { g_fail++; \
++    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
++
++static uint32_t be32(uint32_t ea)   /* raw big-endian read, independent of vm_read32 */
++{
++    const uint8_t* p = vm_base + ea;
++    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++static float bef(uint32_t ea) { uint32_t u = be32(ea); float f; memcpy(&f, &u, 4); return f; }
++
++enum {
++    CFG = 0x10000, FTCFG = 0x10100, LIBP = 0x10200, PATH = 0x10300, FONT = 0x10400,
++    RCFG = 0x10600, REND = 0x10700, SURF = 0x10900, METR = 0x10A00, TI = 0x10B00,
++    LAYOUT = 0x10C00, KERN = 0x10D00, SURF2 = 0x10E00, BUF2 = 0x20000,
++};
++
++static int32_t call_render(uint32_t font, uint32_t code, uint32_t surf, double x, double y,
++                           uint32_t metrics, uint32_t ti)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = font; c.gpr[4] = code; c.gpr[5] = surf;
++    c.fpr[1] = x; c.fpr[2] = y;
++    c.gpr[6] = 0xDEAD0006; c.gpr[7] = 0xDEAD0007;   /* the GPR slots x and y take */
++    c.gpr[8] = metrics; c.gpr[9] = ti;
++    ctx_fn("cellFontRenderCharGlyphImage")(&c);
++    return (int32_t)c.gpr[3];
++}
++
++static int32_t call_scale(const char* name, uint32_t font, double w, double h)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = font; c.fpr[1] = w; c.fpr[2] = h;
++    ctx_fn(name)(&c);
++    return (int32_t)c.gpr[3];
++}
++
++int main(int argc, char** argv)
++{
++    if (argc < 2) { fprintf(stderr, "usage: %s <font.ttf>\n", argv[0]); return 2; }
++    g_font_host = argv[1];
++    vm_base = calloc(1, 16u << 20); assert(vm_base);
++    ppu_vm_size = 16u << 20;
++    ps3_font_register_ctx();
++    CHECK(ctx_fn("cellFontSetScalePixel") && ctx_fn("cellFontRenderCharGlyphImage")
++          && ctx_fn("cellFontSetupRenderScalePoint"));
++
++    /* Before init: every call is UNINITIALIZED. */
++    CHECK(cellFontInitLibraryFreeTypeWithRevision(0, FTCFG, LIBP) == (s32)CELL_FONT_ERROR_UNINITIALIZED);
++
++    /* CellFontConfig as fn 0x4FE524 fills it. */
++    vm_write32(CFG + 0x00, 0x30000); vm_write32(CFG + 0x04, 0x40000);
++    vm_write32(CFG + 0x08, 10); vm_write32(CFG + 0x0C, 0x31000); vm_write32(CFG + 0x10, 0);
++    CHECK(cellFontInitializeWithRevision(0x1234, CFG) == CELL_OK);
++    CHECK(cellFontInitializeWithRevision(0x1234, CFG) == (s32)CELL_FONT_ERROR_ALREADY_INITIALIZED);
++
++    /* CellFontLibraryConfigFT: library, MemoryIF {Object, Malloc, Free, Realloc, Calloc}. */
++    vm_write32(FTCFG + 0x00, 0);
++    vm_write32(FTCFG + 0x04, MIF_OBJ);
++    vm_write32(FTCFG + 0x08, OPD_MALLOC);
++    vm_write32(FTCFG + 0x0C, OPD_FREE);
++    vm_write32(FTCFG + 0x10, 0x1010);
++    vm_write32(FTCFG + 0x14, 0x1018);
++    CHECK(cellFontInitLibraryFreeTypeWithRevision(0x1234, FTCFG, LIBP) == CELL_OK);
++    const uint32_t lib = be32(LIBP);
++    CHECK(lib >= HEAP && lib < HEAP_END && g_mallocs == 1);
++    CHECK(be32(lib + 0) == 0 && be32(lib + 4) == 0);   /* libraryType, libraryVersion */
++
++    /* Fonts. */
++    strcpy((char*)vm_base + PATH, "/dev_bdvd/missing.ttf");
++    CHECK(cellFontOpenFontFile(lib, PATH, 0, 1, FONT) == (s32)CELL_FONT_ERROR_FONT_OPEN_FAILED);
++    strcpy((char*)vm_base + PATH, "/dev_bdvd/test.ttf");
++    CHECK(cellFontOpenFontFile(0x12340, PATH, 0, 1, FONT) == (s32)CELL_FONT_ERROR_INVALID_PARAMETER);
++    CHECK(cellFontOpenFontFile(lib, PATH, 0, 1, FONT) == CELL_OK);
++
++    const double S = 24.0;
++    CHECK(call_scale("cellFontSetScalePixel", FONT, S, S) == CELL_OK);
++    CHECK(bef(FONT + CELL_FONT_O_FONT_SCALE_X) == (float)S);
++
++    CHECK(cellFontGetHorizontalLayout(FONT, LAYOUT) == CELL_OK);
++    const float base = bef(LAYOUT + 0), line = bef(LAYOUT + 4);
++    printf("layout @%gpx: baseLineY %.2f lineHeight %.2f effectHeight %.2f\n",
++           S, base, line, bef(LAYOUT + 8));
++    CHECK(base > S * 0.5 && base < S * 1.5);
++    CHECK(line >= base && line < S * 2.5);
++
++    CHECK(cellFontGetCharGlyphMetrics(FONT, 'A', METR) == CELL_OK);
++    const float gw = bef(METR + 0), gh = bef(METR + 4), adv = bef(METR + 16);
++    printf("'A' @%gpx: %.2fx%.2f bearing (%.2f,%.2f) advance %.2f vadvance %.2f\n",
++           S, gw, gh, bef(METR + 8), bef(METR + 12), adv, bef(METR + 28));
++    CHECK(gw > 2 && gw < S && gh > S * 0.4 && gh < S);
++    CHECK(bef(METR + 12) > S * 0.4 && bef(METR + 12) <= gh + 1);   /* bearingY ~ cap height */
++    CHECK(adv > gw * 0.5 && adv < S * 1.5);
++
++    /* Half the scale: metrics scale with it. */
++    CHECK(call_scale("cellFontSetScalePixel", FONT, S / 2, S / 2) == CELL_OK);
++    CHECK(cellFontGetCharGlyphMetrics(FONT, 'A', METR) == CELL_OK);
++    CHECK(fabsf(bef(METR + 16) - adv / 2) < 1.0f);
++    CHECK(call_scale("cellFontSetScalePixel", FONT, S, S) == CELL_OK);
++
++    CHECK(cellFontGetCharGlyphMetrics(FONT, 0x10FFFD, METR) == (s32)CELL_FONT_ERROR_NO_SUPPORT_GLYPH);
++    CHECK(be32(METR + 0) == 0 && be32(METR + 16) == 0);
++
++    vm_write32(KERN, 0xFFFFFFFF); vm_write32(KERN + 4, 0xFFFFFFFF);
++    CHECK(cellFontGetKerning(FONT, 'A', 'V', KERN) == CELL_OK);
++    printf("kerning A,V: %.2f\n", bef(KERN));
++    CHECK(bef(KERN) <= 0.0f && bef(KERN) > -S && be32(KERN + 4) == 0);
++    CHECK(cellFontGetKerning(FONT, 0, 'V', KERN) == CELL_OK && be32(KERN) == 0);
++
++    /* Renderer: config all zero but expandSize, as the title passes it. */
++    vm_write32(RCFG + 0x0C, 1);
++    CHECK(cellFontCreateRenderer(lib, RCFG, REND) == CELL_OK);
++    CHECK(g_mallocs == 1);                 /* glyph buffer comes on first use */
++
++    /* NULL-buffer surface, 4x size, origin in the middle (fn 0x500700). */
++    const int32_t SZ = (int32_t)S * 4;
++    cellFontRenderSurfaceInit(SURF, 0, SZ, 1, SZ, SZ);
++    CHECK(be32(SURF + 0) == 0 && be32(SURF + 4) == (u32)SZ && be32(SURF + 8) == 1
++          && be32(SURF + 12) == (u32)SZ && be32(SURF + 16) == (u32)SZ
++          && be32(SURF + 0x1C) == (u32)SZ && be32(SURF + 0x20) == (u32)SZ);
++    cellFontRenderSurfaceSetScissor(SURF, 0, 0, SZ, SZ);
++    CHECK(call_scale("cellFontSetupRenderScalePoint", FONT, S, S) == CELL_OK);
++
++    CHECK(call_render(FONT, 'A', SURF, SZ / 2, SZ / 2, METR, TI) == (s32)CELL_FONT_ERROR_RENDERER_UNBIND);
++    CHECK(cellFontBindRenderer(FONT, REND) == CELL_OK);
++    CHECK(cellFontBindRenderer(FONT, REND) == (s32)CELL_FONT_ERROR_RENDERER_ALREADY_BIND);
++
++    CHECK(call_render(FONT, 'A', SURF, SZ / 2, SZ / 2, METR, TI) == CELL_OK);
++    const uint32_t img = be32(TI + 0), iwb = be32(TI + 4), iw = be32(TI + 8), ih = be32(TI + 12);
++    printf("'A' image 0x%08X %ux%u (stride %u), surface 0x%08X\n", img, iw, ih, iwb, be32(TI + 16));
++    CHECK(img >= HEAP && img < HEAP_END && g_mallocs == 2);
++    CHECK(iwb >= iw && fabsf((float)iw - gw) <= 2.0f && fabsf((float)ih - gh) <= 2.0f);
++    CHECK(be32(TI + 16) == 0 && be32(TI + 20) == (u32)SZ);
++    CHECK(bef(METR + 16) > 0);   /* metrics came back too */
++    {
++        unsigned ink = 0, full = 0;
++        for (uint32_t yy = 0; yy < ih; yy++)
++            for (uint32_t xx = 0; xx < iw; xx++) {
++                uint8_t a = vm_base[img + yy * iwb + xx];
++                ink += a != 0; full += a == 255;
++            }
++        printf("'A' coverage: %u of %u pixels inked, %u solid\n", ink, iw * ih, full);
++        CHECK(ink > iw * ih / 5 && full > 0 && ink < iw * ih);
++        for (uint32_t yy = 0; yy < ih; yy++) {      /* ASCII dump */
++            for (uint32_t xx = 0; xx < iw; xx++)
++                putchar(" .:-=+*#%@"[vm_base[img + yy * iwb + xx] * 9 / 255]);
++            putchar('\n');
++        }
++    }
++    /* A space has a glyph with no ink. */
++    CHECK(call_render(FONT, ' ', SURF, SZ / 2, SZ / 2, METR, TI) == CELL_OK);
++    CHECK(be32(TI + 8) == 0 && bef(METR + 16) > 0);
++
++    /* A surface with a buffer: the glyph lands inside it, at the origin. */
++    memset(vm_base + BUF2, 0x11, 64 * 64);
++    cellFontRenderSurfaceInit(SURF2, BUF2, 64, 1, 64, 64);
++    CHECK(call_render(FONT, 'O', SURF2, 8, 40, METR, TI) == CELL_OK);
++    {
++        const uint32_t im = be32(TI + 0), w = be32(TI + 8), h = be32(TI + 12);
++        CHECK(be32(TI + 4) == 64 && be32(TI + 16) == BUF2 && be32(TI + 20) == 64);
++        CHECK(im >= BUF2 && im < BUF2 + 64 * 64);
++        const uint32_t ox = (im - BUF2) % 64, oy = (im - BUF2) / 64;
++        printf("'O' in buffer at (%u,%u) %ux%u\n", ox, oy, w, h);
++        CHECK(ox >= 8 && ox < 8 + 4 && oy + h >= 39 && oy + h <= 42);   /* sits on the baseline */
++        CHECK(vm_base[BUF2] == 0x11);          /* outside the box: untouched */
++    }
++    /* Scissor clips. */
++    cellFontRenderSurfaceSetScissor(SURF2, 0, 0, 12, 64);
++    CHECK(call_render(FONT, 'O', SURF2, 8, 40, METR, TI) == CELL_OK);
++    CHECK(be32(TI + 8) <= 4);
++
++    CHECK(cellFontCloseFont(FONT) == CELL_OK);
++    CHECK(cellFontCloseFont(FONT) == (s32)CELL_FONT_ERROR_INVALID_PARAMETER);
++    CHECK(cellFontDestroyRenderer(REND) == CELL_OK && g_frees == 1);
++    CHECK(cellFontEndLibrary(lib) == CELL_OK && g_frees == 2);
++    CHECK(cellFontEnd() == CELL_OK);
++    CHECK(cellFontEnd() == (s32)CELL_FONT_ERROR_UNINITIALIZED);
++
++    printf("%s (%s): %d passed, %d failed\n", g_fail ? "FAIL" : "PASS", FONT_BACKEND,
++           g_pass, g_fail);
++    return g_fail ? 1 : 0;
++}
+diff --git a/libs/font/tests/test_font_initialize_with_revision.c b/libs/font/tests/test_font_initialize_with_revision.c
+deleted file mode 100644
+index 9ef5a4e0..00000000
+--- a/libs/font/tests/test_font_initialize_with_revision.c
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * test_font_initialize_with_revision - cellFontInitializeWithRevision.
+- *
+- * Titles built with a newer SDK start the font library with
+- * cellFontInitializeWithRevision(revisionFlags, config) instead of cellFontInit.
+- * It must initialise the library: without it every later cellFont call returns
+- * CELL_FONT_ERROR_UNINITIALIZED, which a title that ignores the result never
+- * notices.
+- *
+- *   cc -std=gnu17 -I include -o test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+- */
+-#include "../cellFont.c"
+-
+-#include <assert.h>
+-
+-uint8_t* vm_base;
+-uint32_t ppu_vm_size;
+-int g_resv_store_active = 0;
+-uint32_t g_ww_lo = 0, g_ww_hi = 0;
+-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+-int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+-void spu_lockline_lock(void) {}
+-void spu_lockline_unlock(void) {}
+-void spu_coh_notify_write(uint32_t addr) { (void)addr; }
+-void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+-
+-#define FONT_TYPE 0x1000u
+-#define FONT_OUT  0x2000u
+-
+-int main(void)
+-{
+-    static uint8_t mem[0x100000];
+-    vm_base = mem;
+-    ppu_vm_size = sizeof mem;
+-
+-    CellFontType* type = (CellFontType*)(uintptr_t)FONT_TYPE;     /* guest addresses, as the adapter passes them */
+-    CellFont* font = (CellFont*)(uintptr_t)FONT_OUT;
+-
+-    /* before any init the library is down */
+-    assert(cellFontOpenFontset(0, type, font) == CELL_FONT_ERROR_UNINITIALIZED);
+-
+-    assert(cellFontInitializeWithRevision(1, NULL) == CELL_OK);
+-    assert(cellFontOpenFontset(0, type, font) != CELL_FONT_ERROR_UNINITIALIZED);
+-
+-    /* it is the same initialisation as cellFontInit: a second one is refused */
+-    assert(cellFontInit(NULL) == CELL_FONT_ERROR_ALREADY_INITIALIZED);
+-    assert(cellFontInitializeWithRevision(1, NULL) == CELL_FONT_ERROR_ALREADY_INITIALIZED);
+-
+-    /* and cellFontEnd takes it down again */
+-    assert(cellFontEnd() == CELL_OK);
+-    assert(cellFontOpenFontset(0, type, font) == CELL_FONT_ERROR_UNINITIALIZED);
+-
+-    printf("test_font_initialize_with_revision: all passed\n");
+-    return 0;
+-}
 diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
 index 2ab88b8e..cad0afb9 100644
 --- a/libs/misc/cellAvconfExt.c
@@ -497,6 +2641,52 @@ index 07a3d2e4..75b05941 100644
  
  s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
  s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+diff --git a/runtime/host/host_stubs.c b/runtime/host/host_stubs.c
+index 6e79ec31..3c66fda1 100644
+--- a/runtime/host/host_stubs.c
++++ b/runtime/host/host_stubs.c
+@@ -96,6 +96,22 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(void*))
+     (void)nid; (void)name; (void)fn;
+ }
+ 
++/* ppu_hle.cpp - HLE -> guest function calls (cellFont's MemoryIF callbacks).
++ * There is no guest code to call: an allocation fails cleanly. */
++uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
++                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
++{
++    (void)opd; (void)a0; (void)a1; (void)a2; (void)a3;
++    (void)a4; (void)a5; (void)a6; (void)a7;
++    return 0;
++}
++
++/* ppu_fs.cpp - guest -> host path translation (cellFontOpenFontFile). */
++void ppu_fs_host_path(const char* guest, char* out, size_t cap)
++{
++    if (out && cap) snprintf(out, cap, "%s", guest ? guest : "");
++}
++
+ /* Inline write-watch hooks. ppu_memory.h expands every vm_write* into a range
+  * test against g_ww_lo/g_ww_hi plus a call to ps3_ww_report_inline, and those
+  * live in runtime/ppu/ppu_loader.cpp -- which CMake excludes from the runtime
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index f73907c2..02c53750 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -204,6 +204,14 @@ static void host_path(char* out, size_t cap, const char* guest)
+     ps3_vfs_ps3game_fallback(out, cap);
+ }
+ 
++/* The same guest -> host translation cellFsOpen uses, for HLE libraries that
++ * open game files themselves (cellFontOpenFontFile reads the TTF it is given
++ * by its /dev_hdd1 or /dev_bdvd path). */
++extern "C" void ppu_fs_host_path(const char* guest, char* out, size_t cap)
++{
++    host_path(out, cap, guest);
++}
++
+ /* ---- fd / dir handle tables ---- */
+ #define FS_MAX 256
+ static FILE* g_files[FS_MAX];
 diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
 index 15d4ef60..ebb5bce3 100644
 --- a/runtime/ppu/ppu_hle.cpp
@@ -519,6 +2709,29 @@ index 15d4ef60..ebb5bce3 100644
  
      /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
       * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9cb50400..5ab346aa 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -596,6 +596,7 @@ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int,
+ extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+ extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
+ extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
++extern "C" void ps3_font_register_ctx(void);   /* libs/font/cellFont.c */
+ static uint32_t g_net_errno_ea = 0;
+ static void hle_net_errno_loc(ppu_context* ctx)
+ {
+@@ -932,6 +933,10 @@ extern "C" void ppu_sysprx_register(void)
+     cellSaveData_register_ctx_handlers();
+     /* cellVideoOutSetGamma's float argument is in f1. */
+     avconf_register_ctx();
++    /* cellFont's float-argument entry points (SetScalePixel, SetupRenderScale*,
++     * RenderCharGlyphImage, ...) take their floats in f1/f2, which the generic
++     * 8-GPR adapter never passes. */
++    ps3_font_register_ctx();
+     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
+      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
+     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
 index 3ce8d0d6..04b29c92 100644
 --- a/runtime/spu/spu_workload.c
