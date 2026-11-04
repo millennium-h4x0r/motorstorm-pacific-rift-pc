@@ -66,13 +66,16 @@ at `(*(unsigned char**)&vm_base)+ea`.
   two files apart, so the velocity buffer came out as random bytes and the
   motion blur smeared them across the frame. Fixed in
   `libs/video/rsx_fp_decompiler.c` (alias sync for registers that cross files).
-- **Still open, overexposure**: VP constant c[33].x is the scene exposure; the
-  G-buffer pass multiplies colour by it, via tc6.y. It starts near 4 and climbs
-  to about 35.3 within a few seconds, so the RGBA8 colour target saturates. The
-  G-buffer target that gets colour/16 looks right. The loading screen whites
-  out the same way: c[59].w is about -35.3 and is used as a lerp factor. The
-  value is computed by PPU code. No CPU, SPU or vertex read of the 16x16 FP16
-  luminance target (0x07EBA600) showed up under read watchpoints.
+- **Overexposure**: the PPU exposure code (`func_004C3778`) samples the 16x16
+  FP16 luminance target directly from local memory (EA 0xC7EBA600 + sample
+  offsets). The engine kept the pixels on the GPU, so the code read zeros and
+  drove the exposure (VP c[33].x, also the loading screen's c[59].w) to about
+  35. Fixed in `libs/video/rsx_draw_engine.c` (`eng_small_targets_to_guest`):
+  colour targets of at most `PS3RECOMP_ENG_SMALL_WRITEBACK` pixels (default
+  1024) that were rendered in the frame are stored to guest memory at present.
+  c[33].x now settles around 0.76.
+- Still open: a band of horizontal streaks on the right side of the frame while
+  racing (motion blur or velocity?); not investigated.
 - Diagnostics: `RSX_ENGINE_PASS_DUMP_TRIGGER=<file>` (start or re-arm a pass dump
   by creating the file), `RSX_ENGINE_DROP_LOG=1` (draw drop reasons),
   `RSX_CONST_LOG=33,33` (exposure constant uploads), `GCM_WORD_STATS=10`

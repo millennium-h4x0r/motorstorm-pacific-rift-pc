@@ -1,16 +1,208 @@
 diff --git a/docs/BUILDING.md b/docs/BUILDING.md
-index 3bbabf62..823d16e0 100644
+index 3bbabf62..0e855fef 100644
 --- a/docs/BUILDING.md
 +++ b/docs/BUILDING.md
-@@ -284,6 +284,8 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+@@ -284,6 +284,9 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
  | `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
  | `RSX_ENGINE_COHERENCE_LOG=<n>` | Log the first *n* syncs between guest memory and the engine's surfaces around NV3089 transfers, with how many non-zero pixels moved |
  | `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
 +| `RSX_ENGINE_PASS_DUMP_TRIGGER=<file>` | With `RSX_ENGINE_PASS_DUMP`: start the capture once *file* exists (checked at most once a second) instead of by time or draw count, for a scene reached by hand. When the capture ends the file is removed, and creating it again starts a new capture over the same files |
++| `PS3RECOMP_ENG_SMALL_WRITEBACK=<pixels>` | Colour targets of at most this many pixels (default 1024) that were rendered in the frame are stored to guest memory at each present, for titles that read a reduction target with the CPU; 0 turns it off |
 +| `RSX_ENGINE_DROP_LOG=1` | Every 300 frames, print how many draw groups reached the engine, how many it drew, and how many it dropped at each early exit of `sink_end` (numbered `#n` in source order) |
  | `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
  
  Without a GPU, Mesa's lavapipe runs every check, e.g.
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 02b751b2..5a61e90a 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -204,6 +204,12 @@ static void audio_backend_shutdown(void)
+ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+ {
+     if (s_sdl_audio_dev) {
++        /* PS3_MUTE=1: queue silence, as the WASAPI path does -- the device
++         * still paces the mix, for unattended runs. */
++        static int mute = -1;
++        if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
++        static const float zeros[CELL_AUDIO_BLOCK_SAMPLES * 2];
++        if (mute && num_samples <= CELL_AUDIO_BLOCK_SAMPLES) stereo_samples = zeros;
+         SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+                        num_samples * 2 * sizeof(float));
+     }
+@@ -477,8 +483,10 @@ static void audio_mix_one_block(void)
+          * vs which block the read cursor is on -- distinguishes "writer never
+          * writes" from "writer and reader cycle out of phase". */
+         { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
+-          if (s_pk) { static _Thread_local unsigned _c;
+-            if ((++_c % 400) == 0) {
++          /* Per-port counter: one shared counter with two ports open hit
++           * the same port every time and never showed the other. */
++          if (s_pk) { static unsigned _c[CELL_AUDIO_PORT_MAX];
++            if ((++_c[p] % 400) == 0) {
+                 char map[36]; u32 b;
+                 for (b = 0; b < nblock && b < 32; b++) {
+                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+@@ -559,8 +567,62 @@ static void audio_notify_event_queues(void)
+     }
+ }
+ 
++static unsigned long long g_audio_underruns;  /* device about to play silence */
++
++static unsigned long long audio_now_ms(void)
++{
++#ifdef _WIN32
++    return (unsigned long long)GetTickCount64();
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)ts.tv_nsec / 1000000ULL;
++#endif
++}
++
++/* Diagnostics on the block just mixed into s_mix_buffer, shared by both
++ * mixing loops:
++ *   AUDIO_PEAK=1      report the block's peak amplitude periodically, so "is
++ *                     any port producing sound" is answerable.
++ *   AUDIO_WAV=<file>  append the final mix as raw f32le stereo 48 kHz
++ *                     (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
++static void audio_diag_block(void)
++{
++    static int ap = -1; if (ap < 0) ap = getenv("AUDIO_PEAK") ? 1 : 0;
++    if (ap) {
++        static unsigned n = 0; float pk = 0.0f;
++        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
++            float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
++        if ((++n % 200) == 0 || (pk > 0.001f && n < 40))
++            fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", n, pk);
++    }
++    static FILE* wf = (FILE*)-1;
++    if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
++    if (wf) { fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf); fflush(wf); }
++}
++
++/* AUDIO_RATE=1: blocks mixed vs real time, silent blocks, frames dropped. */
++static void audio_diag_rate(void)
++{
++    static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
++    if (!on) return;
++    static unsigned long long t0, d0, u0; static unsigned n, z;
++    const unsigned long long now = audio_now_ms(); if (!t0) t0 = now; n++;
++    { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
++      if (!nz) z++; }
++    if (now - t0 >= 5000) {
++        fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device queue %u%c",
++                n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
++                g_audio_underruns - u0,
++#if AUDIO_BACKEND_WASAPI
++                (unsigned)s_wasapi_buf_frames, 10);
++#else
++                (unsigned)audio_backend_queued_samples(), 10);
++#endif
++        n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now;
++    }
++}
++
+ #ifdef _WIN32
+-static unsigned long long g_audio_underruns;
+ static unsigned __stdcall audio_mix_thread_func(void* arg)
+ {
+     (void)arg;
+@@ -608,40 +670,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+         }
+         blocks++;
+-        /* Mix and submit one block */
+         audio_mix_one_block();
+-        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
+-         * "is any port producing sound" is answerable (LBP Bink movie audio). */
+-        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
+-          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
+-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+-                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
+-            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+-                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+-        { static FILE* _wf = (FILE*)-1;
+-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
++        audio_diag_block();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+-        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+-        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
+-            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
+-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+-              if (!nz) z++; }
+-            if (now - t0 >= 5000) {
+-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u%c",
+-                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+-                        g_audio_underruns - u0,
+-                #if AUDIO_BACKEND_WASAPI
+-                        (unsigned)s_wasapi_buf_frames, 10);
+-#else
+-                        0u, 10);
+-#endif
+-                n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
+-
+-        /* Notify event queues */
++        audio_diag_rate();
+         audio_notify_event_queues();
+     }
+ 
+@@ -654,17 +686,46 @@ static void* audio_mix_thread_func(void* arg)
+     (void)arg;
+     printf("[cellAudio] Mixing thread started\n");
+ 
++    /* Pace to the device the way the Windows loop does: mix a block only when
++     * the backend has room for one (SDL: fewer than four blocks queued), and
++     * with no device open follow a CLOCK_MONOTONIC schedule of one block per
++     * 256/48000 s. The old loop mixed, queued and slept a fixed 2-5 ms: with
++     * a device the SDL queue (and so the latency) grew without bound, and
++     * without one it mixed ~2.7x faster than real time, racing the guest's
++     * audio thread through its ring. */
++    const long long period_ns = (long long)CELL_AUDIO_BLOCK_SAMPLES * 1000000000LL / CELL_AUDIO_SAMPLE_RATE;
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    long long t0 = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++    unsigned long long blocks = 0;
++    int had_device = 0;
+     while (s_mix_thread_running) {
++        const int room = audio_backend_room();
++        if (room >= 0) {
++            if (room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++            /* SDL queue fully drained after the first blocks: the device is
++             * about to play (or already played) silence. */
++            if (blocks > 64 && audio_backend_queued_samples() == 0) g_audio_underruns++;
++            had_device = 1;
++        } else {
++            clock_gettime(CLOCK_MONOTONIC, &ts);
++            const long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++            if (had_device) { t0 = now - (long long)blocks * period_ns; had_device = 0; }
++            const long long due = t0 + (long long)blocks * period_ns;
++            if (now < due) {
++                struct timespec d = { (time_t)(due / 1000000000LL), (long)(due % 1000000000LL) };
++                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
++                continue;
++            }
++            /* More than 50 ms behind (a debugger stop, a starved host): drop
++             * the backlog instead of mixing it in a burst. */
++            if (now - due > 50000000LL) t0 = now - (long long)blocks * period_ns;
++        }
++        blocks++;
+         audio_mix_one_block();
++        audio_diag_block();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
++        audio_diag_rate();
+         audio_notify_event_queues();
+-
+-        u32 queued = audio_backend_queued_samples();
+-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+-            usleep(5000);
+-        } else {
+-            usleep(2000);
+-        }
+     }
+ 
+     printf("[cellAudio] Mixing thread stopped\n");
 diff --git a/libs/font/cellFont.c b/libs/font/cellFont.c
 index 4e239b55..c82b1c29 100644
 --- a/libs/font/cellFont.c
@@ -2710,10 +2902,26 @@ index 298ee7de..24ac166b 100644
      /* The guest struct is two 4-byte EAs, not two host pointers. */
      vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff6011..963c01ff 100644
+index 8dff6011..356c6edd 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -2672,6 +2672,7 @@ static int pd_open_index(void)
+@@ -109,6 +109,7 @@ typedef struct {
+     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+     int guest_dirty;        /* rendered since guest memory last got a copy   */
+     u32 last_use;           /* g.frames when last bound, sampled or presented */
++    u32 written_frame;      /* g.frames of the last colour write              */
+ } eng_surface;
+ 
+ typedef struct {
+@@ -1579,6 +1580,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+     for (u32 i = 0; i < n_targets; i++) {
+         g.surfaces[targets[i]].color_serial = serial;
+         g.surfaces[targets[i]].guest_dirty = 1;
++        g.surfaces[targets[i]].written_frame = g.frames;
+     }
+ }
+ 
+@@ -2672,6 +2674,7 @@ static int pd_open_index(void)
      }
      s_pd.state = 2;
      s_pd.open = 0;
@@ -2721,7 +2929,7 @@ index 8dff6011..963c01ff 100644
      return 1;
  }
  
-@@ -2691,6 +2692,22 @@ static int pd_capturing(void)
+@@ -2691,6 +2694,22 @@ static int pd_capturing(void)
      if (s_pd.state == 1 && s_pd.after_s &&
          difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
          fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
@@ -2744,7 +2952,7 @@ index 8dff6011..963c01ff 100644
      return s_pd.state == 2;
  }
  
-@@ -2829,6 +2846,10 @@ static void pd_close_pass(void)
+@@ -2829,6 +2848,10 @@ static void pd_close_pass(void)
          s_pd.state = 3;
          fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
                  s_pd.pass, s_pd.dir);
@@ -2755,7 +2963,7 @@ index 8dff6011..963c01ff 100644
      }
  }
  
-@@ -2941,7 +2962,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2941,7 +2964,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
  static void pd_present(u32 presented)
  {
      if (s_pd.state == 0) pd_capturing();
@@ -2765,7 +2973,7 @@ index 8dff6011..963c01ff 100644
          if (pd_open_index())
              fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                      g.frames + 1, g.guest_draws);
-@@ -3022,14 +3044,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+@@ -3022,14 +3046,32 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                  what, rc[0], rc[1], rc[2], rc[3], w, h);
  }
  
@@ -2800,7 +3008,7 @@ index 8dff6011..963c01ff 100644
  
      const u32 prim = g.rsx.current_primitive;
      /* Everything that becomes triangles -- lists, strips, fans, quads, quad
-@@ -3044,33 +3084,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3044,33 +3086,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
      int scratch = 0;
      const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
      if (!rebuild) {
@@ -2840,7 +3048,7 @@ index 8dff6011..963c01ff 100644
      const u32 target = targets[0];
  
      rsx_dsp_surface sf;
-@@ -3091,8 +3131,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3091,8 +3133,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                            eng_surface_format(sf.color_format),
                                            n_targets, &pipeline_is_fixed, &tex_used,
                                            &fp_hash);
@@ -2851,7 +3059,7 @@ index 8dff6011..963c01ff 100644
  
      /* Textures before any pipeline or target binding: a cache refresh can
       * replace a resource, and the backend is free to submit while doing it. */
-@@ -3106,12 +3146,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3106,12 +3148,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
      memset(vsamplers, 0, sizeof vsamplers);
      const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                              textures, samplers);
@@ -2866,7 +3074,7 @@ index 8dff6011..963c01ff 100644
          rsx_draw_engine_write_topology_indices(
              prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
              dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
-@@ -3145,7 +3185,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3145,7 +3187,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      const u32 fp_bytes = (nslots + 1u) * 16u;
      if (g.fp_cb_cap < fp_bytes) {
          u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
@@ -2875,7 +3083,7 @@ index 8dff6011..963c01ff 100644
          g.fp_cb = n;
          g.fp_cb_cap = fp_bytes;
      }
-@@ -3231,6 +3271,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -3231,6 +3273,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
       * the test hook means: a draw through the built-in pair is a draw, not
       * evidence that the decompile-translate-compile path worked. */
      if (!pipeline_is_fixed) g.guest_draws++;
@@ -2883,7 +3091,52 @@ index 8dff6011..963c01ff 100644
  
      if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
      if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-@@ -3379,6 +3420,7 @@ static void eng_present(u32 buffer_id)
+@@ -3360,6 +3403,40 @@ static u32 eng_present_surface(u32 buffer_id)
+     return eng_current_surface();
+ }
+ 
++/* Small colour targets rendered this frame are stored to guest memory at
++ * every present. On RSX a render target IS memory, and a title may read one
++ * with the CPU at any later time with no command the engine could see. The
++ * pixels exist only on the host GPU here, so such a read saw stale bytes.
++ * MotorStorm: Pacific Rift reduces the scene's luminance to a 16x16 FP16
++ * target and its PPU exposure code (func_004C3778) samples it straight from
++ * local memory (0xC0000000 + offset); reading zeros, it took the scene for
++ * black, drove the exposure (VP c[33]) to its maximum and the race rendered
++ * blown out. Only targets of at most PS3RECOMP_ENG_SMALL_WRITEBACK pixels
++ * (default 1024; 0 turns this off) qualify: reduction and readback targets
++ * are tiny, and a frame's full-size targets would cost a large readback each.
++ * A8R8G8B8 and FP16 surfaces (rsx_draw_engine_guest_read). */
++static void eng_small_targets_to_guest(void)
++{
++    static long max_px = -1;
++    if (max_px < 0) {
++        const char* e = getenv("PS3RECOMP_ENG_SMALL_WRITEBACK");
++        max_px = e ? atol(e) : 1024;
++    }
++    if (max_px <= 0) return;
++    for (u32 i = 0; i < g.n_surfaces; i++) {
++        eng_surface* sf = &g.surfaces[i];
++        if (!sf->handle || !sf->guest_dirty || sf->written_frame != g.frames ||
++            (long)sf->w * (long)sf->h > max_px)
++            continue;
++        const u32 bpp = eng_transfer_bpp(sf->fmt);
++        if (!bpp || sf->pitch < sf->w * bpp) continue;
++        rsx_draw_engine_guest_read(sf->location, sf->offset, sf->pitch,
++                                   sf->w * bpp / 4u, sf->h);
++        sf->guest_dirty = 0;
++        eng_textures_touch(sf->location, sf->offset, sf->pitch * sf->h);
++    }
++}
++
+ static void eng_present(u32 buffer_id)
+ {
+     if (!g.ready) return;
+@@ -3376,9 +3453,11 @@ static void eng_present(u32 buffer_id)
+                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
+     }
+     pd_present(target);
++    eng_small_targets_to_guest();
      g.last_present_surface = target;
      g.be->present(g.be->user, g.surfaces[target].handle);
      g.frames++;
