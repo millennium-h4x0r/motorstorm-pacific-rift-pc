@@ -164,36 +164,87 @@ index 9ab90ee1..d3c697c4 100644
      u8  channel;
      u8  encoder;
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c6..b0c7fc72 100644
+index 82ea66c6..185f0da6 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -3405,38 +3405,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -27,6 +27,45 @@
+  * SpursTasksetContext from the real taskset. Set right before dispatch_async (the PPU
+  * create path is sequential here). Gated by YDKJ_REAL_TASKSET in the dispatch. */
+ uint32_t g_ydkj_real_taskset_ea = 0;
++
++/* Every taskset created, with the SPURS instance it belongs to. A SPURS-owned
++ * LFQueue (owner = spurs|1) has to wake a taskset of THAT instance: with only
++ * "the last taskset created" to go on, MotorStorm: Pacific Rift's FIOS queue
++ * woke its audio taskset (another SPURS instance, created later) and the
++ * loader waited forever for a decompression that was never started. */
++#define SPURS_TS_REG_N 32
++static struct { uint32_t ts, spurs; } s_ts_reg[SPURS_TS_REG_N];
++static int s_ts_reg_n = 0;
++static void spurs_ts_register(uint32_t ts, uint32_t spurs)
++{
++    for (int i = 0; i < s_ts_reg_n; i++)
++        if (s_ts_reg[i].ts == ts) { s_ts_reg[i].spurs = spurs; return; }
++    if (s_ts_reg_n < SPURS_TS_REG_N) { s_ts_reg[s_ts_reg_n].ts = ts; s_ts_reg[s_ts_reg_n].spurs = spurs; s_ts_reg_n++; }
++}
++/* The most recently created taskset of a SPURS instance, 0 if none. */
++/* The workload id a new taskset of this SPURS instance gets: 8 + how many
++ * tasksets the instance already has. Distinct per instance, below the 16
++ * workload slots, and clear of the low ids AddWorkload hands out first. */
++static uint32_t spurs_ts_next_wid(uint32_t spurs)
++{
++    uint32_t n = 0;
++    for (int i = 0; i < s_ts_reg_n; i++) if (s_ts_reg[i].spurs == spurs) n++;
++    return 8u + (n & 7u);
++}
++/* The taskset of a SPURS instance whose workload id is wid, 0 if none. */
++static uint32_t spurs_ts_for_wid(uint32_t spurs, uint32_t wid)
++{
++    for (int i = s_ts_reg_n - 1; i >= 0; i--)
++        if (s_ts_reg[i].spurs == spurs && vm_read32(s_ts_reg[i].ts + CSTS_WID) == wid)
++            return s_ts_reg[i].ts;
++    return 0;
++}
++static uint32_t spurs_ts_for_spurs(uint32_t spurs)
++{
++    for (int i = s_ts_reg_n - 1; i >= 0; i--)
++        if (s_ts_reg[i].spurs == spurs) return s_ts_reg[i].ts;
++    return 0;
++}
+ uint32_t g_ydkj_real_taskid     = 0;
+ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
+ 
+@@ -907,9 +946,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+     /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
+      * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
+      * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
+-    spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
++    spurs_taskset_init(taskset_ea, spurs_ea, args, spurs_ts_next_wid(spurs_ea),
+                        taskset_size, /*evf1*/0, /*evf2*/0);
+     g_ydkj_real_taskset_ea = taskset_ea;
++    spurs_ts_register(taskset_ea, spurs_ea);
+ 
+     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
+     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
+@@ -3405,38 +3445,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
      return CELL_OK;
  }
  
 -/* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
 - *      const void* buffer, u32 size, u32 depth, u32 direction)
-- *
++/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
+  *
 - * This one CANNOT be a stub, because the consumer is recompiled SPU code that
 - * reads the queue out of main memory itself. Disassembling image 1 around the
 - * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
 - * a 128-byte line at LS 0x80 and commits it with
-- *
-- *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
-- *   rdch MFC_RdAtomicStat ; brnz -> retry
-+/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
-  *
-- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
-- * bytes in guest memory ARE the interface, and they have to be the real
-- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
 + * Ported from the MotorStorm Apocalypse port (its toolkit patch), where the
 + * layout and protocol were read out of the libspurs task-side LFQueue code
 + * linked into an SPU zlib task. The consumer is recompiled SPU task code that
 + * works on the queue line in main memory with GETLLAR/PUTLLC, so the bytes ARE
 + * the interface. The PPU push is the pop protocol mirrored.
   *
-- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
-- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
+- *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
+- *   rdch MFC_RdAtomicStat ; brnz -> retry
 + *   +0x00 u16 pop  done index      +0x08 u16 push done index
 + *   +0x02 u16 pop  done bitmap     +0x0A u16 push done bitmap
 + *   +0x04 u16 pop  waiters (dir 3) +0x0C u16 push waiters (dir 3)
@@ -204,6 +255,13 @@ index 82ea66c6..b0c7fc72 100644
 + *   +0x50 u16 push waiters  +0x52 u16 push waiter ids[15]
 + *   +0x70 u64 owner (taskset, or SPURS|1)
   *
+- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
+- * bytes in guest memory ARE the interface, and they have to be the real
+- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
+- *
+- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
+- *
 - * The title's own call corroborates the size: it passes q=0x4059FD00 with
 - * buffer=0x4059FD80, exactly 128 bytes later.
 - *
@@ -246,7 +304,7 @@ index 82ea66c6..b0c7fc72 100644
  s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                  u32 size, u32 depth, u32 direction)
  {
-@@ -3445,30 +3456,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+@@ -3445,30 +3496,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
  
      uint32_t q = (uint32_t)queue_ea;
      for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
@@ -283,7 +341,7 @@ index 82ea66c6..b0c7fc72 100644
                 (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
      return CELL_OK;
  }
-@@ -3479,3 +3477,137 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3479,3 +3517,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
      return CELL_OK;
  }
@@ -305,12 +363,17 @@ index 82ea66c6..b0c7fc72 100644
 +/* A waiter id is (workload id << 8) | task id. A taskset-owned queue wakes its
 + * own taskset. A SPURS-owned one (owner = spurs|1) should wake the taskset of
 + * workload id >> 8; this runtime gives every taskset workload id 0, so it
-+ * wakes the last taskset created -- right while a title has one taskset. */
++ * wakes the newest taskset of the owning SPURS instance -- right while each
++ * instance has one taskset. */
 +static uint32_t lfq_taskset_for(uint32_t q, u16 id)
 +{
-+    (void)id;
 +    uint32_t owner = (uint32_t)vm_read64(q + LFQ_OWNER);
 +    if (owner && !(owner & 1u)) return owner;
++    if (owner) {
++        uint32_t ts = spurs_ts_for_wid(owner & ~1u, (uint32_t)(id >> 8));
++        if (!ts) ts = spurs_ts_for_spurs(owner & ~1u);
++        if (ts) return ts;
++    }
 +    return g_ydkj_real_taskset_ea;
 +}
 +
@@ -456,3 +519,21 @@ index 15d4ef60..ebb5bce3 100644
  
      /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
       * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 3ce8d0d6..04b29c92 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -839,6 +839,13 @@ static void spu_async_run(spu_async_job* j)
+                  * both audio tasks run task 1's descriptor). */
+                 if (j->taskset_ea) {
+                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
++                    /* SpursKernelContext.wklCurrentId (LS 0x1DC) = the taskset's
++                     * own workload id. Task-side libspurs builds every LFQueue /
++                     * queue waiter id as (wklCurrentId << 8) | taskId, and the
++                     * PPU side maps it back to the taskset to wake; left 0, two
++                     * tasksets on one SPURS instance were indistinguishable. */
++                    { extern uint8_t* vm_base;
++                      memcpy(ls + 0x1DC, vm_base + j->taskset_ea + 0x74, 4); }   /* CSTS_WID, BE */
+                     fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                             "taskset=0x%08X task=%u\n", j->image_id,
+                             j->taskset_ea, j->taskid); fflush(stderr);
