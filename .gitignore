@@ -13,6 +13,7 @@
 
 /work/*
 !/work/port/
+!/work/run.sh
 !/work/tools/
 !/work/tests/
 !/work/patches/
