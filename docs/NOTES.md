@@ -143,7 +143,7 @@ Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `wor
 - Race bottleneck, from PS3_FTRACE: the RSX FIFO drain is busy for about 130 of every 132 ms. About 20% of that is fence waits: 2-3 guest-reference flushes per frame (surfaces read back for format-reinterpreting textures and depth-to-guest) plus each draw's own render pass and full barrier on the GPU. The rest is walker CPU: driver command recording, vertex fetch/remap, texture decode/hash, and SPIR-V optimisation for new shaders. Main busy-spins in func_0050C818 waiting for SPU job counters.
 - Render-pass merging (`VK_EB_MERGE`, default on): consecutive batched draws into the same framebuffer share a render pass, with a full barrier only on a sampling or attachment hazard. Race 6.8 -> 10.3 fps. `SPU_MFC_LOOKUP_CACHE=1` is defaulted in `main.cpp` (the toolkit's opt-in mfc_for memo): race 8.4 -> 10.6 fps.
 - Race frame (about 65-75 ms at HEAD) is a latency chain: main computes about 20 ms, kicks SPU jobs, then waits about 30 ms for them. The SPU jobs run serially because each WWS job list (Wws_Job EvoHigh/EvoDefault/no name/LibMP3) was added with maxContention 1 (attribute +0x24); that is the game's own setting, and SPURS runs them the same way on hardware. More host threads cannot help. The hot job module is jobmod_67757f5f e2490 (func_4F80), so faster lifted job code is the lever.
-- Main's "spinlock" wait (func_004B63F0 from func_0094CC80/0094CBD8, usleep 250 us back-off) is really a job-done flag. Main sets word +0xC of the job object in func_0094CBD8 and waits for it to clear in func_0094CC80. A host watchpoint never sees the clear, so it comes through another mapping (SPU DMA). `PS3_USLEEP_LOCKWAIT=<lr list>:<reg>` (sys_timer.c, set in main.cpp for all 74 call sites) makes those back-offs return as soon as the word clears; it measured about neutral. `PS3_USLEEP_LOCKWAIT_STATS=1` prints freed/timeout counts.
+- Main's "spinlock" wait (func_004B63F0 from func_0094CC80/0094CBD8, usleep 250 us back-off) is really a job-done flag. Main sets word +0xC of the job object in func_0094CBD8 and waits for it to clear in func_0094CC80. A host watchpoint never sees the clear, so it comes through another mapping (SPU DMA). `PS3_USLEEP_LOCKWAIT=<lr list>:<reg>` (sys_timer.c) makes those back-offs return as soon as the word clears. It is not set by default: main.cpp used to set it, and it was removed after measuring about neutral while the job lists ran serially. The back-off is a direct `sc` (sys_timer_usleep, 250 us) inside func_004B63F0, which leaves LR untouched, so the list is the return addresses of the 73 `bl func_004B63F0` sites in work/src/recomp (`ctx->lr = 0x...; func_004B63F0(ctx)`), and the lock/flag word is in r29 (`:29`). `PS3_USLEEP_LOCKWAIT_STATS=1` prints freed/timeout counts.
 - PPU stwcx./stdcx. commits now call the SPU line-commit hook (`ppu_loader.cpp`), so a PPU atomic on a SPURS request line wakes the coordinator at once instead of on its next 1 ms pass (`PPU_STWCX_KICK=0` turns it off). Race 13.0 -> 14.5 fps in one A/B, within noise. Polling the coordinator faster (100-200 us) made things much worse.
 - SPU job worker in the race: the main WWS job list's policy module runs about 84% of wall time (`SPURS_DISPATCH_STATS=1`: about 3200 runs/s, 0.26 ms each, 0.05 ms gaps). Thread CPU splits as lifted job code about 65% (jobmod 67757f5f / 36bf670e / db10221f / 48b4ef08 ...), DMA memcpy about 13%, condvar traffic about 8% (cut by the coordinator's own condvar `kwake` in cellSpurs.c), and indirect dispatch about 6%. `SPU_FLOAT_RZ=1`, capping JobBatchHandler's poll (`PS3_USLEEP_CAP`), `PS3_USLEEP_LOCKWAIT` and the stwcx kick all measured neutral on race fps.
 - `work/tools/to_race.sh`: INST=<name>, drives a running instance to a Free-Play race with frame-dump checks.
@@ -181,8 +181,46 @@ Remaining structural steps (each multi-day):
    thread. Handle-returning calls (surface_view ~80/frame, snapshots, texture/target
    create) must not drain the queue: allocate handles proxy-side and let the recorder
    bind them later. Removes ~8-10 ms/frame (backend draw recording) from the FIFO thread.
-2. GPU-side vertex fetch (mirror guest vertex memory in GPU buffers with dirty tracking,
-   fetch and byteswap in the VP preamble). Removes most of fetch (~6-9 ms/frame).
-   Write-protect dirty tracking is risky: host syscalls into guest memory fail with EFAULT.
+2. GPU-side vertex fetch: done, on by default (see below).
 3. Main thread: ~7% is the job-counter spin (func_0050C818); per-job SPU speed and the
    PM-yield change (idle workers block instead of polling) are the levers.
+
+### GPU-side vertex fetch (default on; `PS3RECOMP_ENG_GPUFETCH=0` turns it off)
+
+The engine hands the GPU each draw's raw guest bytes instead of decoded vertices
+(rsx_draw_engine.c, "GPU-side vertex fetch"; backend hooks fetch_pool / fetch_serial /
+draw_fetch). It does not use a fixed-address mirror with per-page uploads. Pages in such a
+mirror cannot be rewritten while earlier draws of the same frame still read them: copies
+are not allowed inside a render pass, and the game rewrites its dynamic vertex rings within a
+frame. Instead:
+- Ranges are content-addressed, immutable blocks in a 96 MB pool in the BAR heap
+  (device-local and host-visible, so no copy commands). A block is keyed by the per-frame
+  range hash the vertex cache uses, including the SPU io_written generations.
+- The pool is a ring. A block is reused only once fetch_serial says every draw that read it
+  has completed, and a hot block is copied forward before the head reaches it.
+- The vertex shader gets a generated preamble (eng_vs_to_fetch) that does the work the CPU
+  used to do:
+  - byteswaps and decodes all seven attribute types;
+  - applies the base index and the frequency divider;
+  - performs the quad/fan/polygon/quad-strip expansions per vertex, exactly as
+    rsx_draw_engine_write_topology_indices does.
+- The per-draw table (attribute addresses, formats, the viewport epilogue) is 176 bytes of
+  VS push constants. Disabled attributes are stride-0 constant blocks.
+- Indexed triangle strips (this game cuts them with 0xFFFF restarts) are host strips drawn
+  from a byteswapped index block, with primitive restart on.
+- Pull draws bind only the transform constants their program reads.
+- Everything else takes the CPU path unchanged: inline or immediate vertices, batches that
+  are not one contiguous run, and restart values other than all-ones.
+
+Pack racing, 2026-11-05:
+- ~100% of draws take the pull path.
+- The engine profile's fetch phase drops 5.7-5.9 → 2.0-3.0 ms/frame.
+- bench.sh FIFO CPU drops 15.6 → 11.3 ms/frame; fps is unchanged (~41).
+- With the FIFO walker's engine-only fast feed (cellGcmSys.c gcm_word_engine_only), the FIFO
+  thread sleeps ~40% of the race window. The frame is gated by the main thread's wait in
+  func_004B63F0 (sys_timer_usleep), not by FIFO CPU.
+
+The NVIDIA driver's pipeline disk cache stopped keeping entries at its default size, which a
+few builds of this port fill. Every run then recompiled each race pipeline on the FIFO thread
+(libnvidia-gpucomp 6% of it). main.cpp now sets `__GL_SHADER_DISK_CACHE_SIZE` to 10 GB unless
+it is already set.

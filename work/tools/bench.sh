@@ -8,6 +8,10 @@
 # the FIFO/RSX thread, the three busiest SPURS job workers and the MultiStream
 # SPU thread, then the mean over the rounds. Extra VAR=val args go to the game.
 # Kills the instance with SIGKILL after each round (the game ignores SIGINT).
+# FTRACE=<prefix>: also record a PS3_FTRACE timeline of the window into
+# <prefix>_r<round>.txt (ps3recomp/tools/ftrace_report.py).
+# PROF_TRIGGER=<file>: created at the window's start and removed at its end,
+# for a sampler preloaded through the game's environment arguments.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 I="${INST:-bench}"; N="${ROUNDS:-3}"
@@ -72,7 +76,8 @@ for r in $(seq 1 "$N"); do
     ok=0
     for try in 1 2 3; do                      # to_race.sh can miss a menu step: boot again
         kill_inst; wait 2>/dev/null; rm -f "$FL"; : > "$D/run.log"
-        env "$@" INST="$I" TIMEOUT=900 PS3RECOMP_VK_DUMP_EVERY=10 PS3RECOMP_FLIPLOG="$FL" work/run.sh >/dev/null 2>&1 9>&- &
+        FT=(); [ -n "${FTRACE:-}" ] && { rm -f "${FTRACE}_r$r.txt"; FT=(PS3_FTRACE="-1:10:${FTRACE}_r$r.txt"); }
+        env "$@" "${FT[@]}" INST="$I" TIMEOUT=900 PS3RECOMP_VK_DUMP_EVERY=10 PS3RECOMP_FLIPLOG="$FL" work/run.sh >/dev/null 2>&1 9>&- &
         sleep 3
         if INST="$I" timeout 600 work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
         echo "round $r try $try: $(tail -1 "$D/to_race.txt")" >&2
@@ -108,8 +113,13 @@ def cpu():
     return d
 while time.time() < t_go + 2.0: time.sleep(0.01)
 mono_us = lambda: time.clock_gettime(time.CLOCK_MONOTONIC) * 1e6   # the clock PS3RECOMP_FLIPLOG uses
+if os.environ.get('FTRACE'):
+    import signal; os.kill(pid, signal.SIGUSR2)   # opens the armed PS3_FTRACE window
+pt = os.environ.get('PROF_TRIGGER')               # a sampler's trigger file: present during the window
+if pt: open(pt, 'w').close()
 lo = mono_us(); c0 = cpu()
 time.sleep(10.0)
+if pt: os.remove(pt)
 c1 = cpu(); hi = mono_us()
 ts = [int(l) for l in open(fl) if l.strip()]
 w = [t for t in ts if lo <= t <= hi]
@@ -132,6 +142,10 @@ parts.append('ms %.1f' % (ms(msth[0]) if msth else -1))
 print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), ', '.join(parts)))
 EOF
     ffmpeg -loglevel error -y -i "$F" -vf scale=640:-1 "$D/bench_r$r.png"
+    if [ -n "${FTRACE:-}" ]; then                     # the game writes the trace once the window closes
+        for k in $(seq 1 60); do [ -s "${FTRACE}_r$r.txt" ] && grep -q "wrote" "$D/run.log" 2>/dev/null && break; sleep 0.5; done
+        sleep 1
+    fi
     kill_inst; wait
     flock -u 9
 done

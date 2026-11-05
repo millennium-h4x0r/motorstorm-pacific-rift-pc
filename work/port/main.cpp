@@ -46,6 +46,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>     /* clock_gettime: PS3RECOMP_FLIPLOG */
+#ifndef _WIN32
+#include <sys/prctl.h>   /* PR_SET_TIMERSLACK: PS3RECOMP_TIMERSLACK_NS */
+#endif
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: PRESENT spans */
 #include <string>
 #ifdef _WIN32
 #include <direct.h>   /* _mkdir: the shader cache directory */
@@ -220,7 +224,9 @@ static void fliplog_note(void)
 
 static void present_guest_frame(void)
 {
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     rsx_backend_present();
+    if (ft0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft0, ps3_ft_now());
     fliplog_note();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
@@ -515,6 +521,19 @@ int main(int argc, char** argv)
      * Race 7.9 -> 13.5 fps, visuals and a 3-minute race soak clean; 4 and 5
      * gave no more. SPURS_MAXCONT_MIN=1 restores the hardware behaviour. */
     setenv("SPURS_MAXCONT_MIN", "3", 0);
+    /* GPU-side vertex fetch (rsx_draw_engine.c, "GPU-side vertex fetch"):
+     * the vertex shader reads and decodes the guest's raw vertex and index
+     * bytes from a pool instead of the FIFO thread building reference lists
+     * and decoding every vertex. Pack racing FIFO CPU ~27 -> ~15 ms/frame,
+     * +5-8 fps. Draws it cannot take keep the CPU fetch.
+     * PS3RECOMP_ENG_GPUFETCH=0 restores the CPU fetch everywhere. */
+    setenv("PS3RECOMP_ENG_GPUFETCH", "1", 0);
+    /* PS3RECOMP_TIMERSLACK_NS=<ns>: the kernel's timer slack for this thread
+     * and every thread created after it (default 50 us). The race's main
+     * thread polls a Havok lock with usleep(1) back-offs (func_00A499F8 and
+     * friends) and each one sleeps ~55 us on the host instead of ~1 us. */
+    if (const char* ts = getenv("PS3RECOMP_TIMERSLACK_NS"))
+        if (atol(ts) > 0) prctl(PR_SET_TIMERSLACK, (unsigned long)atol(ts), 0, 0, 0);
 #endif
 
     /* Translated guest shaders kept on disk (rsx_shader_spirv.cpp's cache:
@@ -545,6 +564,19 @@ int main(int argc, char** argv)
             setenv("PS3RECOMP_SPIRV_CACHE", cache.c_str(), 1);
 #endif
         }
+    }
+    /* The NVIDIA driver's own pipeline disk cache stops keeping new entries
+     * at its default size limit, which a few builds of this port fill: every
+     * run then compiled each race pipeline again on the FIFO thread
+     * (libnvidia-gpucomp ~6% of its time in pack racing; 0.7% once the cache
+     * may grow). Give it room unless the user set a size. Other drivers
+     * ignore these variables. */
+    if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) {
+#ifdef _WIN32
+        _putenv_s("__GL_SHADER_DISK_CACHE_SIZE", "10737418240");
+#else
+        setenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240", 0);
+#endif
     }
 
     if (!alloc_guest_vm()) {
