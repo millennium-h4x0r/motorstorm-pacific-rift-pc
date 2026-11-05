@@ -120,6 +120,7 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
+void*    cellGcm_fifo_kick_event(void);   /* set when a guest ref poll finds nothing left to publish */
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
 }
@@ -265,7 +266,24 @@ static DWORD WINAPI frame_clock(LPVOID)
             unsigned long long now0 = mono_ns();
             unsigned long long wake = now0 + poll_ns;
             if (next_tick > now0 && next_tick < wake) wake = next_tick;
-            if (wake > now0) {
+            /* A guest polling the RSX reference with nothing left to publish
+             * (cellGcm_ref_on_poll: main's func_0072E1E0 ref wait) sets the
+             * FIFO kick event: wake on it instead of finishing the poll
+             * interval, so the drain reaches the fence the guest waits for.
+             * The event wait has 1 ms granularity, so the stretch before a
+             * vblank tick still sleeps on the precise clock.
+             * Opt-in (PS3RECOMP_FIFO_KICK=1): the race's ref wait is already
+             * <0.3 ms/frame and the A/B was neutral (50.5 vs 52.0 fps). */
+            static int kick_on = -1;
+            static HANDLE kick_ev = NULL;
+            if (kick_on < 0) {
+                const char* e = getenv("PS3RECOMP_FIFO_KICK");
+                kick_on = (e && *e == '1');
+                if (kick_on) kick_ev = (HANDLE)cellGcm_fifo_kick_event();
+            }
+            if (kick_ev && wake >= now0 + 1000000ull) {
+                WaitForSingleObject(kick_ev, 1);
+            } else if (wake > now0) {
                 struct timespec d = { (time_t)(wake / 1000000000ull), (long)(wake % 1000000000ull) };
                 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
             }

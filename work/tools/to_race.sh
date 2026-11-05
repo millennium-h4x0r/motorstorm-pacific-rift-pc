@@ -83,5 +83,5 @@ sleep 6
 # Flyover "Press X to Skip": two presses, the first can land during a fade
 press 0x4000 6; press 0x4000 6
 ffmpeg -loglevel error -y -i "$F" -vf scale=640:-1 "$D/now.png"
-echo "to_race: in race ($D/now.png). Hold accelerate with: echo '0x0200 100000' > $D/pad.txt"
+echo "to_race: in race ($D/now.png). Hold accelerate with short refreshed holds, e.g. every 4 s: echo '0x0200 300' > $D/pad.txt (a long hold blocks later presses until it expires; see finish_race.sh)"
 exit 0
