@@ -105,6 +105,8 @@ Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `wor
     TIMEOUT=120 INST=base BIN=work/port/build/PacificRiftRecomp work/run.sh >/dev/null &
     INST=exp work/tools/pad.sh cross 3      # -> work/inst/exp/now.png
 
+PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the mask for that many pad reports (default 40), and the file is read again only after the hold has run out. A long hold such as `0x0200 100000` therefore swallows every later press for about half an hour, and a `0` mask is not a release. To keep a button held while still being able to send menu input, rewrite a short hold periodically (`echo "0x0200 300" > pad.txt` every ~4 s) and let the last one drain (~5 s) before the next press. `work/tools/finish_race.sh` does this. It is also why the post-race replay can look hung: START brings back the results, X continues, and Retry Race / Quit Race appears a few seconds later.
+
 `perf` isn't installed. As a sampling profiler, run gdb `thread apply all bt 1` in a loop and count the top frames.
 
 ## Performance
