@@ -564,6 +564,17 @@ int main(int argc, char** argv)
      * its wait there drops ~1.6 -> 0.7 ms/frame (runtime/syscalls/sys_timer.c).
      * PS3_USLEEP_SPIN_MAX=0 turns it off. */
     setenv("PS3_USLEEP_SPIN_MAX", "20", 0);
+    /* JobBatchHandler (PPU thread, loop func_004AF670) polls its WWS job
+     * batches with usleep(200) at lr 0x004AF6D0: each pass releases finished
+     * batches, which main waits for (func_0094CC80, ~6 ms/frame), and submits
+     * the next ones (cellSpursReadyCountStore). On Linux that sleep lasts
+     * ~250 us, and the poll period sat on the critical path twice per batch.
+     * Cap it at 50 us: race ~51 -> ~59 fps, main/FIFO/job CPU per frame all
+     * down. Waking the poll on job completion instead (PS3_USLEEP_WAKE) and
+     * waking main's back-off on the poller's pass (PS3_USLEEP_PASSWAKE) both
+     * measured below the cap (sys_timer.c). PS3_USLEEP_CAP= (empty) restores
+     * the 200 us poll. */
+    setenv("PS3_USLEEP_CAP", "4af6d0:50", 0);
 #endif
 
     /* Translated guest shaders kept on disk (rsx_shader_spirv.cpp's cache:
