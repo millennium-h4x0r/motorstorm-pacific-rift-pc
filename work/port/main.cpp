@@ -46,9 +46,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>     /* clock_gettime: PS3RECOMP_FLIPLOG */
-#ifndef _WIN32
-#include <sys/prctl.h>   /* PR_SET_TIMERSLACK: PS3RECOMP_TIMERSLACK_NS */
-#endif
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: PRESENT spans */
 #include <string>
 #ifdef _WIN32
@@ -528,12 +525,18 @@ int main(int argc, char** argv)
      * +5-8 fps. Draws it cannot take keep the CPU fetch.
      * PS3RECOMP_ENG_GPUFETCH=0 restores the CPU fetch everywhere. */
     setenv("PS3RECOMP_ENG_GPUFETCH", "1", 0);
-    /* PS3RECOMP_TIMERSLACK_NS=<ns>: the kernel's timer slack for this thread
-     * and every thread created after it (default 50 us). The race's main
-     * thread polls a Havok lock with usleep(1) back-offs (func_00A499F8 and
-     * friends) and each one sleeps ~55 us on the host instead of ~1 us. */
-    if (const char* ts = getenv("PS3RECOMP_TIMERSLACK_NS"))
-        if (atol(ts) > 0) prctl(PR_SET_TIMERSLACK, (unsigned long)atol(ts), 0, 0, 0);
+    /* SPURS tasks (Havok creates ~20 a race frame from the main thread) run
+     * on a persistent pool of big-stack threads instead of a pthread_create
+     * each: ~1 ms/frame of main-thread time, and no fell-into-slow-mode
+     * rounds in the A/B (runtime/spu/spu_workload.c). SPU_ASYNC_POOL=0 restores
+     * a thread per task. */
+    setenv("SPU_ASYNC_POOL", "1", 0);
+    /* A guest usleep of at most 20 us yields to its deadline instead of a
+     * nanosleep, which lasts ~55 us on Linux (timer slack). Main polls a
+     * cellSync mutex shared with Havok's SPU tasks with usleep(1) back-offs;
+     * its wait there drops ~1.6 -> 0.7 ms/frame (runtime/syscalls/sys_timer.c).
+     * PS3_USLEEP_SPIN_MAX=0 turns it off. */
+    setenv("PS3_USLEEP_SPIN_MAX", "20", 0);
 #endif
 
     /* Translated guest shaders kept on disk (rsx_shader_spirv.cpp's cache:
