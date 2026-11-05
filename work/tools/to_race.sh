@@ -56,11 +56,14 @@ done
 [ $ok = 1 ] || fail "main menu not reached"
 sleep 2
 # Cursor onto WRECKREATION (highlight row ~206-218), then enter
-for k in 1 2 3 4; do p=$(probe peak); [ "$p" -ge 206 ] && [ "$p" -le 218 ] && break; press 0x0040 3 4; done
+# (peak 0 = no highlight visible right now, e.g. a menu transition: look again instead of pressing)
+for k in $(seq 1 10); do p=$(probe peak); [ "$p" -ge 206 ] && [ "$p" -le 218 ] && break
+    if [ "$p" = 0 ]; then sleep 1; else press 0x0040 3 4; fi; done
 p=$(probe peak); [ "$p" -ge 206 ] && [ "$p" -le 218 ] || fail "Wreckreation not selected (peak $p)"
 press 0x4000 7
 # Wreckreation submenu: ONLINE is lit (~194-200); move down to FREE-PLAY (~207-220)
-for k in 1 2 3 4; do p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] && break; press 0x0040 3 4; done
+for k in $(seq 1 10); do p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] && break
+    if [ "$p" = 0 ]; then sleep 1; else press 0x0040 3 4; fi; done
 p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] || fail "Free-Play not selected (peak $p)"
 # Free-Play -> game setup -> opponent setup (start race) -> vehicle select -> pick the bike
 press 0x4000 6; press 0x4000 6; press 0x4000 7; press 0x4000 3

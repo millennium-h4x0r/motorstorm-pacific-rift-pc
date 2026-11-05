@@ -158,3 +158,12 @@ Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `wor
   - `VK_BE_PROFILE=1` prints the CPU time per engine hook every 2 s. New optional hooks `readback_async`/`readback_fetch` exist for the small-target writeback.
   - Race: about 33-36 fps, with the FIFO thread at about 52% CPU and about 40% waiting on the GPU (the per-frame small-target sync).
 - The game ignores SIGINT. Stop test instances with SIGKILL, or they keep running and steal each other's pad-file presses.
+
+## Profiling a thread
+
+`work/tools/tsample` samples one thread's user-space IP at a fixed rate
+(perf_event_open task clock, works unprivileged) and `tsym.py` turns the
+samples into a per-function histogram against the executable. See its
+README. A solo race profile of the main thread (2026-11-05): 53% lifted game
+code (incl. 7% job-counter spin), 15% out-of-line VMX float helpers, 4% PPU
+store coherence, 3% indirect-call dispatch, 2.4% HLE/syscalls.
