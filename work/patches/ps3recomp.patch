@@ -301,6 +301,66 @@ index 02b751b2..d51cfd8b 100644
      }
  
      printf("[cellAudio] Mixing thread stopped\n");
+diff --git a/libs/audio/tests/test_audio_ring.c b/libs/audio/tests/test_audio_ring.c
+index b6252c94..5f2b36dc 100644
+--- a/libs/audio/tests/test_audio_ring.c
++++ b/libs/audio/tests/test_audio_ring.c
+@@ -14,6 +14,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/audio/tests/test_voice_port_control.c b/libs/audio/tests/test_voice_port_control.c
+index b26b2d77..7990bfc8 100644
+--- a/libs/audio/tests/test_voice_port_control.c
++++ b/libs/audio/tests/test_voice_port_control.c
+@@ -26,6 +26,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/codec/tests/test_cellAtrac.c b/libs/codec/tests/test_cellAtrac.c
+index 8cfd2ec0..a286f542 100644
+--- a/libs/codec/tests/test_cellAtrac.c
++++ b/libs/codec/tests/test_cellAtrac.c
+@@ -35,6 +35,7 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ 
+ enum { MEM = 64u << 20, H = 0x100, WORK = 0x200, OUT = 0x10000, ARGS = 0x20,
+        FILE_EA = 0x100000 };
+diff --git a/libs/codec/tests/test_vdec_decode.c b/libs/codec/tests/test_vdec_decode.c
+index 2f781d1e..52759c04 100644
+--- a/libs/codec/tests/test_vdec_decode.c
++++ b/libs/codec/tests/test_vdec_decode.c
+@@ -47,6 +47,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/filesystem/tests/test_edat_guest_klicensee_np.c b/libs/filesystem/tests/test_edat_guest_klicensee_np.c
+index c710fbc3..aca15a37 100644
+--- a/libs/filesystem/tests/test_edat_guest_klicensee_np.c
++++ b/libs/filesystem/tests/test_edat_guest_klicensee_np.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ int np_psnr_enabled(void) { return 0; }
 diff --git a/libs/font/cellFont.c b/libs/font/cellFont.c
 index 4e239b55..c82b1c29 100644
 --- a/libs/font/cellFont.c
@@ -2112,10 +2172,10 @@ index 6a107a2f..4c720fc9 100644
  }
 diff --git a/libs/font/tests/test_cellfont.c b/libs/font/tests/test_cellfont.c
 new file mode 100644
-index 00000000..f72f6e8c
+index 00000000..6a0b8139
 --- /dev/null
 +++ b/libs/font/tests/test_cellfont.c
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,269 @@
 +/*
 + * ps3recomp - cellFont HLE test: guest struct layouts, allocator callbacks,
 + * the f1/f2 ctx handlers and real glyph rendering.
@@ -2153,6 +2213,7 @@ index 00000000..f72f6e8c
 +int g_spu_coh_armed;   /* 0: no SPU reservations, so the coherency paths stay cold */
 +int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 +void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
 +void spu_coh_notify_write_from_ppu(uint32_t a) { (void)a; }
 +void spu_lockline_lock(void) {}
 +void spu_lockline_unlock(void) {}
@@ -2477,6 +2538,54 @@ index afdd93de..fef1613c 100644
      }  /* end connected block */
  
  emit:
+diff --git a/libs/input/tests/test_pad_file_reports.c b/libs/input/tests/test_pad_file_reports.c
+index edc7f523..7a28117a 100644
+--- a/libs/input/tests/test_pad_file_reports.c
++++ b/libs/input/tests/test_pad_file_reports.c
+@@ -20,6 +20,7 @@ void ppu_resv_break_store(uint64_t a){(void)a;}
+ void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
+ int spu_coh_is_reserved(uint32_t a){(void)a;return 0;}
+ void spu_coh_notify_write(uint32_t a){(void)a;}
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void){}
+ void spu_lockline_unlock(void){}
+ u32 cellGcm_flip_request_count(void){return 0;}
+diff --git a/libs/input/tests/test_pad_hotplug.c b/libs/input/tests/test_pad_hotplug.c
+index 6903c4cd..9a377331 100644
+--- a/libs/input/tests/test_pad_hotplug.c
++++ b/libs/input/tests/test_pad_hotplug.c
+@@ -26,6 +26,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips */
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/input/tests/test_pad_rumble.c b/libs/input/tests/test_pad_rumble.c
+index b5dec8a6..4e427ecf 100644
+--- a/libs/input/tests/test_pad_rumble.c
++++ b/libs/input/tests/test_pad_rumble.c
+@@ -20,6 +20,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips (#344) */
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/input/tests/test_pad_sensor_mode.c b/libs/input/tests/test_pad_sensor_mode.c
+index 2889ff76..a736fc0f 100644
+--- a/libs/input/tests/test_pad_sensor_mode.c
++++ b/libs/input/tests/test_pad_sensor_mode.c
+@@ -20,6 +20,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ u32 cellGcm_flip_request_count(void) { return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
 diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
 index 2ab88b8e..cad0afb9 100644
 --- a/libs/misc/cellAvconfExt.c
@@ -2642,6 +2751,150 @@ index 9ab90ee1..d3c697c4 100644
  typedef struct CellAudioOutConfiguration {
      u8  channel;
      u8  encoder;
+diff --git a/libs/misc/tests/test_avconf_gamma.c b/libs/misc/tests/test_avconf_gamma.c
+index bea806d0..0ae21228 100644
+--- a/libs/misc/tests/test_avconf_gamma.c
++++ b/libs/misc/tests/test_avconf_gamma.c
+@@ -22,6 +22,7 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+ 
+ static uint32_t s_nid;
+diff --git a/libs/network/tests/test_http_response_getters.c b/libs/network/tests/test_http_response_getters.c
+index 8f82e95d..e245a972 100644
+--- a/libs/network/tests/test_http_response_getters.c
++++ b/libs/network/tests/test_http_response_getters.c
+@@ -32,6 +32,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/network/tests/test_http_uri_path.c b/libs/network/tests/test_http_uri_path.c
+index 8bf8384f..1948aae9 100644
+--- a/libs/network/tests/test_http_uri_path.c
++++ b/libs/network/tests/test_http_uri_path.c
+@@ -26,6 +26,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/network/tests/test_netctl_netstart.c b/libs/network/tests/test_netctl_netstart.c
+index 3d6bdef3..d62e9743 100644
+--- a/libs/network/tests/test_netctl_netstart.c
++++ b/libs/network/tests/test_netctl_netstart.c
+@@ -20,6 +20,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/network/tests/test_np_basic_after_np_init_np.c b/libs/network/tests/test_np_basic_after_np_init_np.c
+index 62cd594c..e22f2e8e 100644
+--- a/libs/network/tests/test_np_basic_after_np_init_np.c
++++ b/libs/network/tests/test_np_basic_after_np_init_np.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ int np_psnr_enabled(void) { return 0; }
+diff --git a/libs/network/tests/test_np_commerce2.c b/libs/network/tests/test_np_commerce2.c
+index e5a13410..67e83e5c 100644
+--- a/libs/network/tests/test_np_commerce2.c
++++ b/libs/network/tests/test_np_commerce2.c
+@@ -23,6 +23,7 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+ 
+ typedef int32_t (*create_ctx5_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+diff --git a/libs/network/tests/test_np_manager_offline.c b/libs/network/tests/test_np_manager_offline.c
+index 5a39ee5c..af2d1222 100644
+--- a/libs/network/tests/test_np_manager_offline.c
++++ b/libs/network/tests/test_np_manager_offline.c
+@@ -19,6 +19,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ static int s_psnr;
+diff --git a/libs/network/tests/test_np_matching2.c b/libs/network/tests/test_np_matching2.c
+index a1354be2..59203af5 100644
+--- a/libs/network/tests/test_np_matching2.c
++++ b/libs/network/tests/test_np_matching2.c
+@@ -24,6 +24,7 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+ 
+ /* sceNp */
+diff --git a/libs/network/tests/test_score_init.c b/libs/network/tests/test_score_init.c
+index 9656b4eb..7e852415 100644
+--- a/libs/network/tests/test_score_init.c
++++ b/libs/network/tests/test_score_init.c
+@@ -12,6 +12,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ /* sceNp.c reports ONLINE and queues its manager callback through these. */
+diff --git a/libs/network/tests/test_sys_net.c b/libs/network/tests/test_sys_net.c
+index e9f78886..7359eef0 100644
+--- a/libs/network/tests/test_sys_net.c
++++ b/libs/network/tests/test_sys_net.c
+@@ -23,6 +23,7 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+ static uint16_t s_p2p_port = 36658;
+ uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
+diff --git a/libs/network/tests/test_trophy_registration.c b/libs/network/tests/test_trophy_registration.c
+index cdbee09e..b7fefc3e 100644
+--- a/libs/network/tests/test_trophy_registration.c
++++ b/libs/network/tests/test_trophy_registration.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+diff --git a/libs/network/tests/test_trophy_start.c b/libs/network/tests/test_trophy_start.c
+index 3dcd91d5..d0587369 100644
+--- a/libs/network/tests/test_trophy_start.c
++++ b/libs/network/tests/test_trophy_start.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ int main(void)
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index 82ea66c6..503e7432 100644
 --- a/libs/spurs/cellSpurs.c
@@ -3123,6 +3376,150 @@ index 07a3d2e4..75b05941 100644
  
  s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
  s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+diff --git a/libs/system/tests/test_dialog_abort.c b/libs/system/tests/test_dialog_abort.c
+index 75d488e4..cda57529 100644
+--- a/libs/system/tests/test_dialog_abort.c
++++ b/libs/system/tests/test_dialog_abort.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+diff --git a/libs/system/tests/test_dialog_callbacks.c b/libs/system/tests/test_dialog_callbacks.c
+index 51547699..438115c2 100644
+--- a/libs/system/tests/test_dialog_callbacks.c
++++ b/libs/system/tests/test_dialog_callbacks.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+diff --git a/libs/system/tests/test_game_category.c b/libs/system/tests/test_game_category.c
+index 5bf84c74..9511bd94 100644
+--- a/libs/system/tests/test_game_category.c
++++ b/libs/system/tests/test_game_category.c
+@@ -15,6 +15,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_game_paths.c b/libs/system/tests/test_game_paths.c
+index b46bc4f7..47fd97ea 100644
+--- a/libs/system/tests/test_game_paths.c
++++ b/libs/system/tests/test_game_paths.c
+@@ -11,6 +11,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_game_space.c b/libs/system/tests/test_game_space.c
+index 97ac987d..ac51025b 100644
+--- a/libs/system/tests/test_game_space.c
++++ b/libs/system/tests/test_game_space.c
+@@ -29,6 +29,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_license_area.c b/libs/system/tests/test_license_area.c
+index 84ab8c3e..8def62c7 100644
+--- a/libs/system/tests/test_license_area.c
++++ b/libs/system/tests/test_license_area.c
+@@ -13,6 +13,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+diff --git a/libs/system/tests/test_savedata_fixed.c b/libs/system/tests/test_savedata_fixed.c
+index c6bdb67d..245a1070 100644
+--- a/libs/system/tests/test_savedata_fixed.c
++++ b/libs/system/tests/test_savedata_fixed.c
+@@ -10,6 +10,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_savedata_io.c b/libs/system/tests/test_savedata_io.c
+index d5925e12..5e4c1e06 100644
+--- a/libs/system/tests/test_savedata_io.c
++++ b/libs/system/tests/test_savedata_io.c
+@@ -10,6 +10,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_savedata_param_sfo.c b/libs/system/tests/test_savedata_param_sfo.c
+index 3c3b3ef5..4584859f 100644
+--- a/libs/system/tests/test_savedata_param_sfo.c
++++ b/libs/system/tests/test_savedata_param_sfo.c
+@@ -29,6 +29,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_savedata_root.c b/libs/system/tests/test_savedata_root.c
+index f8ee047f..8e704776 100644
+--- a/libs/system/tests/test_savedata_root.c
++++ b/libs/system/tests/test_savedata_root.c
+@@ -10,6 +10,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
+diff --git a/libs/system/tests/test_savedata_user_autosave.c b/libs/system/tests/test_savedata_user_autosave.c
+index b1972b11..4a1d782f 100644
+--- a/libs/system/tests/test_savedata_user_autosave.c
++++ b/libs/system/tests/test_savedata_user_autosave.c
+@@ -19,6 +19,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+diff --git a/libs/system/tests/test_sysconf.c b/libs/system/tests/test_sysconf.c
+index 500a1355..c4bdc7a8 100644
+--- a/libs/system/tests/test_sysconf.c
++++ b/libs/system/tests/test_sysconf.c
+@@ -15,6 +15,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index 298ee7de..880e03a1 100644
 --- a/libs/video/cellGcmSys.c
@@ -6056,7 +6453,7 @@ index 00000000..c4705297
 +
 +#endif
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302e..163b15d2 100644
+index db64302e..885925b5 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -42,6 +42,7 @@
@@ -6078,7 +6475,128 @@ index db64302e..163b15d2 100644
  
  #include <dlfcn.h>
  #include <pthread.h>
-@@ -446,6 +451,12 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
+@@ -140,6 +145,8 @@ typedef struct vk_image {
+     VkImage        img;
+     VkDeviceMemory mem;
+     VkImageView    view;
++    int            sub_blk;        /* >0: memory is a range of s_suballoc block sub_blk-1, not owned */
++    VkDeviceSize   sub_off, sub_size;
+ } vk_image;
+ 
+ #define VK_SAMPLER_CACHE 32
+@@ -407,6 +414,88 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
+     return -1;
+ }
+ 
++/* Device-local image memory sub-allocated from 64 MB blocks (VK_SUBALLOC,
++ * default on). The race creates render targets and copies at sizes that
++ * follow the game's dynamic resolution, so the recycling pools miss and each
++ * new image cost a vkAllocateMemory/vkFreeMemory pair of kernel ioctls
++ * (~16% of the FIFO thread). Only optimal-tiling images live in these blocks,
++ * so buffer/image granularity never applies. First fit, ranges merged on free. */
++enum { VK_SUB_BLOCKS = 32, VK_SUB_RANGES = 512 };
++#define VK_SUB_BLOCK_BYTES (64ull << 20)
++typedef struct { VkDeviceSize off, size; } vk_sub_range;
++static struct { VkDeviceMemory mem; u32 type; VkDeviceSize size; u32 nfree; vk_sub_range fr[VK_SUB_RANGES]; } s_suballoc[VK_SUB_BLOCKS];
++static int vk_suballoc_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("VK_SUBALLOC"); on = !(e && *e == '0'); }
++    return on;
++}
++static int vk_sub_take(u32 b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize* off)
++{
++    for (u32 i = 0; i < s_suballoc[b].nfree; i++) {
++        vk_sub_range* r = &s_suballoc[b].fr[i];
++        const VkDeviceSize a = (r->off + align - 1) / align * align;
++        if (a + size > r->off + r->size) continue;
++        const VkDeviceSize head = a - r->off, tail = r->off + r->size - (a + size);
++        if (head && tail) {                      /* split in two */
++            if (s_suballoc[b].nfree == VK_SUB_RANGES) continue;
++            memmove(&s_suballoc[b].fr[i + 2], &s_suballoc[b].fr[i + 1], (s_suballoc[b].nfree - i - 1) * sizeof *r);
++            s_suballoc[b].nfree++;
++            s_suballoc[b].fr[i + 1].off = a + size; s_suballoc[b].fr[i + 1].size = tail;
++            r->size = head;
++        } else if (head) { r->size = head; }
++        else if (tail)   { r->off = a + size; r->size = tail; }
++        else { memmove(r, r + 1, (s_suballoc[b].nfree - i - 1) * sizeof *r); s_suballoc[b].nfree--; }
++        *off = a;
++        return 1;
++    }
++    return 0;
++}
++static int vk_sub_alloc(u32 type, VkDeviceSize size, VkDeviceSize align, int* blk, VkDeviceSize* off, VkDeviceMemory* mem)
++{
++    if (size > VK_SUB_BLOCK_BYTES / 4) return 0;       /* big images keep their own allocation */
++    for (u32 b = 0; b < VK_SUB_BLOCKS; b++)
++        if (s_suballoc[b].mem && s_suballoc[b].type == type && vk_sub_take(b, size, align, off)) {
++            *blk = (int)b + 1; *mem = s_suballoc[b].mem; return 1;
++        }
++    for (u32 b = 0; b < VK_SUB_BLOCKS; b++) {
++        if (s_suballoc[b].mem) continue;
++        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++                                     .allocationSize = VK_SUB_BLOCK_BYTES, .memoryTypeIndex = type };
++        if (pvkAllocateMemory(s_vk.device, &mai, NULL, &s_suballoc[b].mem) != VK_SUCCESS) {
++            s_suballoc[b].mem = VK_NULL_HANDLE; return 0;
++        }
++        s_suballoc[b].type = type; s_suballoc[b].size = VK_SUB_BLOCK_BYTES;
++        s_suballoc[b].nfree = 1; s_suballoc[b].fr[0].off = 0; s_suballoc[b].fr[0].size = VK_SUB_BLOCK_BYTES;
++        if (!vk_sub_take(b, size, align, off)) return 0;
++        *blk = (int)b + 1; *mem = s_suballoc[b].mem; return 1;
++    }
++    return 0;
++}
++static void vk_sub_free(int blk, VkDeviceSize off, VkDeviceSize size)
++{
++    if (blk <= 0 || blk > VK_SUB_BLOCKS || !size) return;
++    const u32 b = (u32)blk - 1;
++    u32 i = 0;
++    while (i < s_suballoc[b].nfree && s_suballoc[b].fr[i].off < off) i++;
++    /* merge with the previous and/or next free range */
++    int mprev = i > 0 && s_suballoc[b].fr[i - 1].off + s_suballoc[b].fr[i - 1].size == off;
++    int mnext = i < s_suballoc[b].nfree && off + size == s_suballoc[b].fr[i].off;
++    if (mprev && mnext) {
++        s_suballoc[b].fr[i - 1].size += size + s_suballoc[b].fr[i].size;
++        memmove(&s_suballoc[b].fr[i], &s_suballoc[b].fr[i + 1], (s_suballoc[b].nfree - i - 1) * sizeof(vk_sub_range));
++        s_suballoc[b].nfree--;
++    } else if (mprev) {
++        s_suballoc[b].fr[i - 1].size += size;
++    } else if (mnext) {
++        s_suballoc[b].fr[i].off = off; s_suballoc[b].fr[i].size += size;
++    } else if (s_suballoc[b].nfree < VK_SUB_RANGES) {
++        memmove(&s_suballoc[b].fr[i + 1], &s_suballoc[b].fr[i], (s_suballoc[b].nfree - i) * sizeof(vk_sub_range));
++        s_suballoc[b].fr[i].off = off; s_suballoc[b].fr[i].size = size;
++        s_suballoc[b].nfree++;
++    }   /* else: leak the range (table full), never a double use */
++}
++
+ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                   VkImageUsageFlags usage, VkImageAspectFlags aspect)
+ {
+@@ -426,10 +515,18 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32
+         vk_find_memory_type(req.memoryTypeBits, 0, &type)) {
+         VK_LOG("no memory type for an image\n"); return -1;
+     }
+-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-                                 .allocationSize = req.size, .memoryTypeIndex = type };
+-    VK_CHECK(pvkAllocateMemory(s_vk.device, &mai, NULL, &im->mem), "vkAllocateMemory(image)");
+-    VK_CHECK(pvkBindImageMemory(s_vk.device, im->img, im->mem, 0), "vkBindImageMemory");
++    im->sub_blk = 0; im->sub_off = 0; im->sub_size = 0;
++    if (vk_suballoc_on() &&
++        vk_sub_alloc(type, req.size, req.alignment ? req.alignment : 256, &im->sub_blk, &im->sub_off, &im->mem)) {
++        im->sub_size = req.size;
++        VK_CHECK(pvkBindImageMemory(s_vk.device, im->img, im->mem, im->sub_off), "vkBindImageMemory(sub)");
++    } else {
++        im->sub_blk = 0;
++        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++                                     .allocationSize = req.size, .memoryTypeIndex = type };
++        VK_CHECK(pvkAllocateMemory(s_vk.device, &mai, NULL, &im->mem), "vkAllocateMemory(image)");
++        VK_CHECK(pvkBindImageMemory(s_vk.device, im->img, im->mem, 0), "vkBindImageMemory");
++    }
+     VkImageViewCreateInfo vci = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img,
+         .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+@@ -446,6 +543,12 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
  }
  
  static void vk_present_wait_gpu(void);
@@ -6091,7 +6609,7 @@ index db64302e..163b15d2 100644
  
  /* VK_DRAW_BATCH (vk_eng_draw): draws recorded into s_vk.cmd and not yet
   * submitted. Anything that records other work, destroys an object or reads
-@@ -453,16 +464,88 @@ static void vk_present_wait_gpu(void);
+@@ -453,21 +556,96 @@ static void vk_present_wait_gpu(void);
   * all earlier work has completed. */
  static u32 s_eb_pending;
  static void vk_eng_flush(void);
@@ -6118,7 +6636,7 @@ index db64302e..163b15d2 100644
 + * the batch being recorded and are destroyed once that batch's fence has
 + * signalled (vk_eb_wait_inflight / vk_eng_flush). */
 +enum { VK_DEFER_IMAGE = 1, VK_DEFER_BUFFER, VK_DEFER_FB };
-+typedef struct { int kind; VkImageView view; VkImage img; VkBuffer buf; VkDeviceMemory mem; int mapped; VkFramebuffer fb; } vk_deferred;
++typedef struct { int kind; VkImageView view; VkImage img; VkBuffer buf; VkDeviceMemory mem; int mapped; VkFramebuffer fb; int sub_blk; VkDeviceSize sub_off, sub_size; } vk_deferred;
 +static struct { vk_deferred* v; u32 n, cap; } s_defer_cur, s_defer_inflight;
 +static int vk_defer_on(void)
 +{
@@ -6146,7 +6664,8 @@ index db64302e..163b15d2 100644
 +            if (d->img && !waited) { vk_present_wait_gpu(); waited = 1; }   /* never under a present's copy */
 +            if (d->view) pvkDestroyImageView(s_vk.device, d->view, NULL);
 +            if (d->img)  pvkDestroyImage(s_vk.device, d->img, NULL);
-+            if (d->mem)  pvkFreeMemory(s_vk.device, d->mem, NULL);
++            if (d->sub_blk) vk_sub_free(d->sub_blk, d->sub_off, d->sub_size);
++            else if (d->mem) pvkFreeMemory(s_vk.device, d->mem, NULL);
 +        } else if (d->kind == VK_DEFER_BUFFER) {
 +            if (d->mapped) pvkUnmapMemory(s_vk.device, d->mem);
 +            if (d->buf) pvkDestroyBuffer(s_vk.device, d->buf, NULL);
@@ -6171,7 +6690,8 @@ index db64302e..163b15d2 100644
 -    if (s_eb_pending) vk_eng_flush();
 +    if (vk_eb_busy() && vk_defer_on()) {
 +        if (im->view || im->img || im->mem) {
-+            vk_deferred d = { .kind = VK_DEFER_IMAGE, .view = im->view, .img = im->img, .mem = im->mem };
++            vk_deferred d = { .kind = VK_DEFER_IMAGE, .view = im->view, .img = im->img, .mem = im->mem,
++                              .sub_blk = im->sub_blk, .sub_off = im->sub_off, .sub_size = im->sub_size };
 +            vk_defer_push(&d);
 +        }
 +        memset(im, 0, sizeof *im);
@@ -6181,7 +6701,14 @@ index db64302e..163b15d2 100644
      /* Never under a present's copy that may still read it. */
      if (im->img) vk_present_wait_gpu();
      if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
-@@ -525,7 +608,15 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
+     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
++    if (im->sub_blk) vk_sub_free(im->sub_blk, im->sub_off, im->sub_size);
++    else if (im->mem) pvkFreeMemory(s_vk.device, im->mem, NULL);
+     memset(im, 0, sizeof *im);
+ }
+ 
+@@ -525,7 +703,15 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
  
  static void vk_destroy_buffer(vk_buffer* b)
  {
@@ -6198,7 +6725,7 @@ index db64302e..163b15d2 100644
      if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
      if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
      if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
-@@ -584,9 +675,27 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
+@@ -584,9 +770,27 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
  }
  
@@ -6227,7 +6754,7 @@ index db64302e..163b15d2 100644
      VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
      VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-@@ -598,6 +707,32 @@ static int vk_begin(void)
+@@ -598,6 +802,32 @@ static int vk_begin(void)
      return 0;
  }
  
@@ -6260,7 +6787,7 @@ index db64302e..163b15d2 100644
  static int vk_submit_and_wait(void)
  {
      VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
-@@ -605,7 +740,11 @@ static int vk_submit_and_wait(void)
+@@ -605,7 +835,11 @@ static int vk_submit_and_wait(void)
                          .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
      VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
      VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
@@ -6272,7 +6799,7 @@ index db64302e..163b15d2 100644
      return 0;
  }
  
-@@ -1714,11 +1853,18 @@ static int vk_env_on(const char* name)
+@@ -1714,11 +1948,18 @@ static int vk_env_on(const char* name)
      return v && v[0] && v[0] != '0';
  }
  
@@ -6291,7 +6818,7 @@ index db64302e..163b15d2 100644
          for (u32 i = 0; i < 8; i++)
              if (s_vk.sc_done[i]) {
                  pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
-@@ -1845,8 +1991,15 @@ static int vk_create_swapchain(void)
+@@ -1845,8 +2086,15 @@ static int vk_create_swapchain(void)
          .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
          .clipped = VK_TRUE, .oldSwapchain = old,
      };
@@ -6307,7 +6834,7 @@ index db64302e..163b15d2 100644
      if (old) pvkDestroySwapchainKHR(s_vk.device, old, NULL);
      s_vk.swapchain = VK_NULL_HANDLE;
      if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
-@@ -1868,6 +2021,10 @@ static int vk_create_swapchain(void)
+@@ -1868,6 +2116,10 @@ static int vk_create_swapchain(void)
  
      s_vk.sc_extent = ext;
      s_vk.sc_count = n;
@@ -6318,7 +6845,7 @@ index db64302e..163b15d2 100644
      VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
      return 0;
  }
-@@ -1922,6 +2079,10 @@ static void vk_present_window(void)
+@@ -1922,6 +2174,10 @@ static void vk_present_window(void)
      b.dstAccessMask = 0;
      b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
      b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -6329,7 +6856,7 @@ index db64302e..163b15d2 100644
      pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                            0, 0, NULL, 0, NULL, 1, &b);
      if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
-@@ -2092,12 +2253,61 @@ typedef struct vk_eng_obj {
+@@ -2092,12 +2348,64 @@ typedef struct vk_eng_obj {
      u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
      u8       snapshot;               /* COLOR: a feedback copy, never a target */
      u32      mips;                   /* TEXTURE: levels the image was created with */
@@ -6345,6 +6872,7 @@ index db64302e..163b15d2 100644
 +enum { VK_IPOOL_N = 48 };
 +static struct { vk_image im; VkFormat fmt; u32 w, h, usage; } s_ipool[VK_IPOOL_N];
 +static u32 s_ipool_n;
++static unsigned long long s_ipool_hit, s_ipool_miss, s_snap_hit, s_snap_miss;
 +static void vk_destroy_image(vk_image* im);
 +static int vk_ipool_on(void)
 +{
@@ -6360,8 +6888,10 @@ index db64302e..163b15d2 100644
 +            *im = s_ipool[i].im;
 +            memmove(&s_ipool[i], &s_ipool[i + 1], (s_ipool_n - i - 1) * sizeof s_ipool[0]);
 +            s_ipool_n--;
++            s_ipool_hit++;
 +            return 1;
 +        }
++    s_ipool_miss++;
 +    return 0;
 +}
 +static void vk_ipool_put(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 usage)
@@ -6391,7 +6921,7 @@ index db64302e..163b15d2 100644
  static void vk_eng2_shutdown(void* user);
  
  static struct {
-@@ -2288,8 +2498,12 @@ static void vk_eng_release(void* user, u32 handle)
+@@ -2288,8 +2596,12 @@ static void vk_eng_release(void* user, u32 handle)
          return;
      }
      if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
@@ -6406,7 +6936,7 @@ index db64302e..163b15d2 100644
      memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
  }
  
-@@ -2308,7 +2522,7 @@ static void vk_eng_shutdown(void* user)
+@@ -2308,7 +2620,7 @@ static void vk_eng_shutdown(void* user)
  static void vk_eng_submit_and_wait(void* user, u32 reason)
  {
      (void)user; (void)reason;      /* every other submission has already completed */
@@ -6415,7 +6945,7 @@ index db64302e..163b15d2 100644
  }
  
  static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
-@@ -2325,21 +2539,30 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32
+@@ -2325,21 +2637,30 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32
      const u32 hd = vk_eng_alloc();
      if (!hd) return 0;
      vk_eng_obj* o = &s_eobj[hd];
@@ -6454,7 +6984,7 @@ index db64302e..163b15d2 100644
      if (seed && seed_row_bytes)
          vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
      return hd;
-@@ -2389,8 +2612,9 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
+@@ -2389,8 +2710,9 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
                         (u32)(rgba[2] * 255.0f + 0.5f);
      vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
      if (!o) return;
@@ -6466,7 +6996,7 @@ index db64302e..163b15d2 100644
      VkClearColorValue v;
      memcpy(v.float32, rgba, sizeof v.float32);
      VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-@@ -2409,8 +2633,9 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2409,8 +2731,9 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
      if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
      if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
      if (!o || !aspect) return;
@@ -6478,7 +7008,7 @@ index db64302e..163b15d2 100644
      VkClearDepthStencilValue d = { depth_value, stencil };
      VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
      vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
-@@ -2425,7 +2650,13 @@ static void vk_eng_present(void* user, u32 surface)
+@@ -2425,7 +2748,13 @@ static void vk_eng_present(void* user, u32 surface)
  {
      (void)user;
      if (!s_vk.device) return;
@@ -6493,7 +7023,7 @@ index db64302e..163b15d2 100644
      vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
      pthread_mutex_lock(&s_vk.present_mu);
      VkCommandBuffer cb = vk_present_record_begin();
-@@ -2495,6 +2726,72 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -2495,6 +2824,72 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
      }
  }
  
@@ -6566,7 +7096,7 @@ index db64302e..163b15d2 100644
  /* ---- E3: textures ---------------------------------------------------------
   * The engine decodes every level to host rows (rsx_texture_decode) and hands
   * them over one upload each; the crossbar is a property of the view, so it
-@@ -2597,13 +2894,22 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
+@@ -2597,13 +2992,22 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
   * crossbar view of it (vk_eng_surface_view); it is never an attachment.
   * Released copies keep their images in a small pool, since a lit frame asks
   * for one per light. */
@@ -6590,7 +7120,7 @@ index db64302e..163b15d2 100644
      if (s_snap_pool_n < VK_SNAP_POOL && o->im.img) {
          s_snap_pool[s_snap_pool_n].im = o->im;
          s_snap_pool[s_snap_pool_n].fmt = o->fmt;
-@@ -2619,26 +2925,38 @@ static void vk_eng_snapshot_pool_drain(void)
+@@ -2619,26 +3023,39 @@ static void vk_eng_snapshot_pool_drain(void)
  {
      for (u32 i = 0; i < s_snap_pool_n; i++) vk_destroy_image(&s_snap_pool[i].im);
      s_snap_pool_n = 0;
@@ -6629,11 +7159,12 @@ index db64302e..163b15d2 100644
              break;
          }
 -    if (!reused && vk_create_image(&o->im, t->fmt, t->w, t->h,
++    if (reused) s_snap_hit++; else s_snap_miss++;
 +    if (!reused && vk_create_image(&o->im, t->fmt, w, h,
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT)) {
          vk_destroy_image(&o->im);
-@@ -2646,20 +2964,30 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
+@@ -2646,20 +3063,30 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
          return 0;
      }
      o->kind = VK_ENG_COLOR; o->snapshot = 1;
@@ -6667,7 +7198,7 @@ index db64302e..163b15d2 100644
      if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
      return hd;
  }
-@@ -2697,17 +3025,25 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2697,17 +3124,25 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          snap = vk_eng_alloc();
          if (!snap) return 0;
          t = &s_eobj[snap];
@@ -6699,7 +7230,7 @@ index db64302e..163b15d2 100644
      }
  
      /* The bounce buffer stays (device-local when the device has it, grown as
-@@ -2725,9 +3061,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2725,9 +3160,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          }
      }
      vk_buffer st = s_snap_st;
@@ -6712,7 +7243,7 @@ index db64302e..163b15d2 100644
      if (!rc) {
          vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
          vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-@@ -2746,7 +3082,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2746,7 +3181,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
          if (batch) {
              vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -6721,7 +7252,7 @@ index db64302e..163b15d2 100644
          } else
              rc = vk_submit_and_wait();
      }
-@@ -2858,9 +3194,36 @@ static struct {
+@@ -2858,9 +3293,36 @@ static struct {
  static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
  static u32 s_esamp_count;
  
@@ -6759,7 +7290,7 @@ index db64302e..163b15d2 100644
      for (u32 i = 0; i < s_e2.fb_count; i++)
          if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
      s_e2.fb_count = 0;
-@@ -3070,7 +3433,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+@@ -3070,7 +3532,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
  static void vk_eng_pipeline_release(void* user, u32 pipeline)
  {
      (void)user;
@@ -6768,7 +7299,7 @@ index db64302e..163b15d2 100644
      if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
      vk_eng_pipe* P = &s_epipe[pipeline - 1];
      for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-@@ -3240,6 +3603,12 @@ static void vk_eng2_shutdown(void* user)
+@@ -3240,6 +3702,12 @@ static void vk_eng2_shutdown(void* user)
   * on, so overwriting it is safe). Writing them straight into the UBO meant a
   * batched draw read them back out of it, and that memory is host-coherent,
   * i.e. write-combined and uncached on most drivers. */
@@ -6781,7 +7312,7 @@ index db64302e..163b15d2 100644
  static u8* vk_eng_ucpu(void)
  {
      if (!s_e2.ucpu && s_g.ubo.size) s_e2.ucpu = (u8*)calloc(1, (size_t)s_g.ubo.size);
-@@ -3253,6 +3622,7 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+@@ -3253,6 +3721,7 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
      if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
      memcpy(s_e2.ucpu, data, bytes);
      s_e2.vs_bytes = bytes;
@@ -6789,7 +7320,7 @@ index db64302e..163b15d2 100644
  }
  static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
  {
-@@ -3262,6 +3632,7 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+@@ -3262,6 +3731,7 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
      if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
      memcpy(s_e2.ucpu + s_g.ps_off, data, bytes);
      s_e2.ps_bytes = bytes;
@@ -6797,7 +7328,7 @@ index db64302e..163b15d2 100644
  }
  static void vk_eng_bind_textures(void* user, const u32* textures,
                                   const rsx_be_sampler_desc* samplers, u32 mask)
-@@ -3450,7 +3821,20 @@ static struct {
+@@ -3450,7 +3920,20 @@ static struct {
      VkDescriptorPool pool;
      u32              sets;
      unsigned long long draws, flushes;
@@ -6819,7 +7350,7 @@ index db64302e..163b15d2 100644
  
  static int vk_eb_on(void)
  {
-@@ -3479,7 +3863,21 @@ static int vk_eb_on(void)
+@@ -3479,7 +3962,21 @@ static int vk_eb_on(void)
          VK_LOG("draw batching: no host-coherent ring memory, staying off\n");
          return 0;
      }
@@ -6842,7 +7373,7 @@ index db64302e..163b15d2 100644
      s_eb.on = 1;
      return 1;
  }
-@@ -3488,19 +3886,30 @@ static int vk_eb_on(void)
+@@ -3488,19 +3985,30 @@ static int vk_eb_on(void)
   * decides again. Also frees what a failed vk_eb_on had already created. */
  static void vk_eb_release(void)
  {
@@ -6875,7 +7406,7 @@ index db64302e..163b15d2 100644
  
  static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align);
  
-@@ -3512,43 +3921,174 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
+@@ -3512,43 +4020,174 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
  static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                          u32 rows, u32 row_bytes)
  {
@@ -7026,14 +7557,14 @@ index db64302e..163b15d2 100644
 +    for (u32 i = 0; i < s_rpm.nwritten; i++) if (s_rpm.written[i] == img) return 1;
 +    return 0;
 +}
- 
++
 +static void vk_rpm_add_written(VkImage img)
 +{
 +    if (!img || vk_rpm_written(img)) return;
 +    if (s_rpm.nwritten < VK_EB_WRITTEN_MAX) s_rpm.written[s_rpm.nwritten++] = img;
 +    else s_rpm.need_barrier = 1;     /* lost track: be conservative */
 +}
-+
+ 
 +/* The image behind an engine handle a draw samples (a view samples its surface's image). */
 +static VkImage vk_rpm_sampled_image(u32 handle)
 +{
@@ -7059,7 +7590,7 @@ index db64302e..163b15d2 100644
  }
  
  static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
-@@ -3610,6 +4150,34 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
+@@ -3610,6 +4249,34 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
      return set;
  }
  
@@ -7094,7 +7625,7 @@ index db64302e..163b15d2 100644
  static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                          u32 stride, const u32* indices, u32 index_count)
  {
-@@ -3650,7 +4218,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3650,7 +4317,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      VkDeviceSize voff = 0, ioff = 0;
      VkDescriptorSet set = VK_NULL_HANDLE;
      const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
@@ -7103,7 +7634,7 @@ index db64302e..163b15d2 100644
      if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
      if (batched) {
          /* Slices of the rings and a set from the pool; a full one flushes the
-@@ -3659,8 +4227,35 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3659,8 +4326,35 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
              VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
              voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, 16u);
              ioff = ibytes ? vk_eb_take(&ih, VK_EB_IB_BYTES, ibytes, 16u) : 0;
@@ -7141,7 +7672,7 @@ index db64302e..163b15d2 100644
              if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
                  s_eb.sets < VK_EB_MAX_SETS) {
                  VkDescriptorSetLayout lay = P->cube_mask ? s_e2.split_layout : s_g.set_layout;
-@@ -3670,15 +4265,22 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3670,15 +4364,22 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                  if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
                      s_eb.sets++;
                      s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
@@ -7167,7 +7698,7 @@ index db64302e..163b15d2 100644
          }
          if (batched && !set) batched = 0;
      }
-@@ -3686,12 +4288,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3686,12 +4387,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
          if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
          vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
@@ -7182,7 +7713,7 @@ index db64302e..163b15d2 100644
          if (vk_ensure_vertex_buffer(vbytes)) return;
          memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
          if (ibytes) {
-@@ -3706,15 +4305,58 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3706,15 +4404,58 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          if (!set) return;
          if (vk_begin()) return;
      }
@@ -7250,7 +7781,7 @@ index db64302e..163b15d2 100644
      VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
      if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
          vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
-@@ -3728,14 +4370,24 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3728,14 +4469,24 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
          sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
      }
@@ -7282,7 +7813,7 @@ index db64302e..163b15d2 100644
      pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
      if (ibytes) {
          pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
-@@ -3743,10 +4395,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3743,10 +4494,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      } else {
          pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
      }
@@ -7298,7 +7829,7 @@ index db64302e..163b15d2 100644
  }
  
  static const rsx_draw_backend s_vk_engine_backend = {
-@@ -3764,6 +4419,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3764,6 +4518,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .depth_target_release = vk_eng_release,
      .depth_snapshot       = vk_eng_depth_snapshot,
      .color_snapshot       = vk_eng_color_snapshot,
@@ -7306,7 +7837,7 @@ index db64302e..163b15d2 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
-@@ -3783,11 +4439,81 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3783,11 +4538,83 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .readback             = vk_eng_readback,
      .depth_readback       = vk_eng_depth_readback,
      .color_target_write   = vk_eng_color_target_write,
@@ -7341,7 +7872,9 @@ index db64302e..163b15d2 100644
 +        fprintf(stderr, "[vk-prof] %.1f s:", (t1 - s_vbp_t0) / 1e9);
 +        for (int i = 0; i < VBP_N; i++)
 +            if (s_vbp_n[i]) fprintf(stderr, " %s %llux %.1fms;", s_vbp_name[i], s_vbp_n[i], s_vbp_ns[i] / 1e6);
-+        fprintf(stderr, "\n");
++        fprintf(stderr, " pools: img hit %llu miss %llu (held %u), snap hit %llu miss %llu (held %u)\n",
++                s_ipool_hit, s_ipool_miss, s_ipool_n, s_snap_hit, s_snap_miss, s_snap_pool_n);
++        s_ipool_hit = s_ipool_miss = s_snap_hit = s_snap_miss = 0;
 +        memset(s_vbp_ns, 0, sizeof s_vbp_ns); memset(s_vbp_n, 0, sizeof s_vbp_n); s_vbp_t0 = t1;
 +    }
 +}
@@ -7388,7 +7921,7 @@ index db64302e..163b15d2 100644
  static rsx_backend s_vulkan_backend = {
      .userdata           = &s_vk,
      .set_render_target  = vk_cb_track_state,
-@@ -3937,6 +4663,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3937,6 +4764,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      if (vk_submit_and_wait()) return -1;
  
      if (s_vk.windowed) {
@@ -7400,7 +7933,7 @@ index db64302e..163b15d2 100644
          VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
          if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
              vk_create_swapchain())
-@@ -3961,7 +4692,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
+@@ -3961,7 +4793,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
       * pipeline from the guest's programs, so without them it has nothing to
       * draw with, and the vtable's fixed-function path stays the default.
       * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
@@ -7409,7 +7942,7 @@ index db64302e..163b15d2 100644
      rsx_draw_engine_set_default(s_g.on ? 1 : 0);
      if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
          s_vk.eng_active = 1;
-@@ -4027,10 +4758,24 @@ void rsx_vulkan_backend_shutdown(void)
+@@ -4027,10 +4859,24 @@ void rsx_vulkan_backend_shutdown(void)
  
  int rsx_vulkan_backend_pump_messages(void)
  {
@@ -7434,7 +7967,7 @@ index db64302e..163b15d2 100644
          if (e.type == SDL_QUIT) quit = 1;
          else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
      }
-@@ -4040,12 +4785,20 @@ int rsx_vulkan_backend_pump_messages(void)
+@@ -4040,12 +4886,20 @@ int rsx_vulkan_backend_pump_messages(void)
  void rsx_vulkan_backend_present(void)
  {
      rsx_vulkan_backend_present_begin();
@@ -7495,10 +8028,18 @@ index 033d2528..370e7dae 100644
      printf("Results: %d passed, %d failed\n", g_pass, g_fail);
      return g_fail ? 1 : 0;
 diff --git a/libs/video/tests/test_gcm_fifo_user_command.c b/libs/video/tests/test_gcm_fifo_user_command.c
-index c1ef1854..ba3ec693 100644
+index c1ef1854..bc49e0e2 100644
 --- a/libs/video/tests/test_gcm_fifo_user_command.c
 +++ b/libs/video/tests/test_gcm_fifo_user_command.c
-@@ -43,6 +43,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -23,6 +23,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -43,6 +44,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7507,11 +8048,31 @@ index c1ef1854..ba3ec693 100644
  void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
+diff --git a/libs/video/tests/test_gcm_flip_status.c b/libs/video/tests/test_gcm_flip_status.c
+index d4d3ed7b..3b0f448a 100644
+--- a/libs/video/tests/test_gcm_flip_status.c
++++ b/libs/video/tests/test_gcm_flip_status.c
+@@ -18,6 +18,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
 diff --git a/libs/video/tests/test_gcm_flip_stream.c b/libs/video/tests/test_gcm_flip_stream.c
-index 0db6ccff..172cb8d7 100644
+index 0db6ccff..dddde39d 100644
 --- a/libs/video/tests/test_gcm_flip_stream.c
 +++ b/libs/video/tests/test_gcm_flip_stream.c
-@@ -72,6 +72,8 @@ int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+@@ -38,6 +38,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -72,6 +73,8 @@ int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
  rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7521,10 +8082,18 @@ index 0db6ccff..172cb8d7 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_flip_wrap.c b/libs/video/tests/test_gcm_flip_wrap.c
-index b4667524..30c588bb 100644
+index b4667524..caa37e65 100644
 --- a/libs/video/tests/test_gcm_flip_wrap.c
 +++ b/libs/video/tests/test_gcm_flip_wrap.c
-@@ -46,6 +46,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -25,6 +25,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -46,6 +47,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7534,10 +8103,18 @@ index b4667524..30c588bb 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_get_on_jump.c b/libs/video/tests/test_gcm_get_on_jump.c
-index 24c40f99..0492b110 100644
+index 24c40f99..96e412b0 100644
 --- a/libs/video/tests/test_gcm_get_on_jump.c
 +++ b/libs/video/tests/test_gcm_get_on_jump.c
-@@ -55,6 +55,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -27,6 +27,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -55,6 +56,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7547,10 +8124,18 @@ index 24c40f99..0492b110 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
-index 67094140..8de2c6e1 100644
+index 67094140..4b93ba13 100644
 --- a/libs/video/tests/test_gcm_get_on_release.c
 +++ b/libs/video/tests/test_gcm_get_on_release.c
-@@ -53,6 +53,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -33,6 +33,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -53,6 +54,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7560,10 +8145,18 @@ index 67094140..8de2c6e1 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_legacy_state_filter.c b/libs/video/tests/test_gcm_legacy_state_filter.c
-index 02126946..bfcb548f 100644
+index 02126946..af840894 100644
 --- a/libs/video/tests/test_gcm_legacy_state_filter.c
 +++ b/libs/video/tests/test_gcm_legacy_state_filter.c
-@@ -46,6 +46,8 @@ int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+@@ -22,6 +22,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -46,6 +47,8 @@ int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7573,10 +8166,18 @@ index 02126946..bfcb548f 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_nop_runs.c b/libs/video/tests/test_gcm_nop_runs.c
-index 31ed59ef..9d8b7af0 100644
+index 31ed59ef..ed591220 100644
 --- a/libs/video/tests/test_gcm_nop_runs.c
 +++ b/libs/video/tests/test_gcm_nop_runs.c
-@@ -50,6 +50,8 @@ int  rsx_draw_engine_enabled(void) { return 0; }
+@@ -22,6 +22,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -50,6 +51,8 @@ int  rsx_draw_engine_enabled(void) { return 0; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7586,10 +8187,18 @@ index 31ed59ef..9d8b7af0 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_park_reuse.c b/libs/video/tests/test_gcm_park_reuse.c
-index 30cfb62f..1b4dcadb 100644
+index 30cfb62f..4a81f2cb 100644
 --- a/libs/video/tests/test_gcm_park_reuse.c
 +++ b/libs/video/tests/test_gcm_park_reuse.c
-@@ -59,6 +59,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -31,6 +31,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -59,6 +60,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7599,10 +8208,18 @@ index 30cfb62f..1b4dcadb 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_gcm_resync_labels.c b/libs/video/tests/test_gcm_resync_labels.c
-index cc591fd4..7fddb484 100644
+index cc591fd4..c4a13123 100644
 --- a/libs/video/tests/test_gcm_resync_labels.c
 +++ b/libs/video/tests/test_gcm_resync_labels.c
-@@ -58,6 +58,8 @@ void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
+@@ -29,6 +29,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -58,6 +59,8 @@ void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_set_display_buffer(u32 id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
  { (void)id; (void)location; (void)offset; (void)pitch; (void)width; (void)height; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7611,11 +8228,31 @@ index cc591fd4..7fddb484 100644
  void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
+diff --git a/libs/video/tests/test_gcm_user_command.c b/libs/video/tests/test_gcm_user_command.c
+index 0df54dbc..a351c115 100644
+--- a/libs/video/tests/test_gcm_user_command.c
++++ b/libs/video/tests/test_gcm_user_command.c
+@@ -15,6 +15,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
 diff --git a/libs/video/tests/test_gcm_walker_prof.c b/libs/video/tests/test_gcm_walker_prof.c
-index 065fb54d..34893f41 100644
+index 065fb54d..7742ee65 100644
 --- a/libs/video/tests/test_gcm_walker_prof.c
 +++ b/libs/video/tests/test_gcm_walker_prof.c
-@@ -44,6 +44,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
+@@ -24,6 +24,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -44,6 +45,8 @@ rsx_backend* rsx_get_backend(void) { return NULL; }
  void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
  void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
  void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -7625,10 +8262,18 @@ index 065fb54d..34893f41 100644
  int  rsx_live_draw_enabled(void) { return 0; }
  void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 diff --git a/libs/video/tests/test_nv3089_engine_read.c b/libs/video/tests/test_nv3089_engine_read.c
-index 733d77d1..8610874e 100644
+index 733d77d1..fa033295 100644
 --- a/libs/video/tests/test_nv3089_engine_read.c
 +++ b/libs/video/tests/test_nv3089_engine_read.c
-@@ -69,6 +69,8 @@ static int s_reads;
+@@ -26,6 +26,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ ps3_guest_caller_fn g_ps3_guest_caller;
+@@ -69,6 +70,8 @@ static int s_reads;
  
  /* What the engine does for a transfer: the pixels of the surface in this rectangle, as 32-bit guest words. */
  void rsx_draw_engine_guest_read(u32 loc, u32 off, u32 pitch, u32 w, u32 h)
@@ -7706,7 +8351,7 @@ index 15d4ef60..ebb5bce3 100644
      /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
       * call it makes. WAITBT_EVERY only samples threads that are blocking on an
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index 9309f2d3..b6c203c0 100644
+index 9309f2d3..6ecfb850 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -1033,6 +1033,7 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
@@ -7746,6 +8391,97 @@ index 9309f2d3..b6c203c0 100644
      if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
          /* Report as two words: the watch window is word-granular, and a
           * doubleword CAS on a counter pair is exactly the case worth seeing. */
+@@ -1569,9 +1585,13 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+ 
+ /* Every guest store commits through this: on a line no SPU has reserved (all of
+  * them, until SPU code runs) it is the plain memcpy it replaced. */
++extern "C" int spu_coh_store_fast(uint32_t ea, const void* src, uint32_t n);
++/* A line whose bit is set but that no SPU holds now is stored without the
++ * lock-line lock (spu_coh_store_fast, "Lines held now" in spu_coherency.c). */
+ #define VM_WRITE_COH(a, src, n)                                               \
+     do {                                                                      \
+-        if (spu_coh_line_reserved((uint32_t)(a))) {                           \
++        if (spu_coh_line_reserved((uint32_t)(a)) &&                           \
++            !spu_coh_store_fast((uint32_t)(a), (src), (n))) {                 \
+             spu_lockline_lock();                                              \
+             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+             spu_coh_notify_write((uint32_t)(a));                              \
+@@ -2564,8 +2584,54 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+     ps3_indirect_call(ctx);
+ }
+ 
++/* The common case of an indirect call: no diagnostic knob set, a mapped
++ * target. ps3_indirect_call_impl tests about twenty cached debug switches on
++ * every call before the lookup -- 3% of the main thread's CPU in a race --
++ * so their state is folded into one flag, read once, and a call that needs
++ * none of them goes straight to the lookup and the same call/trampoline
++ * sequence. Anything unusual (a NULL or unmapped target, the recursion cap)
++ * still takes the full path, which also does the reporting. */
++static int icall_plain(void)
++{
++    static int plain = -1;
++    if (plain < 0) {
++        static const char* const knobs[] = {
++            "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
++            "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_TO", "PS3_CALLTRACE_FROM",
++            "PS3_CALLTRACE_R5", "FLOW_FORCE_RTCFG", "SPURS_TRACE", "PS3_PRX_CALLTRACE",
++            "PPU_TOCFIX", "PPU_RETWATCH", "PS3_ICALL_SLOW" };
++        int p = 1;
++        for (size_t i = 0; i < sizeof knobs / sizeof *knobs; i++) if (getenv(knobs[i])) p = 0;
++        plain = p;
++    }
++    return plain;
++}
++
+ extern "C" void ps3_indirect_call(ppu_context* ctx)
+ {
++    if (icall_plain()) {
++        uint32_t addr = (uint32_t)ctx->ctr;
++        if (g_icall_target_set) { addr = g_icall_target; }
++        ppu_fn fn = addr ? ppu_lookup(addr) : nullptr;
++        if (fn && g_dispatch_depth <= 4000) {
++            g_icall_target_set = 0;
++            g_active_ctx = ctx;
++            g_dispatch_depth++;
++            if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
++            g_vcall_sp++;
++            fn(ctx);
++            while (g_trampoline_fn) {
++                void (*tf)(void*) = g_trampoline_fn;
++                g_trampoline_fn = 0;
++                tf(ctx);
++            }
++            if (g_vcall_sp > 0) g_vcall_sp--;
++            g_dispatch_depth--;
++            return;
++        }
++        ps3_indirect_call_impl(ctx);
++        return;
++    }
+     static int on = -1;
+     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+diff --git a/runtime/ppu/ppu_memory.h b/runtime/ppu/ppu_memory.h
+index 97a9d17f..f0fec35f 100644
+--- a/runtime/ppu/ppu_memory.h
++++ b/runtime/ppu/ppu_memory.h
+@@ -137,13 +137,15 @@ int         spu_coh_is_reserved(uint32_t addr);
+ void        spu_lockline_lock(void);
+ void        spu_lockline_unlock(void);
+ void        spu_coh_notify_write(uint32_t addr);
++int         spu_coh_store_fast(uint32_t ea, const void* src, uint32_t n);
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+ #define VM_WRITE_COH(addr, src, n)                                            \
+     do {                                                                      \
+-        if (spu_coh_line_reserved((uint32_t)(addr))) {                        \
++        if (spu_coh_line_reserved((uint32_t)(addr)) &&                        \
++            !spu_coh_store_fast((uint32_t)(addr), (src), (n))) {              \
+             spu_lockline_lock();                                              \
+             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+             spu_coh_notify_write((uint32_t)(addr));                           \
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
 index 9cb50400..add57400 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
@@ -7833,8 +8569,131 @@ index 9cb50400..add57400 100644
      /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
       * sys_net NID LBP imports so none fall to the unresolved-NID default. */
      ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
+diff --git a/runtime/ppu/ppu_vmx.h b/runtime/ppu/ppu_vmx.h
+index 35052c67..167aa0af 100644
+--- a/runtime/ppu/ppu_vmx.h
++++ b/runtime/ppu/ppu_vmx.h
+@@ -270,11 +270,72 @@ VMX_INL float vmx_minf(float x, float y) {
+     if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
+     return x < y ? x : y;
+ }
+-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
+-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
+ VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
+ VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+ 
++#if (defined(__x86_64__) || defined(_M_X64)) && defined(__FMA__) && defined(__SSSE3__) && !defined(PPU_VMX_SCALAR)
++/* vaddfp/vsubfp/vmaddfp/vnmsubfp on one SSE/FMA op over the four lanes (the lifted PPU TUs build
++ * with -march=x86-64-v3). Same semantics as the scalar forms below, bit for bit: the register
++ * file is big-endian, so lanes are byte-swapped in and out with one pshufb; NJ flushes inputs
++ * and output; NaN results follow vmx_vnan2 (A, then B, quieted, else the default NaN) for
++ * add/sub and vmx_fix (default NaN) for the fused forms. PPU threads run with the default MXCSR
++ * (round to nearest, no FTZ/DAZ), which is what the scalar forms compute with. vnmsubfp is
++ * -(a*c - b): fmsub then a sign flip, so an exact zero comes out as -0 like -fmaf(x, z, -y)
++ * (fnmadd would give +0). PPU_VMX_SCALAR selects the scalar forms. */
++#include <immintrin.h>
++/* Forced inline: the lifted functions are large enough that the inliner's budget runs out and
++ * left out-of-line copies of these leaf helpers (one call per vector op in the hot game code). */
++#define VMX_XINL static inline __attribute__((always_inline))
++VMX_XINL __m128i vmx_x_ld(const void* p) {
++    return _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p),
++                            _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
++}
++VMX_XINL void vmx_x_st(void* p, __m128i v) {
++    _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)));
++}
++VMX_XINL __m128i vmx_x_flush(__m128i u, uint32_t vscr) {
++    if (!(vscr & VMX_NJ)) return u;
++    const __m128i den = _mm_cmpeq_epi32(_mm_and_si128(u, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
++    return _mm_blendv_epi8(u, _mm_and_si128(u, _mm_set1_epi32((int)0x80000000u)), den);
++}
++VMX_XINL __m128i vmx_x_isnan(__m128i u) {
++    return _mm_cmpgt_epi32(_mm_and_si128(u, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F800000));
++}
++VMX_XINL __m128i vmx_x_fix(__m128i r) { return _mm_blendv_epi8(r, _mm_set1_epi32(0x7FC00000), vmx_x_isnan(r)); }
++VMX_XINL __m128i vmx_x_vnan2(__m128i r, __m128i x, __m128i y) {
++    const __m128i q = _mm_set1_epi32(0x7FC00000);
++    r = vmx_x_fix(r);
++    r = _mm_blendv_epi8(r, _mm_or_si128(y, q), vmx_x_isnan(y));
++    return _mm_blendv_epi8(r, _mm_or_si128(x, q), vmx_x_isnan(x));   /* A takes precedence */
++}
++#define VMX_X_PS(v) _mm_castsi128_ps(v)
++#define VMX_X_SI(v) _mm_castps_si128(v)
++VMX_XINL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
++    const __m128i x = vmx_x_flush(vmx_x_ld(a_), vscr), y = vmx_x_flush(vmx_x_ld(b_), vscr);
++    const __m128i z = VMX_X_SI(_mm_add_ps(VMX_X_PS(x), VMX_X_PS(y)));
++    vmx_x_st(d_, vmx_x_flush(vmx_x_vnan2(z, x, y), vscr));
++}
++VMX_XINL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
++    const __m128i x = vmx_x_flush(vmx_x_ld(a_), vscr), y = vmx_x_flush(vmx_x_ld(b_), vscr);
++    const __m128i z = VMX_X_SI(_mm_sub_ps(VMX_X_PS(x), VMX_X_PS(y)));
++    vmx_x_st(d_, vmx_x_flush(vmx_x_vnan2(z, x, y), vscr));
++}
++VMX_XINL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
++    const __m128i x = vmx_x_flush(vmx_x_ld(a_), vscr), y = vmx_x_flush(vmx_x_ld(b_), vscr);
++    const __m128i z = vmx_x_flush(vmx_x_ld(c_), vscr);
++    const __m128i m = VMX_X_SI(_mm_fmadd_ps(VMX_X_PS(x), VMX_X_PS(z), VMX_X_PS(y)));
++    vmx_x_st(d_, vmx_x_flush(vmx_x_fix(m), vscr));
++}
++VMX_XINL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
++    const __m128i x = vmx_x_flush(vmx_x_ld(a_), vscr), y = vmx_x_flush(vmx_x_ld(b_), vscr);
++    const __m128i z = vmx_x_flush(vmx_x_ld(c_), vscr);
++    const __m128i m = _mm_xor_si128(VMX_X_SI(_mm_fmsub_ps(VMX_X_PS(x), VMX_X_PS(z), VMX_X_PS(y))),
++                                    _mm_set1_epi32((int)0x80000000u));
++    vmx_x_st(d_, vmx_x_flush(vmx_x_fix(m), vscr));
++}
++#else
++VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
++VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
+ VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+     for (int i = 0; i < 4; i++) {
+         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
+@@ -285,6 +346,7 @@ VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_
+         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
+               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
+         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
++#endif
+ 
+ #define VMX_FUN(name, expr, flush_in, nanmode) \
+ VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
+diff --git a/runtime/ppu/tests/test_ppu_dispatch_depth.cpp b/runtime/ppu/tests/test_ppu_dispatch_depth.cpp
+index 15fe0a68..2204075c 100644
+--- a/runtime/ppu/tests/test_ppu_dispatch_depth.cpp
++++ b/runtime/ppu/tests/test_ppu_dispatch_depth.cpp
+@@ -29,6 +29,7 @@ uint8_t* vm_base;
+ uint32_t ppu_hle_inject_base = 0x20000000;
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) { std::abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { std::abort(); }
+ void spu_lockline_unlock(void) { std::abort(); }
+ int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
+diff --git a/runtime/ppu/tests/test_ppu_entry_arguments.cpp b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
+index 627376d5..039aa402 100644
+--- a/runtime/ppu/tests/test_ppu_entry_arguments.cpp
++++ b/runtime/ppu/tests/test_ppu_entry_arguments.cpp
+@@ -12,6 +12,7 @@ uint8_t* vm_base;
+ uint32_t ppu_hle_inject_base=0x20000000;
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) { std::abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { std::abort(); }
+ void spu_lockline_unlock(void) { std::abort(); }
+ int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
+diff --git a/runtime/ppu/tests/test_ppu_guest_call_stack.cpp b/runtime/ppu/tests/test_ppu_guest_call_stack.cpp
+index 402912f4..0faf3924 100644
+--- a/runtime/ppu/tests/test_ppu_guest_call_stack.cpp
++++ b/runtime/ppu/tests/test_ppu_guest_call_stack.cpp
+@@ -25,6 +25,7 @@ uint8_t* vm_base;
+ uint32_t ppu_hle_inject_base = 0x20000000;
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) {}
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { std::abort(); }
+ void spu_lockline_unlock(void) { std::abort(); }
+ int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 5fc50208..1b162639 100644
+index 5fc50208..50a1d114 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -242,7 +242,8 @@ void spu_stop(spu_context* ctx)
@@ -7886,7 +8745,23 @@ index 5fc50208..1b162639 100644
  #else
      (void)outer;
  #endif
-@@ -1842,7 +1868,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+@@ -927,6 +953,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                       ctx->atomic_stat ? "FAIL" : "OK",
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         ctx->resv_valid = 0;                           /* reservation consumed */
++        spu_coh_hold(ctx, 0xFFFFFFFFu);                /* after the commit, under the lock */
+         spu_lockline_unlock();
+         if (ctx->atomic_stat == 0) {
+             spu_taskset_line_committed(ea & ~127u);
+@@ -947,6 +974,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * has already overwritten. */
+         spu_coh_notify_write(ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
++        spu_coh_hold(ctx, 0xFFFFFFFFu);
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+@@ -1842,7 +1870,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
   * marks that overlay resident in the streaming context; dispatch retries a
   * primary-image miss against the resident overlay's registry. */
  typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
@@ -7896,7 +8771,7 @@ index 5fc50208..1b162639 100644
  /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
   * the same job code buffer at LS 0x4000, dispatched by content signature). */
  #define SPU_OVL_SRC_MAX 128
-@@ -2151,6 +2178,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2151,6 +2180,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      if (size < 512 && !spu_ovl_ea_known(ea)) return;
      for (int i = 0; i < nsrc; i++) {
          const spu_ovl_src* o = &s_ovl_src[i];
@@ -7904,7 +8779,7 @@ index 5fc50208..1b162639 100644
          int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
                               : (o->src_ea == ea);
          if (hit) {
-@@ -2186,6 +2214,78 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+@@ -2186,6 +2216,78 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      }
  }
  
@@ -7983,7 +8858,7 @@ index 5fc50208..1b162639 100644
  /* Match a 16-byte module header against the registered content signatures.
   * Returns the overlay image id, or 0 if none. Used by the WWS job-code dispatch
   * path: the job manager streams a module into the code buffer via a DMA LIST
-@@ -2768,6 +2868,10 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2768,6 +2870,10 @@ void spu_indirect_branch(spu_context* ctx)
      }
      /* Use the same ownership order as the interpreter's rejoin probe. */
      spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
@@ -7994,7 +8869,7 @@ index 5fc50208..1b162639 100644
      /* The job returned through the link register we planted: it is finished.
       * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
       * return landed on LS 0, which is the job's OWN entry, and it ran a second
-@@ -2825,14 +2929,17 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2825,14 +2931,17 @@ void spu_indirect_branch(spu_context* ctx)
      }
  
      if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
@@ -8014,7 +8889,7 @@ index 5fc50208..1b162639 100644
              { fprintf(stderr, "      last dispatched PCs (oldest first):");
                for (unsigned q = 0; q < 8; q++) {
                    unsigned idx = (g_spu_pch_n + q) & 7u;
-@@ -2864,14 +2971,31 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2864,14 +2973,31 @@ void spu_indirect_branch(spu_context* ctx)
          { uint32_t p = ctx->pc & SPU_LS_MASK;
            uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                          ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
@@ -8049,11 +8924,231 @@ index 5fc50208..1b162639 100644
                return;
            } }
          spu_halt(ctx);
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index ed2bcf58..9080644c 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -122,6 +122,117 @@ void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort();
+ 
+ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+ 
++void spu_coh_notify_write(uint32_t ea);
++
++/* ===========================================================================
++ * Lines held now
++ *
++ * A line's bit in the bitmap stays set for the rest of the run once any SPU
++ * has reserved it, so every PPU store to it took the lock-line lock, a fence,
++ * a watch scan and a walk over every reservation holder -- 4% of the main
++ * thread's CPU in a race, nearly all of it for lines nobody held any more.
++ *
++ * Each reservation is now also counted in s_hold_cnt[slot(line)] while its
++ * context may still be holding it, and each start bumps s_hold_gen[slot]. A
++ * context's own thread moves its count: on to the new line before a GETLLAR's
++ * copy, off at its PUTLLC/PUTLLUC and when it is unregistered (a reservation
++ * lost to a notify stays counted until then -- an over-approximation, so the
++ * store takes the locked path as before). Watches count while armed. Slots
++ * are a hash of the line; a collision only sends a store down the locked path.
++ *
++ * spu_coh_store_fast is the PPU side. With no holder counted it stores
++ * without the lock, then fences and looks again:
++ *
++ *   SPU (spu_coh_hold + GETLLAR)        PPU (spu_coh_store_fast)
++ *     gen++, cnt++   (seq_cst RMW)        cnt == 0 ?        (seq_cst load)
++ *     copy the line                       store the data
++ *                                         seq_cst fence
++ *                                         gen, cnt unchanged ? (seq_cst load)
++ *
++ * The store-buffering shape again (see spu_coh_reserve_fast): either the
++ * copy holds the store, or the second look sees the new generation. In that
++ * case the store is done again under the lock with the full notify, which is
++ * the ordering "the SPU's transaction, then this store" -- a legal one -- and
++ * ends the reservation exactly as the locked path does. A PUTLLC's commit
++ * happens before its context's count drops (both under the lock, the drop
++ * after the commit), so a store that sees count 0 is ordered after any commit
++ * on the line and cannot land inside one. PS3_COH_FASTSTORE=0 turns it off.
++ * ===========================================================================*/
++#define SPU_COH_HOLD_SLOTS 65536u
++static unsigned s_hold_cnt[SPU_COH_HOLD_SLOTS];
++static unsigned s_hold_gen[SPU_COH_HOLD_SLOTS];
++
++static inline unsigned spu_coh_hold_slot(uint32_t ea)
++{
++    uint32_t line = ea >> SPU_COH_LINE_SHIFT;
++    return (line * 2654435761u) >> 16;          /* top 16 bits: SPU_COH_HOLD_SLOTS */
++}
++
++static void spu_coh_hold_add(unsigned slot)
++{
++    __atomic_add_fetch(&s_hold_gen[slot], 1u, __ATOMIC_SEQ_CST);
++    __atomic_add_fetch(&s_hold_cnt[slot], 1u, __ATOMIC_SEQ_CST);
++}
++
++static void spu_coh_hold_sub(unsigned slot)
++{
++    __atomic_sub_fetch(&s_hold_cnt[slot], 1u, __ATOMIC_SEQ_CST);
++}
++
++/* Count ctx's reservation on `ea`'s line, or on none with ea == 0xFFFFFFFF.
++ * Called by the context's own thread before a GETLLAR copies the line and
++ * after a PUTLLC/PUTLLUC commits. */
++void spu_coh_hold(spu_context* ctx, uint32_t ea)
++{
++    if (!ctx) return;
++    const unsigned want = ea == 0xFFFFFFFFu ? 0u : spu_coh_hold_slot(ea) + 1u;
++    const unsigned have = ctx->coh_hold;
++    if (want == have) {
++        /* Re-reserving the line it already counts on is a new transaction for
++         * a store racing it: bump the generation so its second look sees it. */
++        if (want) __atomic_add_fetch(&s_hold_gen[want - 1u], 1u, __ATOMIC_SEQ_CST);
++        return;
++    }
++    if (want) spu_coh_hold_add(want - 1u);
++    if (have) spu_coh_hold_sub(have - 1u);
++    ctx->coh_hold = want;
++}
++
++static int spu_coh_faststore_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3_COH_FASTSTORE"); on = !(e && *e == '0'); }
++    return on;
++}
++
++extern uint8_t* vm_base;
++int spu_coh_store_fast(uint32_t ea, const void* src, uint32_t n)
++{
++    if (!n || !spu_coh_faststore_on()) return 0;
++    const unsigned s0 = spu_coh_hold_slot(ea), s1 = spu_coh_hold_slot(ea + n - 1u);
++    const unsigned g0 = __atomic_load_n(&s_hold_gen[s0], __ATOMIC_SEQ_CST);
++    const unsigned g1 = __atomic_load_n(&s_hold_gen[s1], __ATOMIC_SEQ_CST);
++    if (__atomic_load_n(&s_hold_cnt[s0], __ATOMIC_SEQ_CST) ||
++        __atomic_load_n(&s_hold_cnt[s1], __ATOMIC_SEQ_CST))
++        return 0;
++    memcpy(vm_base + ea, src, n);
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    if (__atomic_load_n(&s_hold_gen[s0], __ATOMIC_SEQ_CST) != g0 ||
++        __atomic_load_n(&s_hold_gen[s1], __ATOMIC_SEQ_CST) != g1 ||
++        __atomic_load_n(&s_hold_cnt[s0], __ATOMIC_SEQ_CST) ||
++        __atomic_load_n(&s_hold_cnt[s1], __ATOMIC_SEQ_CST)) {
++        /* A reservation began meanwhile: redo it the locked way. */
++        spu_lockline_lock();
++        memcpy(vm_base + ea, src, n);
++        spu_coh_notify_write(ea);
++        if ((ea >> SPU_COH_LINE_SHIFT) != ((ea + n - 1u) >> SPU_COH_LINE_SHIFT))
++            spu_coh_notify_write(ea + n - 1u);
++        spu_lockline_unlock();
++    }
++    return 1;
++}
++
++
+ /* g_spu_coh_bits (spu_coh_bitmap.h) stays NULL until the first GETLLAR
+  * anywhere. That keeps the PPU fast path off the bitmap entirely for a title
+  * that runs no SPU code, and keeps every existing test that stores through
+@@ -155,6 +266,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+         g_spu_coh_bits = s_coh_bitmap;
+ 
+     if (!ctx) return;
++    spu_coh_hold(ctx, ea);   /* counted before the caller copies the line */
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
+         if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
+     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
+@@ -175,6 +287,7 @@ void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
+     /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
+      * the same serialized commit/notify path as SPU reservations. */
+     spu_coh_reserve(NULL, ea);
++    spu_coh_hold_add(spu_coh_hold_slot(ea));
+     watch->line = ea & ~127u;
+     watch->wake = wake;
+     watch->opaque = opaque;
+@@ -188,6 +301,7 @@ void spu_coh_watch_remove(spu_coh_watch* watch)
+         if (*link != watch) continue;
+         *link = watch->next;
+         watch->next = NULL;
++        spu_coh_hold_sub(spu_coh_hold_slot(watch->line));
+         return;
+     }
+ }
+@@ -225,6 +339,7 @@ void spu_coh_unregister(spu_context* ctx)
+         break;
+     }
+     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
++    spu_coh_hold(ctx, 0xFFFFFFFFu);
+     spu_lockline_unlock();
+ }
+ 
+@@ -245,6 +360,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+             if (PS3_LOG_FIRST(_n, 16))
+                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
+                         (void*)c, entry->ctx->image_id);
++            spu_coh_hold(entry->ctx, 0xFFFFFFFFu);   /* its count would pin the slot */
+             *link = entry->next;
+             free(entry);
+         } else {
+@@ -283,6 +399,7 @@ void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
+ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
+ #endif
+ 
++
+ /* ===========================================================================
+  * GETLLAR without the lock-line lock
+  *
+@@ -338,6 +455,7 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
+         !spu_coh_is_reserved(ea))
+         return 0;
++    spu_coh_hold(ctx, ea);   /* counted before the caller copies the line */
+     /* Retire any older reservation before retargeting it. The fence is what
+      * the argument above rests on. */
+     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ea2e8351..85e4c59e 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -57,6 +57,16 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+  * instead. On 1 the caller copies the line, also without the lock. */
+ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
+ 
++/* Count ctx's reservation as held on ea's line (ea == 0xFFFFFFFF: on none).
++ * The context's own thread calls it before a GETLLAR copies the line and
++ * after a PUTLLC/PUTLLUC; see "Lines held now" in spu_coherency.c. */
++void spu_coh_hold(spu_context* ctx, uint32_t ea);
++
++/* A PPU store of n bytes at ea to a line whose bitmap bit is set: done here
++ * without the lock-line lock when no reservation on it is counted. Returns 0
++ * when the caller must take the locked path. */
++int spu_coh_store_fast(uint32_t ea, const void* src, uint32_t n);
++
+ /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
+@@ -71,7 +81,7 @@ void spu_coh_notify_write(uint32_t ea);
+ /* Remove a context from the reserving set. MUST be called before a
+  * transient (stack-allocated) spu_context goes out of scope. */
+ void spu_coh_unregister(spu_context* ctx);
+-void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
++void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
+ /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
+  * write does not cost it its reservation on hardware. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self);
 diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
-index c5ccbec7..8c59b682 100644
+index c5ccbec7..27313801 100644
 --- a/runtime/spu/spu_context.h
 +++ b/runtime/spu/spu_context.h
-@@ -532,6 +532,17 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+@@ -425,6 +425,11 @@ typedef struct spu_context {
+      * spu_coh_reserve_fast). Written under that lock, read by the context's
+      * own thread. */
+     int coh_listed;
++
++    /* The hold slot (spu_coherency.c, spu_coh_hold) this context's
++     * reservation is counted in, plus one; 0 when it counts in none. Only the
++     * context's own thread changes it. */
++    unsigned coh_hold;
+ } spu_context;
+ 
+ /* event_status is written from more than one host thread: the SPU's own
+@@ -532,6 +537,17 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  #endif
  #if defined(__ARM_NEON)
  #include <arm_neon.h>     /* the quadword swap is one rev32 */
@@ -8071,7 +9166,7 @@ index c5ccbec7..8c59b682 100644
  #endif
  
  /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
-@@ -628,6 +639,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+@@ -628,6 +644,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
      const uint8_t* p = &ctx->ls[lsa];
  #if defined(__ARM_NEON)
      vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
@@ -8080,7 +9175,7 @@ index c5ccbec7..8c59b682 100644
  #elif SPU_LS_FAST
      uint32_t w0, w1, w2, w3;
      memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
-@@ -725,6 +738,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+@@ -725,6 +743,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      uint8_t* p = &ctx->ls[lsa];
  #if defined(__ARM_NEON)
      vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
@@ -8453,6 +9548,197 @@ index 3ce8d0d6..0d19b91e 100644
      if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
          fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                  "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+diff --git a/runtime/spu/tests/test_mfc_resume_elements.c b/runtime/spu/tests/test_mfc_resume_elements.c
+index 2a930b50..a66819ec 100644
+--- a/runtime/spu/tests/test_mfc_resume_elements.c
++++ b/runtime/spu/tests/test_mfc_resume_elements.c
+@@ -26,6 +26,7 @@ void spu_overlay_note_get(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n
+ { (void)c;(void)ea;(void)p;(void)n; }
+ int spu_coh_is_reserved(uint32_t ea) { (void)ea;return 0; }
+ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+diff --git a/runtime/spu/tests/test_spu_coh_stress.c b/runtime/spu/tests/test_spu_coh_stress.c
+new file mode 100644
+index 00000000..ebdc43ba
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_coh_stress.c
+@@ -0,0 +1,173 @@
++/*
++ * Stress test: PPU stores against SPU GETLLAR/PUTLLC loops on the same line.
++ *
++ * spu_coh_store_fast lets a PPU store to a line nobody currently holds skip
++ * the lock-line lock. Its correctness rests on a store-buffering ordering
++ * argument (spu_coherency.c, "Lines held now"): a store must never land
++ * between an SPU's GETLLAR copy and its PUTLLC commit without breaking that
++ * reservation. If it does, the PUTLLC writes the whole line back with the
++ * PPU's word as it was at the GETLLAR -- a lost PPU update.
++ *
++ * Here SPU threads increment their own word of a shared line in
++ * GETLLAR/PUTLLC retry loops (the same lock/reserve/copy/compare/commit/hold
++ * steps as spu_channels.c, through both the locked GETLLAR and
++ * spu_coh_reserve_fast), now and then hopping to a second line so the line's
++ * holder count keeps falling to zero and the fast path is really taken. A PPU
++ * thread stores a sequence into its own word of each line through the real
++ * ppu_memory.h vm_write32 and checks before every store that its previous
++ * value is still there. Any lost update shows up as a mismatch; at the end
++ * every SPU word must equal its count of successful PUTLLCs.
++ *
++ * Build:
++ *   clang -std=gnu17 -O2 -I include -I runtime/spu -pthread \
++ *         -o /tmp/test_spu_coh_stress runtime/spu/tests/test_spu_coh_stress.c
++ *   (STRESS_ITERS=<n> sets the PUTLLCs per SPU thread, default 200000.)
++ *
++ * Exit code: 0 if all passed, 1 if any failed.
++ */
++#include "../spu_coherency.c"
++#include "../../../tests/spu_ls_watch_fixture.h"
++#include "../../ppu/ppu_memory.h"
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static uint8_t g_guest_mem[1u << 20];
++uint8_t* vm_base = g_guest_mem;
++
++uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
++int      g_resv_store_active = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
++{
++    (void)addr; (void)val; (void)width;
++}
++
++static unsigned long g_wakes;
++void spu_ch_wake(spu_context* ctx) { (void)ctx; __atomic_add_fetch(&g_wakes, 1, __ATOMIC_RELAXED); }
++
++static int g_pass, g_fail;
++#define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; \
++    fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++#define LINE_A 0x00040000u
++#define LINE_B 0x00040400u
++#define NSPU   3
++
++static spu_context g_spu[NSPU];
++static unsigned long g_iters = 200000;
++static int g_spus_done;
++
++typedef struct { unsigned long ok, failed, fast_llar; } spu_stats;
++static spu_stats g_stats[NSPU];
++
++/* GETLLAR as spu_channels.c does it: the unlocked fast path for a registered
++ * holder of a marked line, otherwise lock + spu_coh_reserve. */
++static void getllar(spu_context* ctx, uint32_t ea, uint8_t* ls, spu_stats* st)
++{
++    const int fast = spu_coh_reserve_fast(ctx, ea);
++    if (!fast) { spu_lockline_lock(); spu_coh_reserve(ctx, ea); }
++    else st->fast_llar++;
++    memcpy(ls, vm_base + ea, 128);
++    memcpy(ctx->resv_line, ls, 128);
++    if (!fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; spu_lockline_unlock(); }
++}
++
++static int putllc(spu_context* ctx, uint32_t ea, const uint8_t* ls)
++{
++    int ok = 0;
++    spu_lockline_lock();
++    if (ctx->resv_valid && ctx->resv_ea == ea &&
++        memcmp(vm_base + ea, ctx->resv_line, 128) == 0) {
++        /* A store landing here, after the compare, is the lost update; give
++         * one room to land (a commit is never this slow, a preempted one is). */
++        for (volatile int d = 0; d < 64; ++d) {}
++        memcpy(vm_base + ea, ls, 128);
++        ctx->resv_valid = 0;
++        spu_coh_notify_write_except(ea, ctx);
++        ok = 1;
++    }
++    ctx->resv_valid = 0;
++    spu_coh_hold(ctx, 0xFFFFFFFFu);
++    spu_lockline_unlock();
++    return ok;
++}
++
++static void* spu_thread(void* arg)
++{
++    const int i = (int)(intptr_t)arg;
++    spu_context* ctx = &g_spu[i];
++    spu_stats* st = &g_stats[i];
++    uint8_t ls[128];
++    unsigned rng = 0x9E3779B9u * (unsigned)(i + 1);
++    for (unsigned long n = 0; n < g_iters;) {
++        rng = rng * 1103515245u + 12345u;
++        const uint32_t ea = (rng >> 28) < 3 ? LINE_B : LINE_A;
++        getllar(ctx, ea, ls, st);
++        uint32_t w;
++        memcpy(&w, ls + 4 * (1 + i), 4);
++        w = __builtin_bswap32(__builtin_bswap32(w) + 1u);
++        memcpy(ls + 4 * (1 + i), &w, 4);
++        for (volatile int d = (int)((rng >> 8) & 63); d > 0; --d) {}  /* widen the window */
++        if (putllc(ctx, ea, ls)) { st->ok++; n++; }
++        else st->failed++;
++        if ((rng & 0xFF) == 0) {
++            /* A GETLLAR that is never committed (an SPU poll), left held. */
++            getllar(ctx, LINE_B, ls, st);
++        }
++    }
++    spu_coh_unregister(ctx);
++    __atomic_add_fetch(&g_spus_done, 1, __ATOMIC_SEQ_CST);
++    return NULL;
++}
++
++int main(void)
++{
++    const char* e = getenv("STRESS_ITERS");
++    if (e) g_iters = strtoul(e, NULL, 0);
++    for (int i = 0; i < NSPU; ++i) { spu_context_init(&g_spu[i], (uint32_t)i); }
++    /* Mark both lines once so the PPU stores consult the hold counts. */
++    spu_lockline_lock(); spu_coh_reserve(NULL, LINE_A); spu_coh_reserve(NULL, LINE_B); spu_lockline_unlock();
++
++    pthread_t t[NSPU];
++    for (int i = 0; i < NSPU; ++i) pthread_create(&t[i], NULL, spu_thread, (void*)(intptr_t)i);
++
++    /* The PPU: its own word (offset 0) of each line, a sequence, checked. */
++    uint32_t va = 0, vb = 0;
++    unsigned long lost = 0, stores = 0, first_lost_at = 0;
++    while (__atomic_load_n(&g_spus_done, __ATOMIC_SEQ_CST) < NSPU) {
++        if (vm_read32(LINE_A) != va) { if (!lost++) first_lost_at = stores; va = vm_read32(LINE_A); }
++        vm_write32(LINE_A, ++va);
++        if ((stores & 3) == 0) {
++            if (vm_read32(LINE_B) != vb) { if (!lost++) first_lost_at = stores; vb = vm_read32(LINE_B); }
++            vm_write32(LINE_B, ++vb);
++        }
++        stores++;
++    }
++    for (int i = 0; i < NSPU; ++i) pthread_join(t[i], NULL);
++
++    unsigned long ok = 0, failed = 0, fast = 0;
++    for (int i = 0; i < NSPU; ++i) {
++        const unsigned long got = vm_read32(LINE_A + 4u * (1 + i)) + vm_read32(LINE_B + 4u * (1 + i));
++        CHECK(got == g_stats[i].ok, "SPU %d: line words sum %lu, successful PUTLLCs %lu",
++              i, got, g_stats[i].ok);
++        ok += g_stats[i].ok; failed += g_stats[i].failed; fast += g_stats[i].fast_llar;
++    }
++    CHECK(lost == 0, "%lu PPU stores lost to a PUTLLC (first after %lu stores)", lost, first_lost_at);
++    CHECK(vm_read32(LINE_A) == va && vm_read32(LINE_B) == vb, "final PPU words");
++    CHECK(failed > 0, "no PUTLLC ever failed: the race was not exercised");
++    CHECK(g_wakes > 0, "no SPU_EVENT_LR wake was ever delivered");
++
++    /* With every holder gone, a store takes the fast path: no wake. */
++    const unsigned long w0 = g_wakes;
++    vm_write32(LINE_A, 1);
++    vm_write32(LINE_B, 1);
++    CHECK(g_wakes == w0 || !spu_coh_faststore_on(), "a store to an unheld line still woke someone");
++
++    printf("PPU stores %lu, PUTLLC ok %lu failed %lu, unlocked GETLLARs %lu, wakes %lu\n",
++           stores, ok, failed, fast, g_wakes);
++    printf("SPU lock-line stress tests: %d passed, %d failed\n", g_pass, g_fail);
++    return g_fail == 0 ? 0 : 1;
++}
 diff --git a/runtime/spu/tests/test_spu_float_rz_mode.c b/runtime/spu/tests/test_spu_float_rz_mode.c
 index 3e96dc4e..08924674 100644
 --- a/runtime/spu/tests/test_spu_float_rz_mode.c
@@ -8518,6 +9804,42 @@ index 3e96dc4e..08924674 100644
  #endif
  
  /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
+diff --git a/runtime/spu/tests/test_spu_poison_scan.c b/runtime/spu/tests/test_spu_poison_scan.c
+index 710392d8..91dd2e22 100644
+--- a/runtime/spu/tests/test_spu_poison_scan.c
++++ b/runtime/spu/tests/test_spu_poison_scan.c
+@@ -27,6 +27,7 @@ void spu_overlay_note_get(spu_context* c, uint32_t ea, const uint8_t* p, uint32_
+ { (void)c; (void)ea; (void)p; (void)n; }
+ int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
+ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_coh_notify_write_except(uint32_t ea, const void* c) { (void)ea; (void)c; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+diff --git a/runtime/spu/tests/test_spu_taskset_elf_flags.c b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+index 23d61ffe..bec40a19 100644
+--- a/runtime/spu/tests/test_spu_taskset_elf_flags.c
++++ b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+@@ -20,6 +20,7 @@ static uint32_t dispatched_size, dispatched_context;
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
+ {
+     dispatches++; dispatched_image = image; dispatched_size = size;
+diff --git a/runtime/spu/tests/test_spu_workload_masked.c b/runtime/spu/tests/test_spu_workload_masked.c
+index 81e3cc76..e494f64d 100644
+--- a/runtime/spu/tests/test_spu_workload_masked.c
++++ b/runtime/spu/tests/test_spu_workload_masked.c
+@@ -22,6 +22,7 @@ void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
+ uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
+ unsigned long long ps3_ms_now(void) { return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_coh_unregister(spu_context* c) { (void)c; }
+ void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void* opaque)
+ { (void)w; (void)ea; (void)wake; (void)opaque; }
 diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
 index 3a022815..27c422e7 100644
 --- a/runtime/syscalls/sys_timer.c
@@ -8632,6 +9954,90 @@ index 3a022815..27c422e7 100644
      if (usec > 0) {
          struct timespec ts;
          ts.tv_sec  = (time_t)(usec / 1000000);
+diff --git a/tests/fiber_switch/main.c b/tests/fiber_switch/main.c
+index 804dfc1d..98d9474b 100644
+--- a/tests/fiber_switch/main.c
++++ b/tests/fiber_switch/main.c
+@@ -55,6 +55,7 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_lockline_lock(void)   { }
+ void spu_lockline_unlock(void) { }
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ 
+ static uint32_t g_bump = 4096;   /* keep guest address 0 invalid */
+ static uint32_t guest_alloc(uint32_t size, uint32_t align)
+diff --git a/tests/test_gcm_ea2io_range.c b/tests/test_gcm_ea2io_range.c
+index 151e8568..0fcbaffd 100644
+--- a/tests/test_gcm_ea2io_range.c
++++ b/tests/test_gcm_ea2io_range.c
+@@ -14,6 +14,7 @@ int g_resv_store_active;
+ void ppu_resv_break_store(uint64_t addr) { (void)addr; abort(); }
+ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { abort(); }
+ void spu_lockline_unlock(void) { abort(); }
+ 
+diff --git a/tests/test_gcm_io_alloc.c b/tests/test_gcm_io_alloc.c
+index 5b749f9e..bd0d810c 100644
+--- a/tests/test_gcm_io_alloc.c
++++ b/tests/test_gcm_io_alloc.c
+@@ -15,6 +15,7 @@ int g_resv_store_active;
+ void ppu_resv_break_store(uint64_t addr) { (void)addr; abort(); }
+ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { abort(); }
+ void spu_lockline_unlock(void) { abort(); }
+ void (*g_spu_put_hook)(uint32_t ea, uint32_t size);   /* set by cellGcmInit */
+diff --git a/tests/test_gcm_map_flags.c b/tests/test_gcm_map_flags.c
+index 59eeedfd..b2417f97 100644
+--- a/tests/test_gcm_map_flags.c
++++ b/tests/test_gcm_map_flags.c
+@@ -10,6 +10,7 @@ int g_resv_store_active;
+ void ppu_resv_break_store(uint64_t addr) { (void)addr; abort(); }
+ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { abort(); }
+ void spu_lockline_unlock(void) { abort(); }
+ 
+diff --git a/tests/test_loaded_image_memory.cpp b/tests/test_loaded_image_memory.cpp
+index a678053b..169ea4bb 100644
+--- a/tests/test_loaded_image_memory.cpp
++++ b/tests/test_loaded_image_memory.cpp
+@@ -13,6 +13,7 @@ uint32_t ppu_load_elf(const char*);
+ /* These subsystems are inactive in a loader-only fixture. */
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) { std::abort(); }
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock(void) { std::abort(); }
+ void spu_lockline_unlock(void) { std::abort(); }
+ void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
+diff --git a/tests/test_sail_boot_callback.cpp b/tests/test_sail_boot_callback.cpp
+index 2b92932e..c3ea1f1b 100644
+--- a/tests/test_sail_boot_callback.cpp
++++ b/tests/test_sail_boot_callback.cpp
+@@ -24,6 +24,7 @@ uint32_t ppu_prof_resolve_host(void*) { return 0; }
+ void ps3_msf(const char*,...) {}
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) {}
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock() {}
+ void spu_lockline_unlock() {}
+ void ppu_resv_break_store(uint64_t) {}
+diff --git a/tests/test_sysmodule_unload_module_ex.cpp b/tests/test_sysmodule_unload_module_ex.cpp
+index c2546882..23cd448a 100644
+--- a/tests/test_sysmodule_unload_module_ex.cpp
++++ b/tests/test_sysmodule_unload_module_ex.cpp
+@@ -25,6 +25,7 @@ uint32_t ppu_prof_resolve_host(void*) { return 0; }
+ void ps3_msf(const char*,...) {}
+ int spu_coh_is_reserved(uint32_t) { return 0; }
+ void spu_coh_notify_write(uint32_t) {}
++int spu_coh_store_fast(uint32_t, const void*, uint32_t) { return 0; }
+ void spu_lockline_lock() {}
+ void spu_lockline_unlock() {}
+ void ppu_resv_break_store(uint64_t) {}
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
 index 35d8d428..8cf46ef1 100644
 --- a/tools/spu_lifter.py
