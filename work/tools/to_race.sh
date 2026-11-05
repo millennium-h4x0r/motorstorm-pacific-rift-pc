@@ -65,8 +65,14 @@ p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] || fail "Free-Play not sel
 # Free-Play -> game setup -> opponent setup (start race) -> vehicle select -> pick the bike
 press 0x4000 6; press 0x4000 6; press 0x4000 7; press 0x4000 3
 
-ok=0; for k in $(seq 1 20); do sleep 1; [ "$(probe yellow)" -gt 25 ] && { ok=1; break; }; done
-[ $ok = 1 ] || fail "no loading screen (a menu press did not land)"
+ok=0; for k in $(seq 1 20); do sleep 0.5; [ "$(probe yellow)" -gt 25 ] && { ok=1; break; }; done
+# With the SPIR-V disk cache a warm load can be over before the first probe:
+# carry on if the menu bar is gone (a menu screen would still show it).
+if [ $ok = 0 ]; then
+    m=$(probe menu)
+    python3 -c "import sys; sys.exit(0 if float('$m') < 0.2 else 1)" || fail "no loading screen (a menu press did not land)"
+    echo "to_race: no loading screen seen (fast load)"
+fi
 t0=$(date +%s)
 for k in $(seq 1 180); do sleep 1; [ "$(probe yellow)" -lt 8 ] && break; done
 echo "to_race: loading took $(( $(date +%s) - t0 + 1 )) s"

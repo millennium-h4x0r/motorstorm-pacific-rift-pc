@@ -21,3 +21,5 @@
 /work/port/spu/
 
 __pycache__/
+work/port/spu-*/
+work/port/build-*.log
