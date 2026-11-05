@@ -324,8 +324,21 @@ if(MSVC)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "/w;/bigobj")
 else()
-    set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-w;-ffp-contract=off")
+    # PORT_PPU_ARCH (default x86-64-v3: AVX2/FMA/BMI2/MOVBE). Without it the PPU
+    # TUs target baseline x86-64: every VMX vmaddfp/vnmsubfp lane was a call to
+    # libm fmaf (4 PLT calls per vector op; the VMX float helpers were ~9% of the
+    # race main thread), and big-endian guest loads could not use movbe. The
+    # PPU headers have no ISA-conditional code, and -ffp-contract=off keeps
+    # every rounding as written, so results are unchanged. Empty for a host
+    # without AVX2.
+    set(PORT_PPU_ARCH "x86-64-v3" CACHE STRING "-march for the lifted PPU sources (empty: compiler default)")
+    if(PORT_PPU_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-w;-ffp-contract=off;-march=${PORT_PPU_ARCH}")
+    else()
+        set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-w;-ffp-contract=off")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
