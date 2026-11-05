@@ -167,3 +167,22 @@ samples into a per-function histogram against the executable. See its
 README. A solo race profile of the main thread (2026-11-05): 53% lifted game
 code (incl. 7% job-counter spin), 15% out-of-line VMX float helpers, 4% PPU
 store coherence, 3% indirect-call dispatch, 2.4% HLE/syscalls.
+
+### Road to 60 fps (status 2026-11-05)
+
+Standard measurement: `work/tools/bench.sh` (10 s of pack racing from 2 s after GO, solo).
+Current tree: ~35-38 fps in the pack (p50 ~27 ms). Per-frame CPU: FIFO/RSX ~19-22 ms
+(the gate), main ~14.5, each of the 3 SPURS job workers ~12-15, MultiStream ~9-11.
+Heavy frames issue ~3500-5500 draws; the FIFO thread costs ~6 us per draw.
+
+Remaining structural steps (each multi-day):
+1. Asynchronous backend proxy: wrap `rsx_draw_backend` so void calls (bind_*, draw,
+   clear_*, present, release) are queued with copied payloads and recorded on a second
+   thread. Handle-returning calls (surface_view ~80/frame, snapshots, texture/target
+   create) must not drain the queue: allocate handles proxy-side and let the recorder
+   bind them later. Removes ~8-10 ms/frame (backend draw recording) from the FIFO thread.
+2. GPU-side vertex fetch (mirror guest vertex memory in GPU buffers with dirty tracking,
+   fetch and byteswap in the VP preamble). Removes most of fetch (~6-9 ms/frame).
+   Write-protect dirty tracking is risky: host syscalls into guest memory fail with EFAULT.
+3. Main thread: ~7% is the job-counter spin (func_0050C818); per-job SPU speed and the
+   PM-yield change (idle workers block instead of polling) are the levers.
