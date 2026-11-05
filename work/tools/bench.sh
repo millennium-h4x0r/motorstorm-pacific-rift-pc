@@ -58,21 +58,26 @@ classify() {
         sleep 0.2
     done | awk '/^Thread/{ if (lwp) emit(); match($0, /LWP [0-9]+/); lwp=substr($0, RSTART+4, RLENGTH-4); s=""; next }
                 /^#/{ s = s " " $0 }
-                function emit() { if (s ~ /frame_clock/) print lwp, "fifo"; else if (s ~ /spu_0e193327|ms_dsp_/) print lwp, "ms";
+                function emit() { if (s ~ /frame_clock/) print lwp, "fifo"; else if (s ~ /vk_ar_thread/) print lwp, "rec"; else if (s ~ /spu_0e193327|ms_dsp_/) print lwp, "ms";
                                   else if (s ~ /spurs_pm_worker/ && s ~ /jobmod|wws_pm/) print lwp, "job" }
                 END{ if (lwp) emit() }' | sort -u
 }
 
+# One bench round at a time across everyone's bench.sh runs: a round holds
+# work/inst/.bench.lock from boot to kill (concurrent instances skew results).
+LOCK="$ROOT/work/inst/.bench.lock"
 for r in $(seq 1 "$N"); do
+    exec 9>"$LOCK"
+    if ! flock -n 9; then echo "bench: waiting for $LOCK (another bench round is running)" >&2; flock 9; fi
     ok=0
     for try in 1 2 3; do                      # to_race.sh can miss a menu step: boot again
         kill_inst; wait 2>/dev/null; rm -f "$FL"; : > "$D/run.log"
-        env "$@" INST="$I" TIMEOUT=900 PS3RECOMP_VK_DUMP_EVERY=10 PS3RECOMP_FLIPLOG="$FL" work/run.sh >/dev/null 2>&1 &
+        env "$@" INST="$I" TIMEOUT=900 PS3RECOMP_VK_DUMP_EVERY=10 PS3RECOMP_FLIPLOG="$FL" work/run.sh >/dev/null 2>&1 9>&- &
         sleep 3
         if INST="$I" timeout 600 work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
         echo "round $r try $try: $(tail -1 "$D/to_race.txt")" >&2
     done
-    [ $ok = 1 ] || { echo "round $r: to_race failed 3 times" | tee -a "$OUT"; kill_inst; wait; continue; }
+    [ $ok = 1 ] || { echo "round $r: to_race failed 3 times" | tee -a "$OUT"; kill_inst; wait; flock -u 9; continue; }
     pid=$(inst_pid)
     # GO: the race timer lights up (countdown is ~4 s after the flyover skip)
     # the timer box shows 00:00.00 during the countdown: GO is when its digits start changing
@@ -81,7 +86,7 @@ for r in $(seq 1 "$N"); do
         go=0; s0=$(timer_sig)
         for k in $(seq 1 80); do sleep 0.2; s1=$(timer_sig); [ "$s1" != "$s0" ] && { go=1; break; }; done
     fi
-    [ $go = 1 ] || { echo "round $r: GO not seen" | tee -a "$OUT"; kill_inst; wait; continue; }
+    [ $go = 1 ] || { echo "round $r: GO not seen" | tee -a "$OUT"; kill_inst; wait; flock -u 9; continue; }
     echo "0x0200 100000" > "$D/pad.txt"          # hold R2 from GO: stay with the pack
     t_go=$(date +%s.%N)
     cls=$(classify "$pid")                        # takes ~1-2 s, inside the 2 s lead-in
@@ -121,11 +126,14 @@ msth = sorted((t for t, r in roles.items() if r == 'ms'), key=lambda t: -dc.get(
 parts = ['main %.1f' % ms(pid)]
 parts.append('fifo %.1f' % (ms(fifo[0]) if fifo else -1))
 parts.append('jobs ' + '/'.join('%.1f' % ms(t) for t in jobs))
+rec = [t for t, r in roles.items() if r == 'rec']
+if rec: parts.append('rec %.1f' % ms(rec[0]))
 parts.append('ms %.1f' % (ms(msth[0]) if msth else -1))
 print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), ', '.join(parts)))
 EOF
     ffmpeg -loglevel error -y -i "$F" -vf scale=640:-1 "$D/bench_r$r.png"
     kill_inst; wait
+    flock -u 9
 done
 python3 -I - "$OUT" <<'EOF'
 import re, sys
