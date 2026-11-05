@@ -2992,7 +2992,7 @@ index 3dcd91d5..d0587369 100644
  void spu_lockline_unlock(void) {}
  int main(void)
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c6..3813779d 100644
+index 82ea66c6..f50b8ce1 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -18,6 +18,11 @@
@@ -3099,7 +3099,7 @@ index 82ea66c6..3813779d 100644
      }
  }
  static void spurs_commit_hook(uint32_t line)
-@@ -523,11 +584,30 @@ static void spurs_api_unlock(struct SpursInst* si)
+@@ -523,11 +584,32 @@ static void spurs_api_unlock(struct SpursInst* si)
  {
      ReleaseSRWLockExclusive(&s_workload_registry_lock);
      WakeAllConditionVariable(&si->wake);
@@ -3118,19 +3118,21 @@ index 82ea66c6..3813779d 100644
 + * list's atomic line at byte 4 + 2 * spuNum of a quadword (`chd` at LS 0x2418),
 + * so spuNum 6 would wrap onto the list's own counters. An extra lane uses the
 + * workload priority of lane (sn % nspus), since the title set priorities only
-+ * for the SPUs it asked for. */
++ * for the SPUs it asked for. Only instances created with 5 or more SPUs are
++ * widened; the title's 1-SPU instance keeps its single lane. */
 +static u32 spurs_host_lanes(u32 nspus)
 +{
 +    const char* e = getenv("SPURS_HOST_SPUS");
 +    u32 n = e ? (u32)strtoul(e, NULL, 0) : 0;
 +    if (n > 6) n = 6;
++    if (nspus < 5) return nspus;   /* only the title's full-width instance; a 1-SPU one stays serial */
 +    return n > nspus ? n : nspus;
 +}
 +
  static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
  {
      if (!nspus || nspus > 6) return CELL_SPURS_CORE_ERROR_INVAL;
-@@ -551,6 +631,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -551,6 +633,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      ReleaseSRWLockExclusive(&si->lock);
      ReleaseSRWLockExclusive(&s_inst_directory_lock);
      si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
@@ -3138,7 +3140,7 @@ index 82ea66c6..3813779d 100644
      memset(si->prefix, 0, sizeof(si->prefix));
      if (prefix) memcpy(si->prefix, prefix, 15);
  
-@@ -567,8 +648,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -567,8 +650,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      if (start_rc) __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
      ReleaseSRWLockExclusive(&si->lock);
      if (start_rc) return start_rc;
@@ -3149,7 +3151,7 @@ index 82ea66c6..3813779d 100644
      return CELL_OK;
  }
  
-@@ -907,9 +988,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+@@ -907,9 +990,10 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
      /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
       * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
       * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
@@ -3161,7 +3163,7 @@ index 82ea66c6..3813779d 100644
  
      g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
      printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
-@@ -1085,7 +1167,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+@@ -1085,7 +1169,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              g_ydkj_real_taskset_ea = taskset_ea;
              g_ydkj_real_taskid     = i;
  
@@ -3170,7 +3172,7 @@ index 82ea66c6..3813779d 100644
                     " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                     s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
                     context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
-@@ -1394,6 +1476,17 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
+@@ -1394,6 +1478,17 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
      s32 lock_rc = spurs_api_lock(spurs_ea, &si);
      if (lock_rc) return lock_rc;
      const u8* priority_h = GUEST_PTR(priority, const u8*);
@@ -3188,7 +3190,7 @@ index 82ea66c6..3813779d 100644
  
  
      for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
-@@ -1714,6 +1807,34 @@ static WklPm* spurs_resolve_pm(u32 wid)
+@@ -1714,6 +1809,34 @@ static WklPm* spurs_resolve_pm(u32 wid)
   * occupies only its own slot; a later runnable producer can use another slot.
   * Admission and lifecycle state are serialized per instance. Guest execution
   * never runs under that lock, and only a genuine return releases contention. */
@@ -3223,7 +3225,7 @@ index 82ea66c6..3813779d 100644
  static DWORD WINAPI spurs_pm_worker(LPVOID p)
  {
      struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
-@@ -1729,12 +1850,20 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1729,12 +1852,22 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
              SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
          if (si->stopping && !slot->busy) break;
          ReleaseSRWLockExclusive(&si->lock);
@@ -3232,6 +3234,8 @@ index 82ea66c6..3813779d 100644
                                slot->data, slot->wid, slot->ea, slot->spu_num);
          extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
          unsigned polls = g_spurs_pm_polls;
++        if (polls) { extern void ps3_job_progress_signal(void);   /* PS3_USLEEP_WAKE (sys_timer.c) */
++                     ps3_job_progress_signal(); }   /* the run did work: a job may have finished */
          AcquireSRWLockExclusive(&si->lock);
          u32 wid = slot->wid;
 +        if (spurs_dstat_on() && wid < 16) {
@@ -3244,7 +3248,7 @@ index 82ea66c6..3813779d 100644
          if (si->active[wid]) si->active[wid]--;
          spu_lockline_lock();
          vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
-@@ -1742,7 +1871,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1742,7 +1875,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
          if (polls) si->idle[wid] = 0;
          else if (si->idle[wid] < 4) si->idle[wid]++;
          slot->busy = 0;
@@ -3253,7 +3257,7 @@ index 82ea66c6..3813779d 100644
      }
      ReleaseSRWLockExclusive(&si->lock);
      ps3_tprof_thread_exit();
-@@ -1767,7 +1896,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1767,7 +1900,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
              kick_pass = ++kick_run < 16;
          } else {
@@ -3263,7 +3267,7 @@ index 82ea66c6..3813779d 100644
              /* This full pass reads the line after any commit that woke it. */
              (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
          }
-@@ -1778,7 +1908,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1778,7 +1912,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          AcquireSRWLockExclusive(&s_workload_registry_lock);
          if (!kick_pass) si->pass_no++;
          u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
@@ -3272,7 +3276,7 @@ index 82ea66c6..3813779d 100644
              struct SpursPmSlot* slot = &si->slots[sn];
              if (slot->busy) continue;
              for (u32 checked = 0; checked < 16; checked++) {
-@@ -1788,7 +1918,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1788,7 +1922,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                      vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
                      !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
                      continue;
@@ -3281,7 +3285,7 @@ index 82ea66c6..3813779d 100644
                      continue; /* priority zero makes this physical lane ineligible */
                  u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
                  if (!maxcont || si->active[wid] >= maxcont) continue;
-@@ -1812,11 +1942,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1812,11 +1946,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  slot->pm_size = s_workloads[wid].sizePm;
                  slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
                  slot->wid = wid; slot->ea = ea;
@@ -3300,7 +3304,7 @@ index 82ea66c6..3813779d 100644
                  WakeAllConditionVariable(&si->wake);
                  break;
              }
-@@ -1835,7 +1972,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1835,7 +1976,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
        g_spu_line_commit_hook = spurs_commit_hook; }
      memset(si->active, 0, sizeof(si->active));
      memset(si->idle, 0, sizeof(si->idle));
@@ -3309,7 +3313,7 @@ index 82ea66c6..3813779d 100644
          struct SpursPmSlot* slot = &si->slots[sn];
          memset(slot, 0, sizeof(*slot));
          slot->instance = si; slot->spu_num = sn;
-@@ -1847,9 +1984,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1847,9 +1988,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
      return CELL_OK;
  failed:
      AcquireSRWLockExclusive(&si->lock);
@@ -3321,7 +3325,7 @@ index 82ea66c6..3813779d 100644
          HANDLE h = si->slots[sn].thread;
          if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
      }
-@@ -1866,10 +2003,10 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
+@@ -1866,10 +2007,10 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
      if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
      for (u32 wid = 0; wid < 16; wid++)
          if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
@@ -3334,7 +3338,7 @@ index 82ea66c6..3813779d 100644
          HANDLE h = si->slots[sn].thread;
          if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
      }
-@@ -1910,6 +2047,8 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
+@@ -1910,6 +2051,8 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
      s_workloads[wid].readyCount = value;
      /* The real store: the instance byte the kernel (poll thread) watches. */
      vm_write8(si->ea + SPURS_WKL_READY1 + wid, (u8)value);
@@ -3343,7 +3347,7 @@ index 82ea66c6..3813779d 100644
      {   static int _n = 0;
          if (_n < 32)
              printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
-@@ -3405,38 +3544,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3405,38 +3548,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
      return CELL_OK;
  }
  
@@ -3354,19 +3358,22 @@ index 82ea66c6..3813779d 100644
 - * reads the queue out of main memory itself. Disassembling image 1 around the
 - * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
 - * a 128-byte line at LS 0x80 and commits it with
-+/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
-  *
+- *
 - *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
 - *   rdch MFC_RdAtomicStat ; brnz -> retry
++/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
+  *
+- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
+- * bytes in guest memory ARE the interface, and they have to be the real
+- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
 + * Ported from the MotorStorm Apocalypse port (its toolkit patch), where the
 + * layout and protocol were read out of the libspurs task-side LFQueue code
 + * linked into an SPU zlib task. The consumer is recompiled SPU task code that
 + * works on the queue line in main memory with GETLLAR/PUTLLC, so the bytes ARE
 + * the interface. The PPU push is the pop protocol mirrored.
   *
-- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
-- * bytes in guest memory ARE the interface, and they have to be the real
-- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
+- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
 + *   +0x00 u16 pop  done index      +0x08 u16 push done index
 + *   +0x02 u16 pop  done bitmap     +0x0A u16 push done bitmap
 + *   +0x04 u16 pop  waiters (dir 3) +0x0C u16 push waiters (dir 3)
@@ -3377,9 +3384,6 @@ index 82ea66c6..3813779d 100644
 + *   +0x50 u16 push waiters  +0x52 u16 push waiter ids[15]
 + *   +0x70 u64 owner (taskset, or SPURS|1)
   *
-- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
-- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
-- *
 - * The title's own call corroborates the size: it passes q=0x4059FD00 with
 - * buffer=0x4059FD80, exactly 128 bytes later.
 - *
@@ -3422,7 +3426,7 @@ index 82ea66c6..3813779d 100644
  s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                  u32 size, u32 depth, u32 direction)
  {
-@@ -3445,30 +3595,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+@@ -3445,30 +3599,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
  
      uint32_t q = (uint32_t)queue_ea;
      for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
@@ -3459,7 +3463,7 @@ index 82ea66c6..3813779d 100644
                 (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
      return CELL_OK;
  }
-@@ -3479,3 +3616,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3479,3 +3620,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
      return CELL_OK;
  }
@@ -12570,7 +12574,7 @@ index 81e3cc76..e494f64d 100644
  void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void* opaque)
  { (void)w; (void)ea; (void)wake; (void)opaque; }
 diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
-index 3a022815..0fcd9cf3 100644
+index 3a022815..495b8282 100644
 --- a/runtime/syscalls/sys_timer.c
 +++ b/runtime/syscalls/sys_timer.c
 @@ -8,6 +8,9 @@
@@ -12583,10 +12587,98 @@ index 3a022815..0fcd9cf3 100644
  #include "sys_event.h"
  #include "../memory/vm.h"
  #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
-@@ -276,6 +279,118 @@ int64_t sys_timer_usleep(ppu_context* ctx)
+@@ -134,6 +137,27 @@ static void write_be64(uint32_t addr, uint64_t val)
+  *
+  * r3 = microseconds
+  * -----------------------------------------------------------------------*/
++/* Job progress for PS3_USLEEP_WAKE: bumped by libs/spurs whenever a SPURS
++ * policy-module run ends (a WWS job finished or the PM found nothing), and a
++ * listed usleep returns at the first bump instead of sleeping its period. */
++static volatile uint32_t g_job_progress;
++static volatile int g_job_progress_waiters;
++static volatile uint32_t g_pass_seq;      /* PS3_USLEEP_PASSWAKE */
++static volatile int g_pass_waiters;
++#if defined(__linux__)
++#include <linux/futex.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++void ps3_job_progress_signal(void)
++{
++    __atomic_add_fetch(&g_job_progress, 1u, __ATOMIC_SEQ_CST);
++#if defined(__linux__)
++    if (__atomic_load_n(&g_job_progress_waiters, __ATOMIC_SEQ_CST))
++        syscall(SYS_futex, &g_job_progress, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, NULL, NULL, 0);
++#endif
++}
++
+ int64_t sys_timer_usleep(ppu_context* ctx)
+ {
+     uint64_t usec = LV2_ARG_U64(ctx, 0);
+@@ -276,6 +300,178 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          } while (qpc_now.QuadPart < qpc_deadline);
      }
  #else
++    /* PS3_USLEEP_WAKE="<lr>[,<lr>...]": a usleep reached from one of these
++     * return addresses is a poll for SPU job completion. Sleep until the next
++     * SPURS policy-module run ends (ps3_job_progress_signal) or the period is
++     * up, whichever is first. Pacific Rift's JobBatchHandler (lr 0x004AF6D0)
++     * polls its job batches with usleep(200), and the main thread waits for
++     * that thread to release each finished batch (func_0094CC80), so the poll
++     * period sits on the frame's critical path. An early return is a short
++     * sleep to the guest. */
++#if defined(__linux__)
++    if (usec > 0 && usec <= 10000) {
++        static int s_wk_n = -1;
++        static uint32_t s_wk_lr[16];
++        if (s_wk_n < 0) {
++            int n = 0;
++            const char* e = getenv("PS3_USLEEP_WAKE");
++            for (const char* q = e; q && *q && n < 16; ) {
++                char* end;
++                unsigned long v = strtoul(q, &end, 16);
++                if (end == q) break;
++                s_wk_lr[n++] = (uint32_t)v;
++                q = (*end == ',') ? end + 1 : end;
++            }
++            s_wk_n = n;
++        }
++        int hit = 0;
++        for (int i = 0; i < s_wk_n; i++) if ((uint32_t)ctx->lr == s_wk_lr[i]) { hit = 1; break; }
++        /* PS3_USLEEP_PASSWAKE="<waiter lr>:<poller lr>": a usleep from <waiter
++         * lr> also returns as soon as some thread reaches a usleep from <poller
++         * lr>, i.e. the poller finished a pass. Pacific Rift's main thread
++         * (0x0094CCA8, the back-off in func_004B63F0 under func_0094CC80) waits
++         * for JobBatchHandler to release a finished batch, which it does in the
++         * pass that ends at its usleep (0x004AF6D0). */
++        { static int s_pw = -1; static uint32_t s_pw_waiter, s_pw_poller;
++          if (s_pw < 0) { const char* e = getenv("PS3_USLEEP_PASSWAKE"); char* end;
++              s_pw = 0;
++              if (e && *e) { s_pw_waiter = (uint32_t)strtoul(e, &end, 16);
++                  if (*end == ':') { s_pw_poller = (uint32_t)strtoul(end + 1, NULL, 16); s_pw = 1; } } }
++          if (s_pw && (uint32_t)ctx->lr == s_pw_poller) {
++              __atomic_add_fetch(&g_pass_seq, 1u, __ATOMIC_SEQ_CST);
++              if (__atomic_load_n(&g_pass_waiters, __ATOMIC_SEQ_CST))
++                  syscall(SYS_futex, &g_pass_seq, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, NULL, NULL, 0);
++          }
++          if (s_pw && (uint32_t)ctx->lr == s_pw_waiter) {
++              __atomic_add_fetch(&g_pass_waiters, 1, __ATOMIC_SEQ_CST);
++              const uint32_t seq = __atomic_load_n(&g_pass_seq, __ATOMIC_SEQ_CST);
++              struct timespec d = { (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
++              syscall(SYS_futex, &g_pass_seq, FUTEX_WAIT_PRIVATE, seq, &d, NULL, 0);
++              __atomic_sub_fetch(&g_pass_waiters, 1, __ATOMIC_SEQ_CST);
++              return CELL_OK;
++          } }
++        if (hit) {
++            __atomic_add_fetch(&g_job_progress_waiters, 1, __ATOMIC_SEQ_CST);
++            const uint32_t seq = __atomic_load_n(&g_job_progress, __ATOMIC_SEQ_CST);
++            struct timespec d = { (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
++            syscall(SYS_futex, &g_job_progress, FUTEX_WAIT_PRIVATE, seq, &d, NULL, 0);
++            __atomic_sub_fetch(&g_job_progress_waiters, 1, __ATOMIC_SEQ_CST);
++            return CELL_OK;
++        }
++    }
++#endif /* __linux__: PS3_USLEEP_WAKE / PS3_USLEEP_PASSWAKE */
 +    /* PS3_USLEEP_LOCKWAIT="<lr>[,<lr>...]:<reg>": a usleep reached from one of
 +     * these return addresses is a spinlock's back-off and register <reg> holds
 +     * the lock word's address. Wait until that word reads 0 (or the time is

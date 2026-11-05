@@ -514,10 +514,19 @@ int main(int argc, char** argv)
      * EvoDefault, EvoHigh) with maxContention=1, so each list runs on one SPU
      * and every race job runs serially. The WWS job manager claims jobs
      * atomically and orders them with its own barriers, so a list can be
-     * shared; let each run on up to 3 virtual SPUs (libs/spurs/cellSpurs.c).
-     * Race 7.9 -> 13.5 fps, visuals and a 3-minute race soak clean; 4 and 5
-     * gave no more. SPURS_MAXCONT_MIN=1 restores the hardware behaviour. */
-    setenv("SPURS_MAXCONT_MIN", "3", 0);
+     * shared; let each run on up to 6 virtual SPUs (libs/spurs/cellSpurs.c).
+     * Race 7.9 -> 13.5 fps at 3 (then the cap); with 6 host lanes below, the
+     * main race chain (WWS modules de/d0/c9/cb) runs 6-wide.
+     * SPURS_MAXCONT_MIN=1 restores the hardware behaviour. */
+    setenv("SPURS_MAXCONT_MIN", "6", 0);
+    /* DEVIATION FROM HARDWARE: the game's 5-SPU SPURS instance gets 6 host
+     * policy-module lanes (SPURS_HOST_SPUS, libs/spurs/cellSpurs.c); the guest
+     * still sees nSpus=5, and instances created with fewer than 5 SPUs keep
+     * their own count. 6 is the ceiling: the WWS job manager keeps a halfword
+     * per SPU at byte 4+2*spuNum of a quadword, so a 7th SPU would overwrite
+     * the list's own counter. Race (gpufetch, pack window) 42.7 -> 51.4 fps,
+     * main's job wait 9.1 -> 6.0 ms/frame. SPURS_HOST_SPUS=5 restores 5 lanes. */
+    setenv("SPURS_HOST_SPUS", "6", 0);
     /* GPU-side vertex fetch (rsx_draw_engine.c, "GPU-side vertex fetch"):
      * the vertex shader reads and decodes the guest's raw vertex and index
      * bytes from a pool instead of the FIFO thread building reference lists
