@@ -3,8 +3,10 @@
 #   [ROUNDS=3] [INST=bench] [BIN=...] work/tools/bench.sh [VAR=val ...]
 # Each round boots one solo instance, drives it into a Free-Play race with
 # to_race.sh, waits for GO (the race timer appears top right), holds R2 and
-# measures the 10 s window starting 2 s after GO: 12 vehicles in view, before
-# any crash. Prints fps, frame-interval p50/p90 and CPU ms per frame for main,
+# measures the 10 s window starting 2 s after GO. Holding R2 blind, our bike crashes somewhere in
+# that window, and where it lands swings a round by about +-5 fps; "pack" is the fps over
+# GO+0.5..3.5 s instead (the field in view, before the crash), steadier for A/Bs.
+# Prints fps, pack fps, frame-interval p50/p90 and CPU ms per frame for main,
 # the FIFO/RSX thread, the three busiest SPURS job workers and the MultiStream
 # SPU thread, then the mean over the rounds. Extra VAR=val args go to the game.
 # Kills the instance with SIGKILL after each round (the game ignores SIGINT).
@@ -94,14 +96,14 @@ for r in $(seq 1 "$N"); do
     [ $go = 1 ] || { echo "round $r: GO not seen" | tee -a "$OUT"; kill_inst; wait; flock -u 9; continue; }
     echo "0x0200 100000" > "$D/pad.txt"          # hold R2 from GO: stay with the pack
     t_go=$(date +%s.%N)
-    cls=$(classify "$pid")                        # takes ~1-2 s, inside the 2 s lead-in
-    python3 -I - "$pid" "$FL" "$t_go" "$r" "$cls" <<'EOF' | tee -a "$OUT"
+    # Thread roles come from gdb backtraces, which stop the game for a second or two: take
+    # them after the measurement windows (GO+12.5 s), not in the lead-in the pack window uses.
+    rm -f "$D/cls.txt"; ( sleep 12.5; classify "$pid" > "$D/cls.tmp"; mv "$D/cls.tmp" "$D/cls.txt" ) &
+    python3 -I - "$pid" "$FL" "$t_go" "$r" "$D/cls.txt" <<'EOF' | tee -a "$OUT"
 import os, sys, time
-pid, fl, t_go, rnd, cls = int(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
-roles = {}
-for line in cls.split('\n'):
-    p = line.split()
-    if len(p) == 2: roles[int(p[0])] = p[1]
+pid, fl, t_go, rnd, clsf = int(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
+mono_us = lambda: time.clock_gettime(time.CLOCK_MONOTONIC) * 1e6   # the clock PS3RECOMP_FLIPLOG uses
+go_mono = mono_us() - (time.time() - t_go) * 1e6
 hz = os.sysconf('SC_CLK_TCK')
 def cpu():
     d = {}
@@ -112,7 +114,6 @@ def cpu():
         except Exception: pass
     return d
 while time.time() < t_go + 2.0: time.sleep(0.01)
-mono_us = lambda: time.clock_gettime(time.CLOCK_MONOTONIC) * 1e6   # the clock PS3RECOMP_FLIPLOG uses
 if os.environ.get('FTRACE'):
     import signal; os.kill(pid, signal.SIGUSR2)   # opens the armed PS3_FTRACE window
 pt = os.environ.get('PROF_TRIGGER')               # a sampler's trigger file: present during the window
@@ -127,6 +128,17 @@ iv = sorted((b - a) / 1000.0 for a, b in zip(w, w[1:]))
 n = len(iv)
 fps = n / ((hi - lo) / 1e6) if n else 0.0
 p = lambda q: iv[min(n - 1, int(q * n))] if n else 0.0
+# Pack section, GO+0.5..3.5 s: the field in view, before our bike's crash (whose timing and
+# camera vary per round and swing the full window by about +-5 fps). Steadier for A/Bs.
+pw = [t for t in ts if go_mono + 0.5e6 <= t <= go_mono + 3.5e6]
+pack = (len(pw) - 1) / 3.0 if len(pw) > 1 else 0.0
+for k in range(300):                              # thread roles (taken after the window)
+    if os.path.exists(clsf): break
+    time.sleep(0.1)
+roles = {}
+for line in (open(clsf).read().split('\n') if os.path.exists(clsf) else []):
+    f2 = line.split()
+    if len(f2) == 2: roles[int(f2[0])] = f2[1]
 dc = {t: c1[t] - c0.get(t, 0) for t in c1}
 frames = max(1, n)
 def ms(t): return 1000.0 * dc.get(t, 0) / frames
@@ -139,7 +151,7 @@ parts.append('jobs ' + '/'.join('%.1f' % ms(t) for t in jobs))
 rec = [t for t, r in roles.items() if r == 'rec']
 if rec: parts.append('rec %.1f' % ms(rec[0]))
 parts.append('ms %.1f' % (ms(msth[0]) if msth else -1))
-print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), ', '.join(parts)))
+print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | pack %.1f fps | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), pack, ', '.join(parts)))
 EOF
     ffmpeg -loglevel error -y -i "$F" -vf scale=640:-1 "$D/bench_r$r.png"
     if [ -n "${FTRACE:-}" ]; then                     # the game writes the trace once the window closes
@@ -154,7 +166,7 @@ import re, sys
 rows = [l for l in open(sys.argv[1]) if 'fps' in l and 'round' in l]
 if not rows: print('bench: no valid rounds'); sys.exit(1)
 num = lambda pat, l: float(re.search(pat, l).group(1))
-keys = [('fps', r'([\d.]+) fps'), ('p50', r'p50 ([\d.]+)'), ('p90', r'p90 ([\d.]+)'),
+keys = [('fps', r'([\d.]+) fps'), ('pack', r'pack ([\d.]+) fps'), ('p50', r'p50 ([\d.]+)'), ('p90', r'p90 ([\d.]+)'),
         ('main', r'main ([\d.]+)'), ('fifo', r'fifo (-?[\d.]+)'), ('ms', r'ms (-?[\d.]+)$')]
 out = []
 for k, pat in keys:
