@@ -577,6 +577,19 @@ int main(int argc, char** argv)
     setenv("PS3_USLEEP_CAP", "4af6d0:50", 0);
 #endif
 
+    /* Game speed. The game paces itself at 30 fps: its vblank handler
+     * (func_00522448) releases a label every second vblank, and the RSX
+     * acquires that label (NV406E SEMAPHORE_ACQUIRE) before each flip. The
+     * game's simulation steps a fixed amount per frame. With acquires as
+     * no-ops (the toolkit default), we flipped on every vblank (59.6/s) and
+     * races ran 2.05x too fast (race timer 37.1 s over 18.1 s wall). Block on
+     * the acquire as the hardware does: the race timer then matches the wall
+     * clock and the race holds 30 fps. The 250 ms bound only guards against a
+     * label nobody writes; the vblank handler writes this one every 33 ms.
+     * GCM_SEMA_ACQUIRE=0 restores the old, double-speed behaviour. */
+    setenv("GCM_SEMA_ACQUIRE", "1", 0);
+    setenv("GCM_SEMA_ACQUIRE_MS", "250", 0);
+
     /* Translated guest shaders kept on disk (rsx_shader_spirv.cpp's cache:
      * one file per shader, keyed by stage + the whole HLSL text, which
      * carries every piece of state the translation baked in, and checked

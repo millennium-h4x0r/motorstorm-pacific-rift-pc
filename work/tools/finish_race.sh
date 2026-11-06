@@ -37,7 +37,7 @@ race_to_results(){ # $1 tag: hold R2 (refreshed short holds) until the results b
   local t0=$(date +%s) k=0 b
   while :; do echo "0x0200 300" > $D/pad.txt; sleep 4; k=$((k+1)); [ $((k % 15)) = 0 ] && shot $1_t$(( $(date +%s) - t0 ))
     b=$(bar); python3 -c "import sys; sys.exit(0 if $b > 0.5 else 1)" && break
-    [ $(( $(date +%s) - t0 )) -gt 1500 ] && { echo "$1: no results in 25 min"; return 1; }
+    [ $(( $(date +%s) - t0 )) -gt 3600 ] && { echo "$1: no results in 60 min"; return 1; }
     pgrep -f "$BIN /" >/dev/null || { echo "$1: GAME DIED"; return 1; }; done
   echo "$1: results after $(( $(date +%s) - t0 )) s"; : > $D/pad.txt; shot $1_results
   sleep 12; shot $1_results_drained    # let the last R2 hold run out (menus read the file only between holds)

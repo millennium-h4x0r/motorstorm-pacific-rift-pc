@@ -112,11 +112,11 @@ PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the m
 ## Performance
 
 - The lifted SPU sources must be built with `-msse4.1` (work/port/CMakeLists.txt). Without it, `spu_helpers.h` falls back to the byte-loop `spu_shufb` called out of line. That was the top hotspot of the Bink decode threads and made the FMV stutter.
-- Open bug, 2026-11-06: races run at about double speed. We complete a guest flip on every 59.94 Hz vblank (FTRACE: 59.6 flips/s), but the game appears to want 2 vblanks per frame (30 fps).
-  - cellGcmSetFlipMode is stored but never read (`cellGcmSys.c`).
-  - The game's VBlankHandler, func_00522448, counts vblanks against a threshold at [[r2-0x6A38]], then toggles a flag at [[r2-0x6A40]+0x14] + idx*72.
-  - So the fps measured until now (full about 65, pack about 57.6, clang-20) was vblank-capped, not CPU-bound.
-  - Investigation notes: `work/notes/speed_investigation.md`.
+- Game speed (fixed 2026-11-06): races ran 2.05x too fast (race timer 37.1 s over 18.1 s of wall time).
+  - Cause: the game paces itself at 30 fps. Its VBlankHandler (func_00522448) releases a GCM label once the vblank counter reaches the threshold at 0x011478BC (TOC-0x6A38). The RSX does an NV406E SEMAPHORE_ACQUIRE on that label before each flip. ps3recomp treats ACQUIRE as a no-op unless GCM_SEMA_ACQUIRE=1, so we flipped on every vblank (59.6/s).
+  - Fix: main.cpp defaults GCM_SEMA_ACQUIRE=1 with GCM_SEMA_ACQUIRE_MS=250. The race timer now matches the wall clock and races hold 30 fps.
+  - Every fps figure from before this fix (full about 65, pack about 57.6) is double-speed and vblank-capped, so it doesn't compare with current numbers.
+  - No native 60 fps mode: PPU_POKE=011478BC:1 (threshold 1) gives about 55 fps, but the race timer runs 1.7-1.8x fast. The simulation steps a fixed 1/30 s per frame; the EBOOT has 38 f32 1/30 constants. A correct-speed 60 fps would need a timestep patch.
 
 ## Audio (2026-11-04)
 
