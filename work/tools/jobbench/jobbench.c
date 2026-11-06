@@ -46,7 +46,13 @@ void spu_indirect_branch(spu_context* c)
 { c->pc &= SPU_LS_MASK; void (*f)(spu_context*) = lookup(c->pc); if (f) f(c); else unresolved++; }
 void spu_begin_image(int id) { (void)id; }
 void spu_halt(spu_context* c) { (void)c; fprintf(stderr, "jobbench: halt\n"); exit(3); }
-void spu_stop(spu_context* c, uint32_t code) { (void)c; fprintf(stderr, "jobbench: stop 0x%X\n", code); exit(3); }
+/* The runtime's spu_stop takes only ctx; the lifted code sets ctx->stop_code first. A stop here
+ * usually means the function checked data its own DMA would have brought in (jobbench moves none). */
+void spu_stop(spu_context* c) {
+    fprintf(stderr, "jobbench: stop code 0x%X pc 0x%X lr 0x%X r3 %08x\n", c->stop_code, c->pc,
+            c->gpr[0]._u32[0], c->gpr[3]._u32[0]);
+    exit(3);
+}
 void spu_drain_call(spu_context* c, uint32_t ret)
 {
     while (g_spu_trampoline_fn && (c->pc & SPU_LS_MASK) != ret) {

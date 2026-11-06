@@ -23,8 +23,11 @@ if [[ $target == inst:* ]]; then
 fi
 mkdir -p "$out"
 # gdb stops the game at every hit: take the bench lock so this never overlaps a bench.sh round
-exec 9>"$ROOT/work/inst/.bench.lock"
-flock -n 9 || { echo "capture: waiting for the bench lock" >&2; flock 9; }
+# JB_HAVE_LOCK=1: the caller already holds it (e.g. a script that booted the instance under it)
+if [ "${JB_HAVE_LOCK:-0}" != 1 ]; then
+    exec 9>"$ROOT/work/inst/.bench.lock"
+    flock -n 9 || { echo "capture: waiting for the bench lock" >&2; flock 9; }
+fi
 # spu_context layout: sizeof 0x41A60, gpr[128] at 0, the local-store pointer at 0x40800
 # (checked by the harness build: build.sh asserts both).
 cat > "$out/.capture.py" <<EOF

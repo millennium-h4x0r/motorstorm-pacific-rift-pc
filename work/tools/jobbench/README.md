@@ -13,7 +13,15 @@ real inputs, without the game running:
 
 Channels get fixed answers (MFC tag status: all complete; channel counts: 1; writes ignored).
 DMA therefore moves no data. What is timed is the lifted code on the captured local store,
-which is what helper and lifter changes affect. `SPU_FLOAT_RZ`'s MXCSR mode is on by default,
+which is what helper and lifter changes affect.
+
+**Caveat: replay time is not game time for code that loops on DMA.** A job that waits for a
+transfer and then processes the next block runs through its blocks back to back here (every tag
+reads complete at once), so it can do many more iterations per call than in the game.
+jobmod_e8d07656 func_4310 replayed as ~400 us per call, about 12 copies of 48 KB; an exact
+host fast path made that 17x faster in jobbench and changed nothing in the race. Use jobbench to
+compare variants of the same code (hashes and relative time), and confirm any expected frame
+gain with PS3_FTRACE job spans (kind 16) in the game. `SPU_FLOAT_RZ`'s MXCSR mode is on by default,
 as in the game; set `JB_EXACT=1` for the exact float forms.
 
 ## Use

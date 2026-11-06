@@ -156,8 +156,11 @@ elseif(PORT_ENABLE_SPU)
         # here, by clang, or the tail call degrades to a plain call and a guest
         # loop that branches indirectly walks the thread stack off its guard
         # page a few thousand iterations in.
+        # spu_fastpaths.c: exact host fast paths behind the lifter's --wrap-func
+        # (unreferenced, and harmless, in a lift without it).
         list(APPEND SPU_SOURCES ${SPU_LIFTED}
-             "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+             "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c"
+             "${CMAKE_CURRENT_SOURCE_DIR}/spu_fastpaths.c")
         # Generated beside the lift; each is present only once its generator
         # has been run, so each is included only if it is actually here.
         foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
