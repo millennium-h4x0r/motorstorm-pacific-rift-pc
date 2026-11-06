@@ -13788,7 +13788,7 @@ index 05609192..513f3354 100644
  
  def load(path):
 diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
-index 35d8d428..416a05ad 100644
+index 35d8d428..040b006f 100644
 --- a/tools/spu_lifter.py
 +++ b/tools/spu_lifter.py
 @@ -47,6 +47,7 @@ import argparse
@@ -14015,7 +14015,7 @@ index 35d8d428..416a05ad 100644
  def compute_link_returns(insns, bounds) -> set:
      """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
      as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
-@@ -529,6 +725,16 @@ class SPULifter:
+@@ -529,6 +725,17 @@ class SPULifter:
          # compute_link_returns(). Emitted as `return;` so they compose with the
          # brsl->C-call nesting instead of branching to an unregistered PC.
          self.link_return: set = set()
@@ -14029,10 +14029,11 @@ index 35d8d428..416a05ad 100644
 +        self.const_bi_unsafe: set = set()
 +        # --local-regs: emit_source runs localize_registers on every body.
 +        self.local_regs: bool = False
++        self.local_regs_funcs: set[str] = set()   # --local-regs-funcs: these functions only
  
      # ------------------------------------------------------------------ #
      def lift_function(self, insns: list[SPUInstruction],
-@@ -549,6 +755,11 @@ class SPULifter:
+@@ -549,6 +756,11 @@ class SPULifter:
          # every transfer. As gotos they would not, and a job waiting in a loop
          # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
          # each merged chunk entry hands back to the drain when one is pending.
@@ -14044,7 +14045,7 @@ index 35d8d428..416a05ad 100644
          merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
          last_insn = None
          for insn in insns:
-@@ -565,7 +776,8 @@ class SPULifter:
+@@ -565,7 +777,8 @@ class SPULifter:
              if c:
                  if self.trace:
                      func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
@@ -14054,7 +14055,7 @@ index 35d8d428..416a05ad 100644
                  if self.trace and insn.mnemonic not in _NO_RT_WRITE:
                      rt_idx = insn.raw & 0x7F
                      func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
-@@ -883,7 +1095,15 @@ class SPULifter:
+@@ -883,7 +1096,15 @@ class SPULifter:
              return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
          if mn == "wrch":
              # operands: channel, $rt
@@ -14071,7 +14072,7 @@ index 35d8d428..416a05ad 100644
  
          # ---- branches ----
          if mn in ("br", "bra"):
-@@ -971,6 +1191,28 @@ class SPULifter:
+@@ -971,6 +1192,28 @@ class SPULifter:
                  if tgt_reg != "0":
                      return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                  return f"{_ied}SPU_RET(ctx);"
@@ -14100,7 +14101,7 @@ index 35d8d428..416a05ad 100644
              # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
              return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                      f"g_spu_trampoline_fn = spu_indirect_branch; return;")
-@@ -1047,6 +1289,23 @@ class SPULifter:
+@@ -1047,6 +1290,23 @@ class SPULifter:
          }
          return table.get(mn, f"{word} != 0")
  
@@ -14124,17 +14125,18 @@ index 35d8d428..416a05ad 100644
      def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
          if tgt is None:
              return "/* TODO spu: unresolved branch */;"
-@@ -1082,7 +1341,8 @@ class SPULifter:
+@@ -1082,7 +1342,9 @@ class SPULifter:
          weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
          for f in self.functions:
              lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
 -            for b in f.body_lines:
-+            body = localize_registers(f.body_lines) if self.local_regs else f.body_lines
++            body = localize_registers(f.body_lines) \
++                if self.local_regs or f.name in self.local_regs_funcs else f.body_lines
 +            for b in body:
                  lines.append(b if b.endswith(":") else f"    {b}")
              lines.append("}")
              lines.append("")
-@@ -1179,6 +1439,18 @@ def main() -> None:
+@@ -1179,6 +1441,25 @@ def main() -> None:
                          "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                          "which append a zlib inflate string table + float tables "
                          "after the code at 0xAE68 / 0xAE48).")
@@ -14146,6 +14148,13 @@ index 35d8d428..416a05ad 100644
 +                        "between the statements that hand ctx to the runtime, "
 +                        "instead of storing to and reloading from ctx->gpr[] on "
 +                        "every instruction (see localize_registers). Speed only.")
++    p.add_argument("--local-regs-funcs", default="", metavar="NAMES",
++                   help="Comma-separated lifted function names (e.g. "
++                        "jobmod_..._spu_func_00004F80) to lift as --local-regs does, "
++                        "leaving the rest as they are: register promotion wins on long "
++                        "straight-line or loop-heavy functions and loses on small ones "
++                        "called in a loop (every call writes back and reloads). Names "
++                        "that do not occur in this lift are ignored. Speed only.")
 +    p.add_argument("--const-bi", action="store_true",
 +                   help="Dispatch `bi $rN` directly when rN was just loaded with "
 +                        "il/ila: a goto for a forward target inside the function, a "
@@ -14153,7 +14162,7 @@ index 35d8d428..416a05ad 100644
      p.add_argument("--merge-chunks", action="store_true",
                     help="Emit each run of contiguous chunks from one call target "
                          "to the next as ONE C function (branches between them "
-@@ -1197,7 +1469,10 @@ def main() -> None:
+@@ -1197,7 +1478,10 @@ def main() -> None:
                          "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
                          "dispatched blocks later -- classified as a return, which "
                          "silently skipped every job-command handler).")
@@ -14165,11 +14174,12 @@ index 35d8d428..416a05ad 100644
  
      if args.auto_functions:
          from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
-@@ -1332,6 +1607,14 @@ def main() -> None:
+@@ -1332,6 +1616,15 @@ def main() -> None:
                f"(`bi $rN` where rN is a brsl/bisl link reg): "
                f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
      lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
 +    lifter.local_regs = args.local_regs
++    lifter.local_regs_funcs = {n.strip() for n in args.local_regs_funcs.split(',') if n.strip()}
 +    lifter.inline_mfc_params = args.inline_mfc_params
 +    if args.const_bi:
 +        lifter.const_bi = compute_const_bi_targets(insns, bounds)
@@ -14182,10 +14192,10 @@ index 35d8d428..416a05ad 100644
          seeds = {base}
 diff --git a/tools/test_spu_lifter_local_regs.py b/tools/test_spu_lifter_local_regs.py
 new file mode 100644
-index 00000000..f8057311
+index 00000000..873e07b0
 --- /dev/null
 +++ b/tools/test_spu_lifter_local_regs.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,271 @@
 +#!/usr/bin/env python3
 +"""--local-regs and --const-bi must not change what a lifted program computes.
 +
@@ -14435,6 +14445,24 @@ index 00000000..f8057311
 +        with self.assertRaises(ValueError):
 +            localize_registers(['    ctx->gpr[1] = spu_il(1);',
 +                                '    if (spu_rdch(ctx, 0)._u32[0]) goto loc_00000010;'])
++
++
++class LocalRegsFuncs(unittest.TestCase):
++    def test_only_named_functions_are_localized(self):
++        """--local-regs-funcs promotes the named functions and leaves the others on ctx->gpr."""
++        words, _ = LOOP
++        bounds = [(0x00, 0x04), (0x04, 0x18)]
++        insns = disassemble_spu(b''.join(struct.pack('>I', w) for w in words), 0)
++        lifter = SPULifter()
++        lifter.func_starts = {s for s, _ in bounds}
++        lifter.local_regs_funcs = {"spu_func_00000004"}
++        for s, e in bounds:
++            lifter.lift_function(insns, s, e)
++        src = lifter.emit_source("lifted.h")
++        f0 = src[src.index("void spu_func_00000000("):src.index("void spu_func_00000004(")]
++        f4 = src[src.index("void spu_func_00000004("):]
++        self.assertNotIn("spu_v4u sr", f0)
++        self.assertIn("spu_v4u sr3 = spu_u2v(ctx->gpr[3]);", f4)
 +
 +
 +if __name__ == '__main__':
