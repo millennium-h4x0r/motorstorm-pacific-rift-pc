@@ -112,6 +112,11 @@ PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the m
 ## Performance
 
 - The lifted SPU sources must be built with `-msse4.1` (work/port/CMakeLists.txt). Without it, `spu_helpers.h` falls back to the byte-loop `spu_shufb` called out of line. That was the top hotspot of the Bink decode threads and made the FMV stutter.
+- Open bug, 2026-11-06: races run at about double speed. We complete a guest flip on every 59.94 Hz vblank (FTRACE: 59.6 flips/s), but the game appears to want 2 vblanks per frame (30 fps).
+  - cellGcmSetFlipMode is stored but never read (`cellGcmSys.c`).
+  - The game's VBlankHandler, func_00522448, counts vblanks against a threshold at [[r2-0x6A38]], then toggles a flag at [[r2-0x6A40]+0x14] + idx*72.
+  - So the fps measured until now (full about 65, pack about 57.6, clang-20) was vblank-capped, not CPU-bound.
+  - Investigation notes: `work/notes/speed_investigation.md`.
 
 ## Audio (2026-11-04)
 
