@@ -7932,7 +7932,7 @@ index 00000000..c4705297
 +
 +#endif
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302e..8854a339 100644
+index db64302e..5c1ddbda 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -42,6 +42,8 @@
@@ -9685,7 +9685,7 @@ index db64302e..8854a339 100644
 +    VkImage       written[VK_EB_WRITTEN_MAX];   /* attachments rendered since the last barrier */
 +    unsigned long long passes, merged, barriers;
 +} s_rpm = { .on = -1, .need_barrier = 1 };
-+
+ 
 +static int vk_rpm_on(void)
 +{
 +    if (s_rpm.on < 0) { const char* e = getenv("VK_EB_MERGE"); s_rpm.on = !(e && *e == '0'); }
@@ -9730,7 +9730,7 @@ index db64302e..8854a339 100644
 +        return s_eobj[o->surface].im.img;
 +    return o->im.img;
 +}
- 
++
 +/* Heads are relative to the half being recorded into (the whole ring when
 + * not double-buffered); the offset returned is absolute. */
  static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -10101,7 +10101,7 @@ index db64302e..8854a339 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
-@@ -3783,11 +4995,818 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3783,11 +4995,863 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .readback             = vk_eng_readback,
      .depth_readback       = vk_eng_depth_readback,
      .color_target_write   = vk_eng_color_target_write,
@@ -10215,7 +10215,8 @@ index db64302e..8854a339 100644
 +
 +enum { AR_TEXC = 1, AR_TEXU, AR_REL, AR_CTC, AR_CTW, AR_VIEW, AR_DTC, AR_DSNAP, AR_PIPE,
 +       AR_BT, AR_BP, AR_VSC, AR_PSC, AR_BTEX, AR_BVTEX, AR_VP, AR_SC, AR_STEN, AR_DB, AR_DRAW,
-+       AR_CLRC, AR_CLRD, AR_PRESENT, AR_CSNAP, AR_CSNAPR, AR_RBA, AR_SAW, AR_DFETCH, AR_FSER, AR_WRAP };
++       AR_CLRC, AR_CLRD, AR_PRESENT, AR_CSNAP, AR_CSNAPR, AR_RBA, AR_SAW, AR_DFETCH, AR_FSER,
++       AR_TEX3C, AR_TEX3U, AR_CLRCR, AR_CLRDR, AR_DBIAS, AR_WRAP };
 +enum { AR_REL_TEX, AR_REL_CT, AR_REL_DT, AR_REL_PIPE };
 +
 +typedef struct { u32 op, size; } ar_hdr;     /* size: bytes incl. header, 16-aligned */
@@ -10458,6 +10459,10 @@ index db64302e..8854a339 100644
 +typedef struct { rsx_topology topo; u32 vcount, stride, icount; } ar_draw;
 +typedef struct { u32 surface; float rgba[4]; } ar_clrc;
 +typedef struct { u32 depth, flags; float dv; u32 stencil; } ar_clrd;
++typedef struct { u32 v; rsx_be_format fmt; u32 w, h, depth, mips, remap, rsx_fmt; } ar_tex3c;
++typedef struct { u32 tex, z, mip, w, h, row_bytes; } ar_tex3u;
++typedef struct { u32 surface; float rgba[4]; u32 x, y, w, h; } ar_clrcr;
++typedef struct { u32 depth, flags; float dv; u32 stencil, x, y, w, h; } ar_clrdr;
 +typedef struct { u32 v, surface, w, h; } ar_csnap;
 +typedef struct { u32 v, surface, x, y, w, h; } ar_rba;
 +
@@ -10527,6 +10532,15 @@ index db64302e..8854a339 100644
 +        b->draw(u, a->topo, v, a->vcount, a->stride, a->icount ? (const u32*)(v + vb) : NULL, a->icount); break; }
 +    case AR_CLRC: { const ar_clrc* a = p; b->clear_color(u, ar_x(a->surface), a->rgba); break; }
 +    case AR_CLRD: { const ar_clrd* a = p; b->clear_depth_stencil(u, ar_x(a->depth), a->flags, a->dv, (u8)a->stencil); break; }
++    case AR_TEX3C: { const ar_tex3c* a = p;
++        ar_set(a->v, b->texture_create_3d(u, a->fmt, a->w, a->h, a->depth, a->mips, a->remap, a->rsx_fmt)); break; }
++    case AR_TEX3U: { const ar_tex3u* a = p;
++        b->texture_upload_3d(u, ar_x(a->tex), a->z, a->mip, a->w, a->h, a + 1, a->row_bytes); break; }
++    case AR_CLRCR: { const ar_clrcr* a = p;
++        b->clear_color_rect(u, ar_x(a->surface), a->rgba, a->x, a->y, a->w, a->h); break; }
++    case AR_CLRDR: { const ar_clrdr* a = p;
++        b->clear_depth_stencil_rect(u, ar_x(a->depth), a->flags, a->dv, (u8)a->stencil, a->x, a->y, a->w, a->h); break; }
++    case AR_DBIAS: { const ar_f4* a = p; b->set_depth_bias(u, a->a, a->b, (u32)a->c); break; }
 +    case AR_PRESENT: { const u32* a = p; b->present(u, ar_x(*a)); break; }
 +    case AR_CSNAP: { const ar_csnap* a = p; const u32 s = ar_x(a->surface);
 +        ar_set(a->v, s ? b->color_snapshot(u, s) : 0); break; }
@@ -10796,6 +10810,32 @@ index db64302e..8854a339 100644
 +static void arp_clear_depth_stencil(void* u, u32 d, u32 f, float dv, u8 st)
 +{ (void)u; AR_PUT(AR_CLRD, ar_clrd, a); a->depth = d; a->flags = f; a->dv = dv; a->stencil = st; ar_commit(); }
 +static void arp_present(void* u, u32 s) { (void)u; u32* a = ar_begin(AR_PRESENT, 4); *a = s; ar_commit(); }
++/* Volume textures, rectangle clears and polygon offset (gfx-debug): queued
++ * like their 2D / whole-target / depth-bounds counterparts above. */
++static u32 arp_texture_create_3d(void* u, rsx_be_format f, u32 w, u32 h, u32 d, u32 m, u32 r, u32 rf)
++{
++    (void)u; const u32 v = ar_vnew(); if (!v) return 0;
++    AR_PUT(AR_TEX3C, ar_tex3c, a); a->v = v; a->fmt = f; a->w = w; a->h = h; a->depth = d; a->mips = m;
++    a->remap = r; a->rsx_fmt = rf; ar_commit(); return v;
++}
++static void arp_texture_upload_3d(void* u, u32 t, u32 z, u32 m, u32 w, u32 h, const void* src, u32 rb)
++{
++    (void)u; const size_t bytes = (size_t)rb * h;
++    if (bytes + 1024 > VK_AR_RING / 2) {
++        vk_ar_drain_lock(); s_ar_in->texture_upload_3d(s_ar_in->user, ar_x(t), z, m, w, h, src, rb); vk_ar_unlock(); return;
++    }
++    ar_tex3u* a = ar_begin(AR_TEX3U, sizeof(ar_tex3u) + bytes);
++    a->tex = t; a->z = z; a->mip = m; a->w = w; a->h = h; a->row_bytes = rb;
++    memcpy(a + 1, src, bytes); ar_commit();
++}
++static void arp_clear_color_rect(void* u, u32 s, const float c[4], u32 x, u32 y, u32 w, u32 h)
++{ (void)u; AR_PUT(AR_CLRCR, ar_clrcr, a); a->surface = s; memcpy(a->rgba, c, 16);
++  a->x = x; a->y = y; a->w = w; a->h = h; ar_commit(); }
++static void arp_clear_depth_stencil_rect(void* u, u32 d, u32 f, float dv, u8 st, u32 x, u32 y, u32 w, u32 h)
++{ (void)u; AR_PUT(AR_CLRDR, ar_clrdr, a); a->depth = d; a->flags = f; a->dv = dv; a->stencil = st;
++  a->x = x; a->y = y; a->w = w; a->h = h; ar_commit(); }
++static void arp_set_depth_bias(void* u, float slope, float units, u32 bits)
++{ (void)u; AR_PUT(AR_DBIAS, ar_f4, a); a->a = slope; a->b = units; a->c = (float)bits; a->d = 0; ar_commit(); }
 +static void arp_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h, void* out, u32 pitch)
 +{ (void)u; vk_ar_drain_lock(); s_ar_in->readback(s_ar_in->user, ar_x(s), x, y, w, h, out, pitch); vk_ar_unlock(); }
 +static int arp_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h, float* out, u32 pitch)
@@ -10910,9 +10950,14 @@ index db64302e..8854a339 100644
 +    b->fetch_pool = gf ? arp_fetch_pool : NULL;
 +    b->fetch_serial = gf ? arp_fetch_serial : NULL;
 +    b->draw_fetch = gf ? arp_draw_fetch : NULL;
-+    /* not proxied: nothing in the Vulkan backend implements them yet */
-+    b->texture_create_3d = NULL; b->texture_upload_3d = NULL; b->depth_as_color = NULL;
-+    b->set_depth_bias = NULL; b->clear_color_rect = NULL; b->clear_depth_stencil_rect = NULL;
++    const int v3 = inner->texture_create_3d && inner->texture_upload_3d;
++    b->texture_create_3d = v3 ? arp_texture_create_3d : NULL;
++    b->texture_upload_3d = v3 ? arp_texture_upload_3d : NULL;
++    b->set_depth_bias = inner->set_depth_bias ? arp_set_depth_bias : NULL;
++    b->clear_color_rect = inner->clear_color_rect ? arp_clear_color_rect : NULL;
++    b->clear_depth_stencil_rect = inner->clear_depth_stencil_rect ? arp_clear_depth_stencil_rect : NULL;
++    /* not proxied: nothing in the Vulkan backend implements it yet */
++    b->depth_as_color = NULL;
 +    VK_LOG("asynchronous recording: on (%u MB ring, recorder thread)\n", VK_AR_RING >> 20);
 +    return b;
 +}
@@ -10920,7 +10965,7 @@ index db64302e..8854a339 100644
  static rsx_backend s_vulkan_backend = {
      .userdata           = &s_vk,
      .set_render_target  = vk_cb_track_state,
-@@ -3937,6 +5956,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3937,6 +6001,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      if (vk_submit_and_wait()) return -1;
  
      if (s_vk.windowed) {
@@ -10932,7 +10977,7 @@ index db64302e..8854a339 100644
          VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
          if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
              vk_create_swapchain())
-@@ -3961,7 +5985,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
+@@ -3961,7 +6030,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
       * pipeline from the guest's programs, so without them it has nothing to
       * draw with, and the vtable's fixed-function path stays the default.
       * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
@@ -10941,7 +10986,7 @@ index db64302e..8854a339 100644
      rsx_draw_engine_set_default(s_g.on ? 1 : 0);
      if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
          s_vk.eng_active = 1;
-@@ -4025,14 +6049,39 @@ void rsx_vulkan_backend_shutdown(void)
+@@ -4025,14 +6094,39 @@ void rsx_vulkan_backend_shutdown(void)
      memset(&s_vk, 0, sizeof s_vk);
  }
  
@@ -10981,7 +11026,7 @@ index db64302e..8854a339 100644
      }
      return quit ? -1 : 0;
  }
-@@ -4040,12 +6089,20 @@ int rsx_vulkan_backend_pump_messages(void)
+@@ -4040,12 +6134,20 @@ int rsx_vulkan_backend_pump_messages(void)
  void rsx_vulkan_backend_present(void)
  {
      rsx_vulkan_backend_present_begin();
@@ -11003,7 +11048,7 @@ index db64302e..8854a339 100644
      s_vk.present_split = 1;
      if (s_vk.eng_active) rsx_draw_engine_present();
      else                 vk_cb_present(&s_vk, 0);
-@@ -4055,9 +6112,12 @@ void rsx_vulkan_backend_present_begin(void)
+@@ -4055,9 +6157,12 @@ void rsx_vulkan_backend_present_begin(void)
  void rsx_vulkan_backend_present_finish(void)
  {
      if (!s_vk.device) return;
