@@ -12823,6 +12823,54 @@ index f04fda63..d6e8a4ad 100644
 +#endif
 +
  #endif /* SPU_HELPERS_H */
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 499f3a65..d3df4a86 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -19,6 +19,16 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <stddef.h>   /* offsetof */
++
++/* Set (on its own thread, around one call) by a caller that frees the local
++ * store as soon as the job returns, so the 256 KB copy back out is skipped
++ * (spu_workload.c: async SPURS tasks). */
++#if defined(_MSC_VER)
++__declspec(selectany) SPU_THREAD_LOCAL int g_spu_job_ls_discard;
++#else
++SPU_THREAD_LOCAL int g_spu_job_ls_discard __attribute__((weak));
++#endif
+ 
+ void spu_mfc_release(spu_context* ctx);   /* spu_channels.c */
+ 
+@@ -164,7 +174,16 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+ {
+     if (!entry) return -1;
+     spu_context ctx;
+-    spu_context_init(&ctx, 0);
++    if (local_store && !opts) {
++        /* spu_context_init, except the 256 KB ls_store, which the copy below
++         * overwrites in full anyway (a raw thread's context is published to
++         * other threads before that copy, so it keeps the full init). */
++        const size_t o = offsetof(spu_context, ls_store);
++        memset(&ctx, 0, o);
++        memset((uint8_t*)&ctx + o + SPU_LS_SIZE, 0, sizeof ctx - o - SPU_LS_SIZE);
++        ctx.ls = ctx.ls_store; ctx.spu_id = 0; ctx.status = SPU_STATUS_STOPPED;
++    } else
++        spu_context_init(&ctx, 0);
+     { static int s_cl = -1;
+       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
+@@ -339,7 +358,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+     spu_mfc_release(&ctx);
+     spu_coh_unregister(&ctx);
+     spu_mfc_release(&ctx);   /* or its MFC slot leaks and later SPUs share one engine */
+-    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
++    if (local_store && !g_spu_job_ls_discard) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+     return 0;
+ }
+ 
 diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
 index 08af5b11..351e88bc 100644
 --- a/runtime/spu/spu_overlay_residency.h
@@ -12846,7 +12894,7 @@ index 08af5b11..351e88bc 100644
  }
  #endif
 diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
-index 3ce8d0d6..ec562587 100644
+index 3ce8d0d6..160b8dbf 100644
 --- a/runtime/spu/spu_workload.c
 +++ b/runtime/spu/spu_workload.c
 @@ -17,6 +17,9 @@
@@ -12859,7 +12907,73 @@ index 3ce8d0d6..ec562587 100644
  #include <errno.h>
  #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
  #endif
-@@ -839,9 +842,18 @@ static void spu_async_run(spu_async_job* j)
+@@ -640,6 +643,53 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
+     if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
+ }
+ 
++/* A pool thread's reusable local store for per-dispatch tasks (SPU_LS_REUSE,
++ * default on; =0 restores a calloc per task). Each async task started with a
++ * fresh zeroed 256 KB LS (calloc), got its ELF segments and SpursTasksetContext
++ * written into it, and was freed after the run: a 256 KB memset per task, ~25
++ * tasks a race frame. With the copy back out skipped (g_spu_job_ls_discard),
++ * the only bytes ever written into this buffer are the ELF's PT_LOAD ranges
++ * and the kernel/context area below 0x3000, so zeroing exactly those leaves it
++ * in the same all-zero state calloc gave. Not used for the persistent-LS, cri
++ * (image 22) or SPU_LS_DUMP paths, which keep their own buffers. */
++static int spu_ls_reuse_enabled(void)
++{ static int on = -1; if (on < 0) { const char* e = getenv("SPU_LS_REUSE"); on = !(e && *e == '0'); } return on; }
++static SPU_THREAD_LOCAL uint8_t* t_ls_buf;
++static SPU_THREAD_LOCAL uint32_t t_ls_dirty[18][2];   /* [lo, hi) ranges written since it was last zero */
++static SPU_THREAD_LOCAL unsigned t_ls_ndirty;
++static uint8_t* spu_ls_take(const uint8_t* image, size_t image_size)
++{
++    if (!t_ls_buf) {
++        t_ls_buf = (uint8_t*)calloc(1, SPU_LS_SIZE);
++        if (!t_ls_buf) return NULL;
++    } else {
++        for (unsigned i = 0; i < t_ls_ndirty; i++)
++            memset(t_ls_buf + t_ls_dirty[i][0], 0, t_ls_dirty[i][1] - t_ls_dirty[i][0]);
++    }
++    /* What this task writes before it runs: the kernel/context area, and its
++     * PT_LOAD segments (spu_elf_load_to_ls). If the ELF does not parse, the
++     * whole buffer counts as written. */
++    t_ls_ndirty = 0;
++    t_ls_dirty[t_ls_ndirty][0] = 0; t_ls_dirty[t_ls_ndirty][1] = 0x3000; t_ls_ndirty++;
++    int ok = image && image_size >= 0x34 && image[0] == 0x7F && image[1] == 'E';
++    if (ok) {
++        const uint32_t phoff = rd_be32(image + 0x1C);
++        uint16_t phent = rd_be16(image + 0x2A); const uint16_t phnum = rd_be16(image + 0x2C);
++        if (phent < 0x20) phent = 0x20;
++        for (uint16_t i = 0; i < phnum && ok; i++) {
++            const size_t po = (size_t)phoff + (size_t)i * phent;
++            if (po + 0x20 > image_size) break;
++            const uint8_t* ph = image + po;
++            if (rd_be32(ph) != 1) continue;
++            const uint32_t va = rd_be32(ph + 0x08), mem = rd_be32(ph + 0x14);
++            if ((uint64_t)va + mem > SPU_LS_SIZE || t_ls_ndirty == 18) { ok = 0; break; }
++            t_ls_dirty[t_ls_ndirty][0] = va; t_ls_dirty[t_ls_ndirty][1] = va + mem; t_ls_ndirty++;
++        }
++    }
++    if (!ok) { t_ls_ndirty = 1; t_ls_dirty[0][0] = 0; t_ls_dirty[0][1] = SPU_LS_SIZE; }
++    return t_ls_buf;
++}
++
+ static void spu_async_run(spu_async_job* j)
+ {
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+@@ -663,7 +713,10 @@ static void spu_async_run(spu_async_job* j)
+                     j->taskset_ea, j->taskid, j->image_id,
+                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
+     } else {
+-        ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
++        static int s_dump = -1; if (s_dump < 0) s_dump = getenv("SPU_LS_DUMP") ? 1 : 0;
++        ls = (spu_ls_reuse_enabled() && j->image_id != 22 && !s_dump)
++           ? spu_ls_take(j->image, j->image_size)
++           : (uint8_t*)calloc(1, SPU_LS_SIZE);
+     }
+     if (ls) {
+         uint32_t entry = 0;
+@@ -839,9 +892,18 @@ static void spu_async_run(spu_async_job* j)
                   * both audio tasks run task 1's descriptor). */
                  if (j->taskset_ea) {
                      spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
@@ -12881,7 +12995,22 @@ index 3ce8d0d6..ec562587 100644
                  }
              }
              /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
-@@ -979,8 +991,10 @@ static void spu_async_run(spu_async_job* j)
+@@ -927,8 +989,14 @@ static void spu_async_run(spu_async_job* j)
+                 #undef RDBE32
+             }
+             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
++            /* A per-dispatch local store is freed right after the run unless the
++             * cri resume loop reuses it or SPU_LS_DUMP writes it out: skip the
++             * runner's 256 KB copy back for every other task. */
++            { static int s_dump = -1; if (s_dump < 0) s_dump = getenv("SPU_LS_DUMP") ? 1 : 0;
++              g_spu_job_ls_discard = !ts_slot && j->image_id != 22 && !s_dump; }
+             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                 1, j->have_r3 ? j->r3 : 0, 0);
++            g_spu_job_ls_discard = 0;
+             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
+              * the kernel re-enters it when work is signaled. Our HLE runs it once,
+              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
+@@ -979,14 +1047,16 @@ static void spu_async_run(spu_async_job* j)
                    FILE* f = fopen(path, "wb");
                    if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                        fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
@@ -12894,7 +13023,14 @@ index 3ce8d0d6..ec562587 100644
              spu_serial_release();
              if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
          }
-@@ -999,6 +1013,7 @@ static void spu_async_run(spu_async_job* j)
+         /* Persistent LS is retained in its taskset slot for the next task; a
+          * per-dispatch LS is freed. */
+-        if (!ts_slot) free(ls);
++        if (!ts_slot && ls != t_ls_buf) free(ls);
+     }
+     if (ts_slot) {
+ #ifdef _WIN32
+@@ -999,6 +1069,7 @@ static void spu_async_run(spu_async_job* j)
  }
  
  #ifdef _WIN32
@@ -12902,7 +13038,7 @@ index 3ce8d0d6..ec562587 100644
  static DWORD WINAPI spu_async_thread(LPVOID p) {
      ps3_thread_name("spu job");
      /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
-@@ -1014,7 +1029,68 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
+@@ -1014,7 +1085,68 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      return 0;
  }
  #else
@@ -12972,7 +13108,7 @@ index 3ce8d0d6..ec562587 100644
  #endif
  
  int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
-@@ -1224,13 +1300,24 @@ uint16_t spu_ef_bits_take(uint32_t obj)
+@@ -1224,13 +1356,24 @@ uint16_t spu_ef_bits_take(uint32_t obj)
  #define SPU_WAKE_LATCH_MAX 16
  static volatile uint32_t s_wake_latch[SPU_WAKE_LATCH_MAX];   /* taskset EA, 0 = free */
  
@@ -12999,7 +13135,7 @@ index 3ce8d0d6..ec562587 100644
  }
  
  /* Consume a latched wake for this taskset. Returns 1 if one was pending. */
-@@ -1379,6 +1466,36 @@ void spu_taskset_line_committed(uint32_t line)
+@@ -1379,6 +1522,36 @@ void spu_taskset_line_committed(uint32_t line)
      }
  }
  
@@ -13036,7 +13172,7 @@ index 3ce8d0d6..ec562587 100644
  /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
   * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
   * until one is delivered. Returns 0 (the syscall's success rc). */
-@@ -1434,7 +1551,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1434,7 +1607,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
       * path (complete its loop / set completion flags) instead of hanging. 0/unset
       * keeps the block-forever behaviour. Reversible, opt-in. */
      unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
@@ -13045,7 +13181,7 @@ index 3ce8d0d6..ec562587 100644
      /* Release the global SPU-serial lock while parked so another SPU task can
       * run (and possibly signal us); re-acquired before returning to resume. */
      spu_serial_release();
-@@ -1444,7 +1561,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1444,7 +1617,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      spu_lockline_unlock();
  #ifdef _WIN32
      AcquireSRWLockExclusive(&s_sig_lock);
@@ -13055,7 +13191,7 @@ index 3ce8d0d6..ec562587 100644
          if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
              static int _n = 0;
              if (++secs && _n < 16) { _n++;
-@@ -1455,24 +1573,38 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+@@ -1455,24 +1629,38 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      }
      ReleaseSRWLockExclusive(&s_sig_lock);
  #else
@@ -13105,7 +13241,7 @@ index 3ce8d0d6..ec562587 100644
      if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
          fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                  "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
-@@ -1548,9 +1680,11 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+@@ -1548,9 +1736,11 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
          if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
      }
  
@@ -13120,7 +13256,7 @@ index 3ce8d0d6..ec562587 100644
      if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
          static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
              /* Dump a larger window of the task context buffer + scan for any word
-@@ -1591,6 +1725,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+@@ -1591,6 +1781,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
       * mmap'd and committed on touch, so this reserves address space rather
       * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
       * the guard page above. */
