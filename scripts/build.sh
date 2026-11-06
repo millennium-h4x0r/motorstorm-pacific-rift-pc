@@ -10,9 +10,13 @@ PORT="$ROOT/work/port"
 BUILD="${BUILD_DIR:-$PORT/build}"
 SPU_DIR="${SPU_DIR:-$PORT/spu}"
 JOBS="${JOBS:-14}"
+# Compiler: clang-20 when installed (+2 full / +4 pack fps over clang-18 on the
+# same tree in an interleaved bench), else clang. Override with CC=/CXX=.
+if [ -z "${CC:-}" ] && command -v clang-20 >/dev/null; then CC=clang-20; CXX=clang++-20; fi
+CC="${CC:-clang}"; CXX="${CXX:-clang++}"
 [ -f "$ROOT/work/src/recomp/ppu_recomp.h" ] || { echo "nothing lifted yet -- run scripts/lift.sh" >&2; exit 1; }
 cmake -S "$PORT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
     -DPS3RECOMP_DIR="$DIR" -DRECOMP_DIR="$ROOT/work/src/recomp" -DSPU_DIR="$SPU_DIR" \
     -DPS3RECOMP_RSX_VULKAN="${PORT_VULKAN:-ON}" \
     -DPython3_EXECUTABLE="${PYTHON:-$ROOT/.venv/bin/python}" >/dev/null
