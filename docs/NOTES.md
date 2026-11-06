@@ -117,6 +117,10 @@ PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the m
   - Fix: main.cpp defaults GCM_SEMA_ACQUIRE=1 with GCM_SEMA_ACQUIRE_MS=250. The race timer now matches the wall clock and races hold 30 fps.
   - Every fps figure from before this fix (full about 65, pack about 57.6) is double-speed and vblank-capped, so it doesn't compare with current numbers.
   - No native 60 fps mode: PPU_POKE=011478BC:1 (threshold 1) gives about 55 fps, but the race timer runs 1.7-1.8x fast. The simulation steps a fixed 1/30 s per frame; the EBOOT has 38 f32 1/30 constants. A correct-speed 60 fps would need a timestep patch.
+- 60 fps mode (`PS3RECOMP_FPS=60`, opt-in):
+  - The game clock (f32 at 0x012FD140) advances by the frame timer's fixed step: n * 1e6 / 60 us, with n = vblanks per frame from SetInterval (func_00435D18, timer+0x18). The game asks for n = 2. The vblank gate's threshold (0x011478BC) is copied from the same field each frame.
+  - work/tools/patch_lift.py (run by scripts/lift.sh) splices a call to port_timer_interval (work/port/port_patches.cpp) into func_00435D18. With PS3RECOMP_FPS=60 it turns 2 into 1, giving a 1/60 s step and a flip allowed every vblank.
+  - Verified: the clock gains exactly 1/60 per flip. Without the hook, threshold 1 alone ran the race 1.75x fast. Expected fps is the old uncapped figure (about 65 full, about 58 pack on a quiet machine).
 
 ## Audio (2026-11-04)
 

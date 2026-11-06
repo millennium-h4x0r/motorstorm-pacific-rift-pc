@@ -180,6 +180,7 @@ add_executable(${PROJECT_NAME}
     settings.cpp
     ui.cpp
     stubs.cpp
+    port_patches.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}

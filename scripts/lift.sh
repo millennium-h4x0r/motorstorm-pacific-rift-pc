@@ -29,5 +29,7 @@ mkdir -p "$ROOT/work/out" "$ROOT/work/src"
     --functions "$ROOT/work/out/$name.functions.json" \
     --hle-stubs "$ROOT/work/out/$name.imports.json" \
     --code-end 0xcc0ddc --chunks 48 --output "$ROOT/work/src/recomp"
+# The port's hooks into the game's own code (work/tools/patch_lift.py).
+"$PY" "$ROOT/work/tools/patch_lift.py" "$ROOT/work/src/recomp"
 "$ROOT/work/tools/lift_spu.sh" "$ELF"
 echo "lifted: work/src/recomp (PPU), work/port/spu (SPU)"
