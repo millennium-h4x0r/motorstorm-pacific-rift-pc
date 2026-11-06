@@ -15,6 +15,15 @@ JOBS="${JOBS:-14}"
 if [ -z "${CC:-}" ] && command -v clang-20 >/dev/null; then CC=clang-20; CXX=clang++-20; fi
 CC="${CC:-clang}"; CXX="${CXX:-clang++}"
 [ -f "$ROOT/work/src/recomp/ppu_recomp.h" ] || { echo "nothing lifted yet -- run scripts/lift.sh" >&2; exit 1; }
+# A compiler change on an existing build dir makes CMake wipe its cache
+# mid-configure and drop the -D values below; start such a dir fresh instead.
+if [ -f "$BUILD/CMakeCache.txt" ]; then
+    cached="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt")"
+    if [ -n "$cached" ] && [ "$(command -v "$CXX")" != "$cached" ] && [ "$CXX" != "$cached" ]; then
+        echo "build.sh: compiler changed ($cached -> $CXX), reconfiguring $BUILD from scratch"
+        rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
+    fi
+fi
 cmake -S "$PORT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
     -DPS3RECOMP_DIR="$DIR" -DRECOMP_DIR="$ROOT/work/src/recomp" -DSPU_DIR="$SPU_DIR" \
