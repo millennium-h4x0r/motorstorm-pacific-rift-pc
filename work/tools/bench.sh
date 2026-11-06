@@ -17,6 +17,11 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 I="${INST:-bench}"; N="${ROUNDS:-3}"
+# The instance is found and killed by its comm name, so a renamed copy of the
+# binary would escape the lock and keep running after its round.
+if [ -n "${BIN:-}" ] && [ "$(basename "$BIN")" != PacificRiftRecomp ]; then
+    echo "bench: BIN must be named PacificRiftRecomp (got $(basename "$BIN"))" >&2; exit 2
+fi
 D="$ROOT/work/inst/$I"; F="$D/frame.ppm"; FL="$D/flip.txt"; OUT="$D/bench.txt"
 mkdir -p "$D"; : > "$OUT"
 cd "$ROOT"
