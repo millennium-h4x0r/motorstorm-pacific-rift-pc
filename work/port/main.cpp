@@ -666,8 +666,9 @@ int main(int argc, char** argv)
           port_settings* ps = port_settings_get();
           const int had = port_settings_load(ps, port_settings_path());
           port_settings_export(ps);
-          printf("[settings] %s %s: fullscreen %d, FPS counter %d\n", had ? "read" : "defaults, no",
-                 port_settings_path(), ps->fullscreen, ps->fps_counter);
+          printf("[settings] %s %s: fullscreen %d, scale %d, upscaler %s, fps %d, FPS counter %d\n",
+                 had ? "read" : "defaults, no", port_settings_path(), ps->fullscreen, ps->scale,
+                 ps->upscaler ? "fsr" : "off", ps->fps, ps->fps_counter);
           port_ui_init();
       } }
 

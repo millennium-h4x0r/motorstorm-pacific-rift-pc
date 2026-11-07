@@ -8,8 +8,10 @@
  *
  * While the menu is open the game gets a neutral pad (cellPad.c). Every change
  * is written to user/settings.ini at once (settings.h) and applies now.
- * The Apocalypse start screen, languages, resolution scale, VSync, FPS limit
- * and mods pages are not here: this port's backend has none of those knobs. */
+ * The resolution scale (Video page) is read at start, so it says it takes
+ * effect after a restart; the FSR 1 upscaler and its sharpness apply at once.
+ * The Apocalypse start screen, languages, VSync, FPS limit and mods pages are
+ * not here: this port's backend has none of those knobs. */
 #include "settings.h"
 #include "ui.h"
 
@@ -21,15 +23,23 @@
 #include <SDL2/SDL.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 extern "C" unsigned ppu_boot_frames_presented(void);       /* main.cpp */
 extern "C" unsigned rsx_vulkan_backend_guest_draws(void);  /* draws in the last frame */
+extern "C" void rsx_vulkan_backend_set_fsr(int on, float sharpness);
+extern "C" int  rsx_vulkan_backend_fsr_state(unsigned* in_w, unsigned* in_h, unsigned* out_w, unsigned* out_h);
 
 namespace {
 
 double g_fps = 0.0, g_fps_t = 0.0;
+/* Ported from the Apocalypse port's ui.cpp (k_scales). */
+const char* const k_scales[] = { "720p (1x)", "1440p (2x)", "4K (3x)" };
+int g_boot_scale = 1;          /* the scale this run renders at (PS3RECOMP_RES_SCALE at start) */
+int g_boot_fps = 30;           /* the frame rate this run runs at (PS3RECOMP_FPS at start) */
+const char* const k_fps[] = { "30 (original)", "60" };
 unsigned g_fps_frames = 0;
 bool g_styled = false;
 
@@ -96,9 +106,39 @@ void page_video(port_settings& s)
     if (ImGui::Checkbox("Fullscreen  (F11, Alt+Enter)", &b)) {
         s.fullscreen = b; rsx_ui_set_fullscreen(b); save();
     }
+    /* Render scale: every render target N times the game's 1280x720. */
+    int sc = s.scale - 1;
+    if (ImGui::Combo("Resolution", &sc, k_scales, 3)) { s.scale = sc + 1; save(); }
+    if (s.scale != g_boot_scale)
+        hint("Takes effect after a restart.");
+    int fi = s.fps == 60 ? 1 : 0;
+    if (ImGui::Combo("Frame rate", &fi, k_fps, 2)) { s.fps = fi ? 60 : 30; save(); }
+    if (s.fps != g_boot_fps)
+        hint("Takes effect after a restart.");
+    /* AMD FSR 1: upscales the presented frame to the window, applies now. */
+    bool fsr = s.upscaler != 0;
+    if (ImGui::Checkbox("AMD FSR 1 upscaling", &fsr)) {
+        s.upscaler = fsr ? 1 : 0;
+        rsx_vulkan_backend_set_fsr(s.upscaler, s.fsr_sharpness);
+        save();
+    }
+    if (s.upscaler) {
+        float sh = s.fsr_sharpness;
+        if (ImGui::SliderFloat("FSR sharpness", &sh, 0.0f, 1.0f, "%.2f")) {
+            s.fsr_sharpness = sh;
+            rsx_vulkan_backend_set_fsr(1, sh);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) save();
+    }
+    ImGui::Separator();
     const ImGuiIO& io = ImGui::GetIO();
+    unsigned iw = 0, ih = 0, ow = 0, oh = 0;
+    const int on = rsx_vulkan_backend_fsr_state(&iw, &ih, &ow, &oh);
     ImGui::Text("Window: %.0f x %.0f", io.DisplaySize.x, io.DisplaySize.y);
-    ImGui::Text("Game frame: 1280 x 720, stretched to the window");
+    ImGui::Text("Game frame: %u x %u (%dx)", iw, ih, g_boot_scale);
+    if (on) ImGui::Text("FSR 1: %u x %u -> %u x %u", iw, ih, ow, oh);
+    else if (s.upscaler) hint("FSR 1 is idle: the window is not larger than the game frame.");
+    else ImGui::TextUnformatted("Stretched to the window");
 }
 
 void page_performance(port_settings& s)
@@ -223,6 +263,11 @@ int hotkey(int key, void*)
 
 void port_ui_init(void)
 {
+    { const char* e = getenv("PS3RECOMP_RES_SCALE");
+      const int n = e ? atoi(e) : 1;
+      g_boot_scale = n >= 1 && n <= 4 ? n : 1; }
+    { const char* e = getenv("PS3RECOMP_FPS");
+      g_boot_fps = (e && atoi(e) == 60) ? 60 : 30; }
     rsx_ui_set_draw(draw, nullptr);
     rsx_ui_set_hotkey(hotkey, nullptr);
     rsx_ui_set_visible(port_settings_get()->fps_counter);

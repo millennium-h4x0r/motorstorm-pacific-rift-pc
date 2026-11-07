@@ -11,11 +11,15 @@
 #include <direct.h>
 #endif
 
-static port_settings g_settings = { 0, 0 };
+static port_settings g_settings = { 0, 1, 0, 0.8f, 30, 0 };
 
 void port_settings_defaults(port_settings* s)
 {
     s->fullscreen = 0;
+    s->scale = 1;
+    s->upscaler = 0;
+    s->fsr_sharpness = 0.8f;
+    s->fps = 30;
     s->fps_counter = 0;
 }
 
@@ -54,7 +58,20 @@ int port_settings_load(port_settings* s, const char* path)
         const char* k = trim(t);
         const char* v = trim(eq + 1);
         if (!strcmp(section, "video") && !strcmp(k, "fullscreen")) s->fullscreen = as_bool(v, s->fullscreen);
-        else if (!strcmp(section, "performance") && !strcmp(k, "fps_counter"))
+        else if (!strcmp(section, "video") && !strcmp(k, "scale")) {
+            const int n = atoi(v);
+            if (n >= 1 && n <= 3) s->scale = n;
+        } else if (!strcmp(section, "video") && !strcmp(k, "upscaler")) {
+            if (!strcmp(v, "fsr") || !strcmp(v, "fsr1")) s->upscaler = 1;
+            else if (!strcmp(v, "off") || !strcmp(v, "none")) s->upscaler = 0;
+        } else if (!strcmp(section, "video") && !strcmp(k, "fps")) {
+            const int n = atoi(v);
+            if (n == 30 || n == 60) s->fps = n;
+        } else if (!strcmp(section, "video") && !strcmp(k, "fsr_sharpness")) {
+            char* end = nullptr;
+            const float f = strtof(v, &end);
+            if (end != v && f >= 0.0f && f <= 1.0f) s->fsr_sharpness = f;
+        } else if (!strcmp(section, "performance") && !strcmp(k, "fps_counter"))
             s->fps_counter = as_bool(v, s->fps_counter);
     }
     fclose(f);
@@ -84,19 +101,36 @@ int port_settings_save(const port_settings* s, const char* path)
             "# An environment variable set before the game starts wins over a value here.\n"
             "\n[video]\n"
             "fullscreen = %d\n"
+            "scale = %d          ; 1 = 720p, 2 = 1440p, 3 = 4K (takes effect after a restart)\n"
+            "upscaler = %s      ; off, or fsr (AMD FSR 1: upscales the frame to the window)\n"
+            "fsr_sharpness = %.2f ; 0..1, 1 = sharpest\n"
+            "fps = %d            ; 30 (original) or 60 (takes effect after a restart)\n"
             "\n[performance]\n"
             "fps_counter = %d\n",
-            s->fullscreen ? 1 : 0, s->fps_counter ? 1 : 0);
+            s->fullscreen ? 1 : 0, s->scale, s->upscaler ? "fsr" : "off", (double)s->fsr_sharpness,
+            s->fps == 60 ? 60 : 30, s->fps_counter ? 1 : 0);
     return fclose(f) == 0 ? 0 : -1;
+}
+
+static void export_var(const char* name, const char* value)
+{
+    if (getenv(name)) return;                      /* set by the caller: it wins */
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
 }
 
 void port_settings_export(const port_settings* s)
 {
-#ifdef _WIN32
-    if (s->fullscreen && !getenv("PS3RECOMP_VK_FULLSCREEN")) _putenv_s("PS3RECOMP_VK_FULLSCREEN", "1");
-#else
-    if (s->fullscreen) setenv("PS3RECOMP_VK_FULLSCREEN", "1", 0);
-#endif
+    char b[32];
+    if (s->fullscreen) export_var("PS3RECOMP_VK_FULLSCREEN", "1");
+    if (s->scale > 1) { snprintf(b, sizeof b, "%d", s->scale); export_var("PS3RECOMP_RES_SCALE", b); }
+    if (s->upscaler) export_var("PS3RECOMP_FSR", "1");
+    if (s->fps == 60) export_var("PS3RECOMP_FPS", "60");
+    snprintf(b, sizeof b, "%.2f", (double)s->fsr_sharpness);
+    export_var("PS3RECOMP_FSR_SHARPNESS", b);
 }
 
 const char* port_settings_path(void)

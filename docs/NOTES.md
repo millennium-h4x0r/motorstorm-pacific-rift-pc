@@ -90,6 +90,28 @@ at `(*(unsigned char**)&vm_base)+ea`.
   `RSX_CONST_LOG=33,33` (exposure constant uploads), `GCM_WORD_STATS=10`
   (call/ret counts in the FIFO).
 
+## Resolution scale and FSR 1 upscaling (2026-11-07)
+
+Player settings (`user/settings.ini`, written by the F1 menu's Video page; read by windowed runs only, and an environment variable already set wins):
+
+    [video]
+    scale = 1|2|3          ; PS3RECOMP_RES_SCALE: 720p / 1440p / 4K render targets (restart)
+    upscaler = off|fsr     ; PS3RECOMP_FSR=1: AMD FSR 1 to the window's size (live)
+    fsr_sharpness = 0.80   ; PS3RECOMP_FSR_SHARPNESS, 0..1, 1 sharpest (live)
+    fps = 30|60            ; PS3RECOMP_FPS=60 (port_patches.cpp; restart)
+
+- **Render scale** (`PS3RECOMP_RES_SCALE=N`, 1..4, engine path only; the approach is the Apocalypse port's `vk_res_scale`, hand-ported to this backend). Every colour and depth target the engine creates is N times its guest size. The engine still speaks guest pixels everywhere; `rsx_vulkan_backend.c` scales at the edges:
+  - viewport, scissor, clear rectangles, snapshot extents (colour, corner, depth), and the depth-bias slope (times N, since depth changes 1/N as much per pixel);
+  - uploads (target seed, NV3089 writes) go through a guest-size staging image and are blown up with a nearest blit;
+  - readbacks (2D transfers, small-target exposure writeback, depth to guest) are shrunk on the GPU first: nearest for RGBA8 (may be packed data), linear for RGBA16F, nearest depth blit (CPU decimation if the depth format cannot blit);
+  - the present blits the flipped surface into a full-size frame image (`frame`, N x 1280x720), which the window and the frame dump take.
+  - WPOS: the GPU hands fragment programs image pixels. `rsx_fp_apply_wpos_scale` (rsx_fp_decompiler.c) inserts `input.position.xy *= fp_alpha.w` with fp_alpha.w = 1/N (new optional hook `rsx_draw_backend.res_scale`). Full-screen passes that build UVs from WPOS still sample at image resolution.
+  - Textures stay at guest size.
+- **FSR 1** (`PS3RECOMP_FSR=1`): EASU then RCAS as two compute passes on the present's command buffer, from the frame into an output the size of the swapchain (offscreen: `PS3RECOMP_FSR_OUT=<w>x<h>`, default 2x the frame). Skipped when the output is no larger than the frame. The shader math is AMD's unchanged `ffx_fsr1.h`/`ffx_a.h` (v1.20210629, MIT, `libs/video/vulkan/fsr1/LICENSE.txt`); `vulkan/rsx_vk_fsr.comp` is compiled to the committed `rsx_vk_fsr_{easu,rcas}.spv.h` with glslangValidator (command in its header), like the fallback shaders. The CPU constants come from AMD's `FsrEasuCon`/`FsrRcasCon` built with `A_CPU` (`rsx_vk_fsr1.c`). DLSS 2 and FSR 2/3 are temporal; they need motion vectors and a jittered projection, which this game does not produce.
+- The present now copies only the centre pixel to the host unless a frame dump is due that frame (the full copy at 4K was 33 MB a frame).
+- Verified (work/inst/ressh/, Kanaloa Bay Free-Play): scales 1, 2 and 3 render the same scene with matching exposure, shadows, motion blur and HUD. The flyover, crash replay, intro FMV and menus (to_race.sh passes) also render at 2x/3x. FSR 1 works at 1x to 4K and at 2x to 4K, and is visibly sharper than the bilinear stretch. fps not yet measured on a quiet machine.
+- Known gaps: a shadow lookup with unnormalised coordinates (`rsx_fp_decompiler.c` _rsx_shadow, GetDimensions) would divide guest texel coordinates by the scaled size. Not seen in this game. Guest-memory round trips (readback then re-upload) come back at guest resolution, nearest-upscaled.
+
 ## Parallel test instances
 
 `INST=<name> work/run.sh` runs an isolated, offscreen instance. Each one gets its own:
