@@ -55,6 +55,8 @@ int port_settings_load(port_settings* s, const char* path)
         char* eq = strchr(t, '=');
         if (!eq) continue;
         *eq = 0;
+        /* A value may carry a comment after it ("scale = 2 ; 1440p"). */
+        if (char* c = strpbrk(eq + 1, ";#")) *c = 0;
         const char* k = trim(t);
         const char* v = trim(eq + 1);
         if (!strcmp(section, "video") && !strcmp(k, "fullscreen")) s->fullscreen = as_bool(v, s->fullscreen);
