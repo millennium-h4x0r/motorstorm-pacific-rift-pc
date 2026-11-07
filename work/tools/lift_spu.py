@@ -31,7 +31,7 @@ runs on the SPUs and how the port's runtime dispatches each kind:
 
 Usage: work/tools/lift_spu.py [--eboot ELF] [--toolkit DIR] [--spu-dir DIR]
   SPU_OUT=<dir>          output directory (default work/port/spu; --spu-dir wins)
-  SPU_LIFT_EXTRA="..."   extra spu_lifter.py options for EVERY lift (ELFs, job
+  SPU_LIFT_EXTRA="..."   spu_lifter.py options for EVERY lift (default --const-bi; ELFs, job
                          modules, PM, MultiStream DSP), passed down as
                          SPU_LIFTER_ARGS, e.g. "--local-regs --const-bi"
 Exits nonzero if any expected kind is missing or any tool fails. The output
@@ -249,7 +249,12 @@ def main():
         die(f"no toolkit at {args.toolkit}")
     py = sys.executable
     spu = Path(args.spu_dir).resolve()
-    extra = os.environ.get("SPU_LIFT_EXTRA", "").strip()
+    # --const-bi by default (hand-ported from the Apocalypse port's lifter): an
+    # indirect branch whose target is a known constant becomes a direct one,
+    # 93% of ~420K SPU dispatches/frame. Bit-exact on the 7 jobbench captures;
+    # pack fps +1.6 (56.7 -> 58.3, 4 ABBA pairs), job CPU 6.7 -> 6.2 ms/frame.
+    # SPU_LIFT_EXTRA replaces it (SPU_LIFT_EXTRA=" " for none).
+    extra = os.environ.get("SPU_LIFT_EXTRA", "--const-bi").strip()
     os.environ["SPU_LIFTER_ARGS"] = extra       # inherited by every lift below
     if extra:
         print(f"[lift_spu] extra lifter options for every lift: {extra}")
