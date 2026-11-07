@@ -143,6 +143,7 @@ PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the m
   - The game clock (f32 at 0x012FD140) advances by the frame timer's fixed step: n * 1e6 / 60 us, with n = vblanks per frame from SetInterval (func_00435D18, timer+0x18). The game asks for n = 2. The vblank gate's threshold (0x011478BC) is copied from the same field each frame.
   - work/tools/patch_lift.py (run by scripts/lift.sh) splices a call to port_timer_interval (work/port/port_patches.cpp) into func_00435D18. With PS3RECOMP_FPS=60 it turns 2 into 1, giving a 1/60 s step and a flip allowed every vblank.
   - Verified: the clock gains exactly 1/60 per flip. Without the hook, threshold 1 alone ran the race 1.75x fast. Expected fps is the old uncapped figure (about 65 full, about 58 pack on a quiet machine).
+- SPU lift: work/tools/lift_spu.py passes `--const-bi` by default (SPU_LIFT_EXTRA overrides). Constant-target indirect branches become direct calls; measured +1.6 fps with the pack in view (idea credited to the Apocalypse lifter).
 
 ## Audio (2026-11-04)
 
