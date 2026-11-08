@@ -672,6 +672,12 @@ int main(int argc, char** argv)
           port_ui_init();
       } }
 
+    /* 60 fps mode: the engine's scheduled full texture hash (a change its
+     * sparse check misses) every 16 frames instead of 8, the same delay in
+     * seconds as at 30 fps; ~0.1 us less per draw on the RSX thread. */
+    { const char* f = getenv("PS3RECOMP_FPS");
+      if (f && atoi(f) == 60) setenv("PS3RECOMP_ENG_TEXHASH_EVERY", "16", 0); }
+
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
