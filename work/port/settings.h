@@ -22,7 +22,7 @@ typedef struct port_settings {
     float fsr_sharpness;/* FSR's RCAS sharpening, 0..1, 1 sharpest (PS3RECOMP_FSR_SHARPNESS) */
     int fps;            /* 30 (the game's own) or 60 (PS3RECOMP_FPS, port_patches.cpp); read at start only */
     /* [performance] */
-    int fps_counter;    /* the counter drawn by the UI (F10) */
+    int fps_counter;    /* the HUD drawn by the UI (F10 cycles): 0 off, 1 detailed (default), 2 compact */
 } port_settings;
 
 /* The defaults: a window at 720p, no upscaler, no FPS counter. */

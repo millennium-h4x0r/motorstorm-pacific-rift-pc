@@ -3,7 +3,7 @@
  * Ported from the Apocalypse port's ui.cpp, trimmed to what applies here:
  *
  *   F1, or Select+Start held half a second   the in-game menu (Escape closes it)
- *   F10                                      the FPS counter on or off
+ *   F10                                      the performance HUD: detailed, compact, off
  *   F11, or Alt+Enter                        full screen and back (the backend)
  *
  * While the menu is open the game gets a neutral pad (cellPad.c). Every change
@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -97,10 +98,10 @@ void hint(const char* t)
     ImGui::PopStyleColor();
 }
 
-void set_fps_counter(bool on)
+void set_fps_counter(int mode)
 {
     port_settings& s = *port_settings_get();
-    s.fps_counter = on ? 1 : 0;
+    s.fps_counter = mode >= 0 && mode <= 2 ? mode : 0;
     rsx_ui_set_visible(s.fps_counter);
     save();
 }
@@ -196,8 +197,9 @@ void page_video(port_settings& s)
 
 void page_performance(port_settings& s)
 {
-    bool b = s.fps_counter;
-    if (ImGui::Checkbox("On-screen FPS counter  (F10)", &b)) set_fps_counter(b);
+    static const char* const k_hud[] = { "Off", "Detailed", "Compact" };
+    int h = s.fps_counter;
+    if (ImGui::Combo("Performance HUD  (F10)", &h, k_hud, 3)) set_fps_counter(h);
     ImGui::Separator();
     ImGui::Text("Frame rate: %.1f fps", g_fps);
     ImGui::Text("Frames presented: %u", ppu_boot_frames_presented());
@@ -234,7 +236,7 @@ void page_controller()
 void page_keys()
 {
     ImGui::TextUnformatted("F1          this menu (or Select+Start held)");
-    ImGui::TextUnformatted("F10         the FPS counter");
+    ImGui::TextUnformatted("F10         the performance HUD: detailed, compact, off");
     ImGui::TextUnformatted("F11         full screen (or Alt+Enter)");
     ImGui::TextUnformatted("Escape      close this menu; with it closed, quit the game");
 }
@@ -269,7 +271,66 @@ void draw_menu()
     ImGui::End();
 }
 
-void draw_fps()
+/* ---- performance HUD ------------------------------------------------------
+ * Frame times come from the guest's presented-frame counter, sampled on each
+ * UI frame: the time since it last moved, split over the frames it moved by.
+ * The last k_ft samples feed the graph and the 1% low / worst figures. */
+constexpr int k_ft = 240;
+float g_ft[k_ft];               /* ms, ring */
+int g_ft_n = 0, g_ft_i = 0;
+double g_ft_since = 0.0;        /* s since the counter last moved */
+unsigned g_ft_last = 0;
+double g_cpu = -1.0;            /* this process, % of one core */
+
+void hud_sample(double dt)
+{
+    const unsigned f = ppu_boot_frames_presented();
+    g_ft_since += dt;
+    if (f != g_ft_last) {
+        const unsigned d = f - g_ft_last;
+        g_ft_last = f;
+        if (d < 1000) {
+            const float ms = (float)(g_ft_since * 1000.0 / d);
+            for (unsigned k = 0; k < d && k < (unsigned)k_ft; k++) {
+                g_ft[g_ft_i] = ms; g_ft_i = (g_ft_i + 1) % k_ft;
+                if (g_ft_n < k_ft) g_ft_n++;
+            }
+        }
+        g_ft_since = 0.0;
+    }
+#ifndef _WIN32
+    /* CPU time of the whole process (every guest thread) every half second. */
+    static double acc = 0.0, last_cpu = -1.0;
+    acc += dt;
+    if (acc >= 0.5) {
+        FILE* fp = fopen("/proc/self/stat", "r");
+        if (fp) {
+            char buf[1024];
+            const size_t n = fread(buf, 1, sizeof buf - 1, fp);
+            fclose(fp);
+            buf[n] = 0;
+            const char* q = strrchr(buf, ')');
+            unsigned long ut = 0, st = 0;
+            /* fields after the name: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
+            if (q && sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2) {
+                const double t = (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
+                if (last_cpu >= 0.0) g_cpu = (t - last_cpu) / acc * 100.0;
+                last_cpu = t;
+            }
+        }
+        acc = 0.0;
+    }
+#endif
+}
+
+ImU32 fps_colour(double fps, double target)
+{
+    if (fps >= target * 0.95) return IM_COL32(120, 230, 120, 255);
+    if (fps >= target * 0.75) return IM_COL32(255, 205, 90, 255);
+    return IM_COL32(255, 100, 80, 255);
+}
+
+void draw_fps_compact()
 {
     const ImGuiIO& io = ImGui::GetIO();
     char t[32];
@@ -278,7 +339,92 @@ void draw_fps()
     const ImVec2 p(io.DisplaySize.x - sz.x - 18.0f, 12.0f);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     dl->AddRectFilled(ImVec2(p.x - 8, p.y - 4), ImVec2(p.x + sz.x + 8, p.y + sz.y + 4), IM_COL32(0, 0, 0, 150), 6.0f);
-    dl->AddText(p, IM_COL32(255, 190, 110, 255), t);
+    dl->AddText(p, fps_colour(g_fps, g_boot_fps), t);
+}
+
+void draw_fps_detailed()
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    const float fs = ImGui::GetFontSize();
+    const double target = g_boot_fps, target_ms = 1000.0 / target;
+
+    /* Average, worst and 1% low over the samples held. */
+    float sorted[k_ft];
+    double sum = 0.0;
+    for (int k = 0; k < g_ft_n; k++) { sorted[k] = g_ft[k]; sum += g_ft[k]; }
+    std::sort(sorted, sorted + g_ft_n);
+    const double avg = g_ft_n ? sum / g_ft_n : 0.0;
+    const double worst = g_ft_n ? sorted[g_ft_n - 1] : 0.0;
+    double low1 = 0.0;              /* mean fps of the slowest 1% of frames */
+    if (g_ft_n) {
+        const int m = g_ft_n / 100 > 0 ? g_ft_n / 100 : 1;
+        double s = 0.0;
+        for (int k = g_ft_n - m; k < g_ft_n; k++) s += sorted[k];
+        low1 = 1000.0 / (s / m);
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.62f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fs * 0.7f, fs * 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(fs * 0.5f, fs * 0.2f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::Begin("##hud", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    const float w = fs * 15.0f;
+
+    /* fps, large, coloured against the target */
+    ImGui::SetWindowFontScale(1.6f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(fps_colour(g_fps, target)));
+    ImGui::Text("%.0f", g_fps);
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("fps  / %d", g_boot_fps);
+
+    ImGui::Text("%.1f ms avg   %.1f ms worst", avg, worst);
+    ImGui::Text("1%% low %.0f fps", low1);
+
+    /* frame-time graph: bars, oldest left; dashed target line */
+    const float gh = fs * 3.0f;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + gh), IM_COL32(0, 0, 0, 90), 4.0f);
+    const float top_ms = (float)(target_ms * 2.5);
+    const float bw = w / k_ft;
+    for (int k = 0; k < g_ft_n; k++) {
+        const int idx = (g_ft_i - g_ft_n + k + k_ft) % k_ft;
+        const float ms = g_ft[idx];
+        const float hgt = gh * (ms < top_ms ? ms / top_ms : 1.0f);
+        const float x = p0.x + (k_ft - g_ft_n + k) * bw;
+        const ImU32 c = ms <= target_ms * 1.05 ? IM_COL32(120, 230, 120, 200)
+                      : ms <= target_ms * 1.5 ? IM_COL32(255, 205, 90, 220) : IM_COL32(255, 100, 80, 240);
+        dl->AddRectFilled(ImVec2(x, p0.y + gh - hgt), ImVec2(x + (bw > 1.5f ? bw - 0.5f : bw), p0.y + gh), c);
+    }
+    const float ty = p0.y + gh - gh * (float)(target_ms / top_ms);
+    for (float x = p0.x; x < p0.x + w; x += 8.0f)
+        dl->AddLine(ImVec2(x, ty), ImVec2(x + 4.0f < p0.x + w ? x + 4.0f : p0.x + w, ty), IM_COL32(255, 255, 255, 110));
+    ImGui::Dummy(ImVec2(w, gh));
+
+    /* what is being rendered */
+    unsigned iw = 0, ih = 0, ow = 0, oh = 0;
+    const int fsr = rsx_vulkan_backend_fsr_state(&iw, &ih, &ow, &oh);
+    if (iw && ih) {
+        if (fsr) ImGui::TextDisabled("%ux%u  FSR 1 -> %ux%u", iw, ih, ow, oh);
+        else     ImGui::TextDisabled("%ux%u  (%dx)", iw, ih, g_boot_scale);
+    }
+    if (g_cpu >= 0.0) ImGui::TextDisabled("%u draws   CPU %.0f%%", rsx_vulkan_backend_guest_draws(), g_cpu);
+    else              ImGui::TextDisabled("%u draws", rsx_vulkan_backend_guest_draws());
+
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+}
+
+void draw_fps()
+{
+    if (port_settings_get()->fps_counter == 2) draw_fps_compact();
+    else draw_fps_detailed();
 }
 
 void draw(void*)
@@ -289,8 +435,10 @@ void draw(void*)
     static int last_frame = -10;
     if (ImGui::GetFrameCount() != last_frame + 1) {
         g_fps_frames = ppu_boot_frames_presented(); g_fps_t = 0.0;
+        g_ft_last = g_fps_frames; g_ft_since = 0.0;
     }
     last_frame = ImGui::GetFrameCount();
+    hud_sample(rsx_ui_frame_dt());
     g_fps_t += rsx_ui_frame_dt();
     if (g_fps_t >= 0.5) {
         const unsigned f = ppu_boot_frames_presented();
@@ -305,8 +453,11 @@ void draw(void*)
 int hotkey(int key, void*)
 {
     if (key == SDLK_F10) {
-        set_fps_counter(!port_settings_get()->fps_counter);
-        fprintf(stderr, "[ui] FPS counter %s\n", port_settings_get()->fps_counter ? "on" : "off");
+        /* detailed -> compact -> off -> detailed */
+        static const int next[] = { 1, 2, 0 };
+        set_fps_counter(next[port_settings_get()->fps_counter % 3]);
+        static const char* const n[] = { "off", "detailed", "compact" };
+        fprintf(stderr, "[ui] HUD %s\n", n[port_settings_get()->fps_counter % 3]);
         return 1;
     }
     return 0;

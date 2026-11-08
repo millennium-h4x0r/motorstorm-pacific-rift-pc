@@ -20,7 +20,7 @@ void port_settings_defaults(port_settings* s)
     s->upscaler = 0;
     s->fsr_sharpness = 0.8f;
     s->fps = 30;
-    s->fps_counter = 0;
+    s->fps_counter = 1;
 }
 
 static char* trim(char* t)
@@ -74,7 +74,11 @@ int port_settings_load(port_settings* s, const char* path)
             const float f = strtof(v, &end);
             if (end != v && f >= 0.0f && f <= 1.0f) s->fsr_sharpness = f;
         } else if (!strcmp(section, "performance") && !strcmp(k, "fps_counter"))
-            s->fps_counter = as_bool(v, s->fps_counter);
+        {   /* 0 off, 1 detailed, 2 compact; on/off/true/false as 1/0 */
+            char* end = nullptr;
+            const long n = strtol(v, &end, 10);
+            s->fps_counter = (end != v && n >= 0 && n <= 2) ? (int)n : as_bool(v, s->fps_counter);
+        }
     }
     fclose(f);
     return 1;
@@ -108,9 +112,9 @@ int port_settings_save(const port_settings* s, const char* path)
             "fsr_sharpness = %.2f ; 0..1, 1 = sharpest\n"
             "fps = %d            ; 30 (original) or 60 (takes effect after a restart)\n"
             "\n[performance]\n"
-            "fps_counter = %d\n",
+            "fps_counter = %d      ; HUD (F10 cycles): 0 = off, 1 = detailed, 2 = compact\n",
             s->fullscreen ? 1 : 0, s->scale, s->upscaler ? "fsr" : "off", (double)s->fsr_sharpness,
-            s->fps == 60 ? 60 : 30, s->fps_counter ? 1 : 0);
+            s->fps == 60 ? 60 : 30, s->fps_counter);
     return fclose(f) == 0 ? 0 : -1;
 }
 
