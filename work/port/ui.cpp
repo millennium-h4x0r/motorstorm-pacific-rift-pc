@@ -8,8 +8,8 @@
  *
  * While the menu is open the game gets a neutral pad (cellPad.c). Every change
  * is written to user/settings.ini at once (settings.h) and applies now.
- * The resolution scale (Video page) is read at start, so it says it takes
- * effect after a restart; the FSR 1 upscaler and its sharpness apply at once.
+ * The resolution scale and frame rate (Video page) are read at start, so they
+ * take effect after a restart (the page has a Restart now button); the FSR 1 upscaler and its sharpness apply at once.
  * The Apocalypse start screen, languages, VSync, FPS limit and mods pages are
  * not here: this port's backend has none of those knobs. */
 #include "settings.h"
@@ -26,6 +26,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+extern char** environ;
+#endif
 
 extern "C" unsigned ppu_boot_frames_presented(void);       /* main.cpp */
 extern "C" unsigned rsx_vulkan_backend_guest_draws(void);  /* draws in the last frame */
@@ -99,6 +105,52 @@ void set_fps_counter(bool on)
     save();
 }
 
+/* Start the game again with the menu's resolution and frame rate: both are
+ * read once at start (render targets and shaders are built at the scale; the
+ * frame timer's interval is set during boot). Same binary, same arguments,
+ * the environment with those two variables replaced by the menu's values, so
+ * they win over what the run started with. Progress since the last save is
+ * lost. Idea from the Apocalypse port's ui.cpp (play / restart_note). */
+#ifndef _WIN32
+void restart_now(const port_settings& s)
+{
+    save();
+    std::vector<std::string> args;
+    { FILE* f = fopen("/proc/self/cmdline", "rb");
+      if (!f) return;
+      std::string a; int c;
+      while ((c = fgetc(f)) != EOF) { if (c) a += (char)c; else { args.push_back(a); a.clear(); } }
+      fclose(f); }
+    if (args.empty()) return;
+    std::vector<std::string> env;
+    for (char** e = environ; *e; e++)
+        if (strncmp(*e, "PS3RECOMP_RES_SCALE=", 20) && strncmp(*e, "PS3RECOMP_FPS=", 14)) env.push_back(*e);
+    env.push_back("PS3RECOMP_RES_SCALE=" + std::to_string(s.scale));
+    env.push_back(std::string("PS3RECOMP_FPS=") + (s.fps == 60 ? "60" : "30"));
+    std::vector<char*> av, ev;
+    for (auto& a : args) av.push_back(&a[0]);
+    for (auto& e : env) ev.push_back(&e[0]);
+    av.push_back(nullptr); ev.push_back(nullptr);
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n <= 0) return;
+    self[n] = 0;
+    fprintf(stderr, "[ui] restarting: resolution %dx, %d fps\n", s.scale, s.fps);
+    fflush(stderr); fflush(stdout);
+    execve(self, av.data(), ev.data());
+    fprintf(stderr, "[ui] restart failed\n");
+}
+
+void restart_button(const port_settings& s)
+{
+    if (ImGui::Button("Restart now")) restart_now(s);
+    ImGui::SameLine();
+    hint("Unsaved race progress is lost.");
+}
+#else
+void restart_button(const port_settings&) {}
+#endif
+
 void page_video(port_settings& s)
 {
     /* The window as it is: F11 changes it without the menu. */
@@ -115,6 +167,7 @@ void page_video(port_settings& s)
     if (ImGui::Combo("Frame rate", &fi, k_fps, 2)) { s.fps = fi ? 60 : 30; save(); }
     if (s.fps != g_boot_fps)
         hint("Takes effect after a restart.");
+    if (s.scale != g_boot_scale || s.fps != g_boot_fps) restart_button(s);
     /* AMD FSR 1: upscales the presented frame to the window, applies now. */
     bool fsr = s.upscaler != 0;
     if (ImGui::Checkbox("AMD FSR 1 upscaling", &fsr)) {
