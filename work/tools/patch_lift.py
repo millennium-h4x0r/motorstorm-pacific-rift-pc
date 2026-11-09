@@ -26,6 +26,13 @@ PATCHES = [
     ('func_00435D18',
      'void func_00435D18(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
      '    { void port_timer_interval(ppu_context*); port_timer_interval(ctx); } /* patch_lift.py */\n'),
+    # func_008CF1C0 takes the frame step in f1 and hands it to the game clock
+    # (func_0031BA20) and the other per-frame updates. port_frame_dt (60 fps
+    # mode) scales it by the vblanks the previous frame really took, so a
+    # frame that misses 60 does not run the game in slow motion.
+    ('func_008CF1C0',
+     'void func_008CF1C0(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
+     '    { void port_frame_dt(ppu_context*); port_frame_dt(ctx); } /* patch_lift.py */\n'),
 ]
 
 

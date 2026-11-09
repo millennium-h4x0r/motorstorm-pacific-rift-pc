@@ -3805,7 +3805,7 @@ index 500a1355..c4bdc7a8 100644
  void spu_lockline_unlock(void) {}
  void np_psnr_pump(void) {}
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 298ee7de..f4e5c0c7 100644
+index 298ee7de..de3247c2 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -409,6 +409,26 @@ static int s_gcm_syscall_mode = 0;
@@ -3992,6 +3992,17 @@ index 298ee7de..f4e5c0c7 100644
  
      /* The guest struct is two 4-byte EAs, not two host pointers. */
      vm_write32(ea + 0, GCM_OFFSET_TABLE_IO_ADDR);
+@@ -4125,6 +4203,10 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+     return CELL_OK;
+ }
+ 
++/* The vblank beats so far, for host code (no side effect, unlike the HLE
++ * cellGcmGetVBlankCount below). */
++u32 cellGcm_vblank_ticks(void) { return s_vblank_count; }
++
+ /* Return incrementing VBlank counter */
+ u32 cellGcmGetVBlankCount(void)
+ {
 diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
 index eca370f1..823ca3e4 100644
 --- a/libs/video/rsx_dispatch.c
