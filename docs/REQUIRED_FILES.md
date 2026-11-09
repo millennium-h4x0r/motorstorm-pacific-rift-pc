@@ -23,7 +23,7 @@ size   19047304 bytes
 `disc/` is git-ignored. Link the dump and copy the decrypted ELF in:
 
 ```sh
-SRC=~/Games/PS3/BCES00129/PS3_GAME
+SRC=/path/to/your/dump/BCES00129/PS3_GAME
 mkdir -p disc/PS3_GAME/USRDIR
 for f in "$SRC"/*; do [ "$(basename "$f")" = USRDIR ] || ln -sfn "$f" disc/PS3_GAME/; done
 for f in "$SRC"/USRDIR/*; do case "$(basename "$f")" in EBOOT.*|ms2.psarc.*) ;; *) ln -sfn "$f" disc/PS3_GAME/USRDIR/;; esac; done
@@ -33,3 +33,18 @@ cp "$SRC/USRDIR/EBOOT.elf" disc/PS3_GAME/USRDIR/
 rm -f disc/PS3_GAME/USRDIR/ms2.psarc.666*
 cat "$SRC"/USRDIR/ms2.psarc.666* > disc/PS3_GAME/USRDIR/ms2.psarc   # 4,811,608,561 bytes, starts "PSAR"
 ```
+
+## PS3 firmware (dev_flash)
+
+The game opens files under `/dev_flash` (system fonts, the firmware MP3
+decoder that MultiStream loads). The port serves them from a real `dev_flash`
+tree: `$PS3_DEV_FLASH`, which `work/run.sh` sets to RPCS3's copy,
+`~/.config/rpcs3/dev_flash`, unless you set it yourself. Install the official
+PS3 firmware (`PS3UPDAT.PUP` from Sony) in RPCS3 (*File → Install Firmware*)
+to get it. `work/tools/lift_ms_dsp.py` also lifts `sys/external/flashMP3.pic`
+from it during `scripts/lift.sh`; without it that decoder runs interpreted.
+
+## Where the port writes
+
+All git-ignored, at the repository root: `hdd0/` (saves), `user/`
+(`settings.ini`, `shader_cache/`), `gamedata/`, `work/runs/` (logs).

@@ -1,10 +1,10 @@
 # Lessons from the MotorStorm Apocalypse port
 
-How the sibling port (`~/Games/RECOMP/motorstorm_apoca`) got to its main menu,
+How the sibling MotorStorm Apocalypse port got to its main menu,
 and what that means for Pacific Rift. That port uses ps3recomp v0.13.0
 (`42f5f8f9`), a one-time copy of the inFAMOUS 2 port base (`b57ea21`) and a
 3 MB patch (`work/patches/ps3recomp.patch`). Its git history has 11 commits.
-"In v0.18" below comes from grepping `motorstorm_pacific/ps3recomp` (commit
+"In v0.18" below comes from grepping this port's `ps3recomp/` checkout (commit
 `4e8f3ca8`). Its CHANGELOG only goes up to v0.15.0, so the code is the better
 guide.
 

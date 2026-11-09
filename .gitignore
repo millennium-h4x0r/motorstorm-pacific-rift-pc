@@ -23,3 +23,31 @@
 __pycache__/
 work/port/spu-*/
 work/port/build-*.log
+
+# Inside the allowlisted folders: compiled tools and anything the game or a
+# run can leave behind (scripts/check_clean.sh refuses these as well).
+/work/tools/tsample/tsample
+*.o
+*.so
+*.a
+*.log
+*.elf
+*.self
+*.sprx
+*.prx
+*.bin
+*.dat
+*.psarc*
+*.pkg
+*.iso
+*.rap
+*.edat
+*.sdat
+*.sfo
+*.ppm
+*.png
+*.wav
+*.mp3
+*.at3
+*.bik
+*.spv
