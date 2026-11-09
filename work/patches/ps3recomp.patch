@@ -73,7 +73,7 @@ index 3bbabf62..515d3825 100644
  
  Without a GPU, Mesa's lavapipe runs every check, e.g.
 diff --git a/include/ps3emu/ps3_ftrace.h b/include/ps3emu/ps3_ftrace.h
-index 84065d2d..8dc8f643 100644
+index 84065d2d..0ee2e45d 100644
 --- a/include/ps3emu/ps3_ftrace.h
 +++ b/include/ps3emu/ps3_ftrace.h
 @@ -22,6 +22,9 @@
@@ -94,7 +94,7 @@ index 84065d2d..8dc8f643 100644
  #endif
  
  #ifdef __cplusplus
-@@ -58,6 +62,17 @@ enum ps3_ft_kind {
+@@ -58,6 +62,19 @@ enum ps3_ft_kind {
                                * complete; who = render passes, a = depth resolves | colour copies << 16,
                                * b = 1 present / 0 flush */
      PS3_FT_HLE         = 15, /* who = PPU tid, a = NID, b = guest lr: an HLE import call */
@@ -109,10 +109,12 @@ index 84065d2d..8dc8f643 100644
 +    PS3_FT_SPURS_WAKE  = 21, /* instant: the SPURS coordinator left its wait; a = 1 woken / 0 timed out */
 +    PS3_FT_SPU_TASK    = 20, /* span: a taskset task run (spu_async_run, LS load to exit);
 +                              * who = host tid, a = image id, b = taskid */
++    PS3_FT_VBLANK      = 22, /* instant: a vblank tick (a = vblank count, b = 1 flip completed too) */
++    PS3_FT_VBLANK_CB   = 23, /* span: the guest vblank handler run by ppu_gcm_pump (a = vblank count) */
  };
  
  #if defined(_MSC_VER)
-@@ -74,7 +89,7 @@ typedef struct {
+@@ -74,7 +91,7 @@ typedef struct {
      int on;              /* 0 unknown, 1 initialising, 2 recording, 3 off/done */
      int dumped;
      uint32_t n, cap, dropped;
@@ -121,7 +123,7 @@ index 84065d2d..8dc8f643 100644
      ps3_ft_rec* buf;
      char path[1024];
      struct { uint64_t t0, t1; uint32_t lr, n; } us[PS3_FT_TIDS];   /* usleep run being merged */
-@@ -113,8 +128,9 @@ static inline void ps3_ft_dump(void)
+@@ -113,8 +130,9 @@ static inline void ps3_ft_dump(void)
      if (n > s->cap) n = s->cap;
      FILE* f = fopen(s->path, "w");
      if (!f) { fprintf(stderr, "[ftrace] cannot write %s\n", s->path); return; }
@@ -133,7 +135,7 @@ index 84065d2d..8dc8f643 100644
      for (uint32_t t = 0; t < PS3_FT_TIDS; t++)
          if (s->names[t][0]) fprintf(f, "T %u %s\n", t, s->names[t]);
      for (uint32_t i = 0; i < n; i++) {
-@@ -129,6 +145,20 @@ static inline void ps3_ft_dump(void)
+@@ -129,6 +147,20 @@ static inline void ps3_ft_dump(void)
  
  static inline void ps3_ft_dump_atexit(void) { ps3_ft_dump(); }
  
@@ -154,7 +156,7 @@ index 84065d2d..8dc8f643 100644
  /* First hook: read PS3_FTRACE once. Hooks see "off" while another thread is
   * still setting up, which only loses spans before the window anyway. */
  static inline int ps3_ft_init(void)
-@@ -159,6 +189,13 @@ static inline int ps3_ft_init(void)
+@@ -159,6 +191,13 @@ static inline int ps3_ft_init(void)
                  s->base = ps3_ft_now();
                  s->start = s->base + (uint64_t)(start * 1e9);
                  s->end = s->start + (uint64_t)(secs * 1e9);
@@ -3803,7 +3805,7 @@ index 500a1355..c4bdc7a8 100644
  void spu_lockline_unlock(void) {}
  void np_psnr_pump(void) {}
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 298ee7de..6ddef67b 100644
+index 298ee7de..f4e5c0c7 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -409,6 +409,26 @@ static int s_gcm_syscall_mode = 0;
@@ -3849,7 +3851,42 @@ index 298ee7de..6ddef67b 100644
      }
  }
  
-@@ -1551,6 +1573,9 @@ void gcm_note_spu_put(u32 ea, u32 size)
+@@ -807,8 +829,10 @@ void cellGcm_request_tick(void)
+     if (gcm_flip_executed_take()) {
+         FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
+         GCM_PENDING_SET(3);
++        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_VBLANK, 0, s_vblank_count, 1, t, t); }
+     } else {
+         GCM_PENDING_SET(1);
++        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_VBLANK, 0, s_vblank_count, 0, t, t); }
+     }
+ }
+ 
+@@ -852,8 +876,10 @@ void ppu_gcm_pump(void)
+                            calls, nv, nf, s_vblank_count, 10); } }
+     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
++        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+                            0, 0, 0, 0, 0, 0, 0);
++        if (ft0) ps3_ft_span(PS3_FT_VBLANK_CB, 0, s_vblank_count, 0, ft0, ps3_ft_now());
+     }
+     if (p & 2) {
+         /* Delivery waits for a guest thread to reach an HLE call or a timer
+@@ -882,7 +908,11 @@ void ppu_gcm_pump(void)
+ 
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++void cellGcmTickVBlank(void)
++{
++    s_vblank_count++; GCM_PENDING_SET(1);
++    if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_VBLANK, 0, s_vblank_count, 0, t, t); }
++}
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+@@ -1551,6 +1581,9 @@ void gcm_note_spu_put(u32 ea, u32 size)
      u32 room = 0;
      u32 io = gcm_ea2io_range(ea, &room);
      if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
@@ -3859,7 +3896,7 @@ index 298ee7de..6ddef67b 100644
  
      /* Coalesce with the previous block when an SPU emits one buffer in several
       * transfers -- otherwise only the last fragment is remembered and the
-@@ -1951,9 +1976,14 @@ void cellGcm_rsx_process_fifo(void)
+@@ -1951,9 +1984,14 @@ void cellGcm_rsx_process_fifo(void)
      wprof_note_walker();
      g_gcm_drain_tid = GetCurrentThreadId();
      const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -3874,7 +3911,7 @@ index 298ee7de..6ddef67b 100644
      if (ft_t0) {
          const uint64_t t1 = ps3_ft_now();
          if (t1 - ft_t0 >= ps3_ft_min_ns())
-@@ -1998,6 +2028,23 @@ static int gcm_word_diag(void)
+@@ -1998,6 +2036,23 @@ static int gcm_word_diag(void)
      return on;
  }
  
@@ -3898,7 +3935,7 @@ index 298ee7de..6ddef67b 100644
  /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
   * plus the methods whose answer the walker writes itself. */
  static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
-@@ -2074,6 +2121,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2074,6 +2129,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
      if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
      const int wdiag = gcm_word_diag();
@@ -3906,7 +3943,7 @@ index 298ee7de..6ddef67b 100644
      /* rsx_state feeds only the legacy vtable backend. With the draw engine
       * up and no vtable registered, the state it builds is never read, and the
       * only methods worth handing it are the ones with effects outside it
-@@ -2257,7 +2305,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2257,7 +2313,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           * skip is a faster decode, not a bigger tick, and VF5 depends on the
           * walker yielding at the cap (it lost 7 milestones when a whole run
           * cost one word). */
@@ -3915,7 +3952,7 @@ index 298ee7de..6ddef67b 100644
              const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
              const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
              u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
-@@ -2519,9 +2567,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2519,9 +2575,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
               * which can match, are skipped. Most of a frame's words come this
               * way (God of War HD: about five million vertex-program microcode and
               * constant words a second). */
@@ -3947,7 +3984,7 @@ index 298ee7de..6ddef67b 100644
                  if (dea) {
                      if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
                          s_fifo_getoff += 4 + count * 4;
-@@ -3312,6 +3381,7 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
+@@ -3312,6 +3389,7 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
          return CELL_GCM_ERROR_INVALID_VALUE;
  
      gcm_publish_offset_tables();
@@ -8347,7 +8384,7 @@ index 00000000..005dd2fb
 +
 +#endif
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302e..21dc5b82 100644
+index db64302e..7aee6eed 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -42,6 +42,8 @@
@@ -10350,11 +10387,14 @@ index db64302e..21dc5b82 100644
      vk_buffer    indices;
      u32          warned;
      /* The split set layout (vk_eng_split_layout) and its one set, made the
-@@ -2852,15 +4096,43 @@ static struct {
+@@ -2852,15 +4096,46 @@ static struct {
      VkDescriptorSet       split_set;
      VkPipelineLayout      split_pipe_layout;
      u32                   dummy_cube;
 +    u32                   dummy_vol;
++    /* Where this draw's VS constants are: ucpu, or a block the caller keeps
++     * unchanged until the draw is recorded (vk_eng_bind_vs_constants_ref). */
++    const u8*             vs_src;
  } s_e2;
  
  #define VK_ENG_SAMP_CACHE 64
@@ -10395,7 +10435,7 @@ index db64302e..21dc5b82 100644
      for (u32 i = 0; i < s_e2.fb_count; i++)
          if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
      s_e2.fb_count = 0;
-@@ -3007,6 +4279,12 @@ static VkPipelineLayout vk_eng_split_layout(void)
+@@ -3007,6 +4282,12 @@ static VkPipelineLayout vk_eng_split_layout(void)
                                          .pSetLayouts = &s_e2.split_layout };
      VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                          .setLayoutCount = 1, .pSetLayouts = &s_e2.split_layout };
@@ -10408,7 +10448,7 @@ index db64302e..21dc5b82 100644
      if (pvkAllocateDescriptorSets(s_vk.device, &dai, &s_e2.split_set) != VK_SUCCESS ||
          pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_e2.split_pipe_layout) != VK_SUCCESS) {
          s_e2.split_pipe_layout = VK_NULL_HANDLE;
-@@ -3016,6 +4294,17 @@ static VkPipelineLayout vk_eng_split_layout(void)
+@@ -3016,6 +4297,17 @@ static VkPipelineLayout vk_eng_split_layout(void)
  }
  
  /* Which units a pixel program declares as TextureCube. */
@@ -10426,7 +10466,7 @@ index db64302e..21dc5b82 100644
  static u32 vk_eng_cube_units(const char* ps_hlsl)
  {
      u32 mask = 0;
-@@ -3060,9 +4349,15 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+@@ -3060,9 +4352,15 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
      P->rs = *rs;
      P->nslots = layout->count;
      P->stride = vertex_stride;
@@ -10443,7 +10483,7 @@ index db64302e..21dc5b82 100644
      P->used = 1;
      return slot + 1u;
  }
-@@ -3070,7 +4365,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+@@ -3070,7 +4368,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
  static void vk_eng_pipeline_release(void* user, u32 pipeline)
  {
      (void)user;
@@ -10452,7 +10492,7 @@ index db64302e..21dc5b82 100644
      if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
      vk_eng_pipe* P = &s_epipe[pipeline - 1];
      for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-@@ -3105,11 +4400,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+@@ -3105,11 +4403,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
          va[s] = (VkVertexInputAttributeDescription){ s, 0, VK_FORMAT_R32G32B32A32_SFLOAT, s * 16u };
      VkPipelineVertexInputStateCreateInfo vi = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -10469,7 +10509,7 @@ index db64302e..21dc5b82 100644
      VkPipelineViewportStateCreateInfo vps = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
          .viewportCount = 1, .scissorCount = 1 };
-@@ -3125,6 +4423,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+@@ -3125,6 +4426,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                                                                             : VK_CULL_MODE_BACK_BIT,
          .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                   : VK_FRONT_FACE_CLOCKWISE,
@@ -10477,7 +10517,7 @@ index db64302e..21dc5b82 100644
          .lineWidth = 1.0f };
      VkPipelineMultisampleStateCreateInfo ms = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-@@ -3195,11 +4494,12 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+@@ -3195,11 +4497,12 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
      VkPipelineColorBlendStateCreateInfo cb = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
          .attachmentCount = P->rt_count, .pAttachments = cba };
@@ -10493,7 +10533,7 @@ index db64302e..21dc5b82 100644
      VkGraphicsPipelineCreateInfo gci = {
          .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
          .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
-@@ -3240,6 +4540,12 @@ static void vk_eng2_shutdown(void* user)
+@@ -3240,6 +4543,12 @@ static void vk_eng2_shutdown(void* user)
   * on, so overwriting it is safe). Writing them straight into the UBO meant a
   * batched draw read them back out of it, and that memory is host-coherent,
   * i.e. write-combined and uncached on most drivers. */
@@ -10506,15 +10546,28 @@ index db64302e..21dc5b82 100644
  static u8* vk_eng_ucpu(void)
  {
      if (!s_e2.ucpu && s_g.ubo.size) s_e2.ucpu = (u8*)calloc(1, (size_t)s_g.ubo.size);
-@@ -3253,6 +4559,7 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+@@ -3252,7 +4561,20 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+     const u32 cap = (u32)s_g.ps_off;
      if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
      memcpy(s_e2.ucpu, data, bytes);
++    s_e2.vs_src = NULL;
++    s_e2.vs_bytes = bytes;
++    s_cbr.vs_dirty = 1;
++}
++/* bind_vs_constants without the staging copy: `data` stays unchanged until
++ * the draw that uses it is recorded (the async recorder's constant block). */
++static void vk_eng_bind_vs_constants_ref(const void* data, u32 bytes)
++{
++    if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
++    const u32 cap = (u32)s_g.ps_off;
++    if (bytes > cap) bytes = cap;
++    s_e2.vs_src = (const u8*)data;
      s_e2.vs_bytes = bytes;
 +    s_cbr.vs_dirty = 1;
  }
  static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
  {
-@@ -3262,6 +4569,7 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+@@ -3262,6 +4584,7 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
      if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
      memcpy(s_e2.ucpu + s_g.ps_off, data, bytes);
      s_e2.ps_bytes = bytes;
@@ -10522,7 +10575,7 @@ index db64302e..21dc5b82 100644
  }
  static void vk_eng_bind_textures(void* user, const u32* textures,
                                   const rsx_be_sampler_desc* samplers, u32 mask)
-@@ -3283,12 +4591,14 @@ static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
+@@ -3283,12 +4606,14 @@ static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
  static void vk_eng_set_viewport(void* user, float x, float y, float w, float h)
  {
      (void)user;
@@ -10539,7 +10592,7 @@ index db64302e..21dc5b82 100644
  }
  static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
  
-@@ -3300,6 +4610,28 @@ static float vk_depth_bound(float v, float open)
+@@ -3300,6 +4625,28 @@ static float vk_depth_bound(float v, float open)
      return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
  }
  
@@ -10568,7 +10621,7 @@ index db64302e..21dc5b82 100644
  static void vk_eng_set_depth_bounds(void* user, float min, float max)
  {
      (void)user;
-@@ -3369,7 +4701,8 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+@@ -3369,7 +4716,8 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
      const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
                    | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
                    | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
@@ -10578,7 +10631,7 @@ index db64302e..21dc5b82 100644
      for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
      if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
      float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
-@@ -3383,6 +4716,20 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+@@ -3383,6 +4731,20 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
          .addressModeW = vk_gcm_wrap(d->wrap_r),
          .minLod = min_lod, .maxLod = max_lod,
          .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
@@ -10599,7 +10652,7 @@ index db64302e..21dc5b82 100644
      VkSampler smp;
      if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return s_vk.sampler;
      s_esamp[s_esamp_count].key = key;
-@@ -3395,13 +4742,28 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+@@ -3395,13 +4757,28 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
   * A unit gets a view of its own kind only -- a cube for a TextureCube unit, a
   * 2D one otherwise -- and NULL for anything else, which then samples the
   * dummy of the unit's kind. */
@@ -10629,7 +10682,7 @@ index db64302e..21dc5b82 100644
  }
  
  /* What a cube unit with nothing bound samples: a 1x1 cube, magenta on every
-@@ -3450,7 +4812,20 @@ static struct {
+@@ -3450,7 +4827,20 @@ static struct {
      VkDescriptorPool pool;
      u32              sets;
      unsigned long long draws, flushes;
@@ -10651,7 +10704,7 @@ index db64302e..21dc5b82 100644
  
  static int vk_eb_on(void)
  {
-@@ -3479,7 +4854,21 @@ static int vk_eb_on(void)
+@@ -3479,7 +4869,21 @@ static int vk_eb_on(void)
          VK_LOG("draw batching: no host-coherent ring memory, staying off\n");
          return 0;
      }
@@ -10674,7 +10727,7 @@ index db64302e..21dc5b82 100644
      s_eb.on = 1;
      return 1;
  }
-@@ -3488,19 +4877,30 @@ static int vk_eb_on(void)
+@@ -3488,19 +4892,30 @@ static int vk_eb_on(void)
   * decides again. Also frees what a failed vk_eb_on had already created. */
  static void vk_eb_release(void)
  {
@@ -10707,7 +10760,7 @@ index db64302e..21dc5b82 100644
  
  static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align);
  
-@@ -3512,43 +4912,174 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
+@@ -3512,43 +4927,174 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSiz
  static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                          u32 rows, u32 row_bytes)
  {
@@ -10851,7 +10904,7 @@ index db64302e..21dc5b82 100644
 +    vk_eb_end_pass();
 +    s_rpm.need_barrier = 1;
 +}
-+
+ 
 +static int vk_rpm_written(VkImage img)
 +{
 +    if (!img) return 0;
@@ -10865,7 +10918,7 @@ index db64302e..21dc5b82 100644
 +    if (s_rpm.nwritten < VK_EB_WRITTEN_MAX) s_rpm.written[s_rpm.nwritten++] = img;
 +    else s_rpm.need_barrier = 1;     /* lost track: be conservative */
 +}
- 
++
 +/* The image behind an engine handle a draw samples (a view samples its surface's image). */
 +static VkImage vk_rpm_sampled_image(u32 handle)
 +{
@@ -10891,7 +10944,7 @@ index db64302e..21dc5b82 100644
  }
  
  static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
-@@ -3570,18 +5101,29 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
+@@ -3570,18 +5116,29 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
      if (!set) return VK_NULL_HANDLE;
      const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
      if (split && !dummy_cube) return VK_NULL_HANDLE;
@@ -10923,7 +10976,7 @@ index db64302e..21dc5b82 100644
                                           VK_IMAGE_LAYOUT_GENERAL };
          si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
      }
-@@ -3610,6 +5152,35 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
+@@ -3610,6 +5167,35 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
      return set;
  }
  
@@ -10959,7 +11012,7 @@ index db64302e..21dc5b82 100644
  static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                          u32 stride, const u32* indices, u32 index_count)
  {
-@@ -3618,6 +5189,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3618,6 +5204,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
      vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
      if (!P->used || stride != P->stride) return;
@@ -10970,7 +11023,7 @@ index db64302e..21dc5b82 100644
  
      /* Targets: every member of a set is target A's size (engine contract). */
      const u32 n = s_eng_bound.nrt;
-@@ -3644,14 +5219,15 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3644,14 +5234,15 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
      if (!pipe || !rp || !fb) return;
  
@@ -10988,7 +11041,7 @@ index db64302e..21dc5b82 100644
      if (batched) {
          /* Slices of the rings and a set from the pool; a full one flushes the
           * batch (which empties them all) and the draw takes its slices again. */
-@@ -3659,8 +5235,35 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3659,8 +5250,35 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
              VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
              voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, 16u);
              ioff = ibytes ? vk_eb_take(&ih, VK_EB_IB_BYTES, ibytes, 16u) : 0;
@@ -11011,7 +11064,7 @@ index db64302e..21dc5b82 100644
 +                    set = s_dset.set;
 +                    s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
 +                    if (!reuse_vs) {
-+                        memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
++                        memcpy((u8*)s_eb.ub.ptr + uvs, s_e2.vs_src ? s_e2.vs_src : vk_eng_ucpu(), vsb);
 +                        s_cbr.vs_off = uvs; s_cbr.epoch_vs = s_eb.epoch; s_cbr.vs_bytes = vsb; s_cbr.vs_dirty = 0;
 +                    }
 +                    if (!reuse_ps) {
@@ -11026,14 +11079,14 @@ index db64302e..21dc5b82 100644
              if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
                  s_eb.sets < VK_EB_MAX_SETS) {
                  VkDescriptorSetLayout lay = P->cube_mask ? s_e2.split_layout : s_g.set_layout;
-@@ -3670,30 +5273,34 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3670,51 +5288,98 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                  if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
                      s_eb.sets++;
                      s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
 -                    memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
 -                    memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
 +                    if (!reuse_vs) {
-+                        memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
++                        memcpy((u8*)s_eb.ub.ptr + uvs, s_e2.vs_src ? s_e2.vs_src : vk_eng_ucpu(), vsb);
 +                        s_cbr.vs_off = uvs; s_cbr.epoch_vs = s_eb.epoch; s_cbr.vs_bytes = vsb; s_cbr.vs_dirty = 0;
 +                    }
 +                    if (!reuse_ps) {
@@ -11072,7 +11125,13 @@ index db64302e..21dc5b82 100644
          if (ibytes) {
              if (vk_eng_ensure_indices(ibytes)) return;
              memcpy(s_e2.indices.ptr, indices, (size_t)ibytes);
-@@ -3706,15 +5313,58 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+         }
+         vbuf = s_vk.vertices.buf; ibuf = s_e2.indices.buf; voff = ioff = 0;
+         if (!vk_eng_ucpu()) return;
+-        memcpy(s_g.ubo.ptr, s_e2.ucpu, vsb);
++        memcpy(s_g.ubo.ptr, s_e2.vs_src ? s_e2.vs_src : s_e2.ucpu, vsb);
+         memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.ucpu + s_g.ps_off, psb);
+         set = vk_eng_write_descriptors(P);
          if (!set) return;
          if (vk_begin()) return;
      }
@@ -11140,7 +11199,7 @@ index db64302e..21dc5b82 100644
      VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
      if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
          vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
-@@ -3728,14 +5378,40 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3728,14 +5393,40 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
          sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
      }
@@ -11188,7 +11247,7 @@ index db64302e..21dc5b82 100644
      pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
      if (ibytes) {
          pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
-@@ -3743,10 +5419,49 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3743,10 +5434,49 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      } else {
          pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
      }
@@ -11240,7 +11299,7 @@ index db64302e..21dc5b82 100644
  }
  
  static const rsx_draw_backend s_vk_engine_backend = {
-@@ -3764,6 +5479,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3764,6 +5494,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .depth_target_release = vk_eng_release,
      .depth_snapshot       = vk_eng_depth_snapshot,
      .color_snapshot       = vk_eng_color_snapshot,
@@ -11248,7 +11307,7 @@ index db64302e..21dc5b82 100644
      .pipeline_create      = vk_eng_pipeline_create,
      .pipeline_release     = vk_eng_pipeline_release,
      .bind_targets         = vk_eng_bind_targets,
-@@ -3783,11 +5499,885 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3783,11 +5514,886 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .readback             = vk_eng_readback,
      .depth_readback       = vk_eng_depth_readback,
      .color_target_write   = vk_eng_color_target_write,
@@ -11659,7 +11718,8 @@ index db64302e..21dc5b82 100644
 +    case AR_VSCD: { /* patch the recorder's copy of the block, bind its head */
 +        const u32* a = p;
 +        if (a[2] > a[1]) memcpy(s_ar_vsc_copy + a[1], a + 4, a[2] - a[1]);
-+        b->bind_vs_constants(u, s_ar_vsc_copy, a[0]);
++        if (b->bind_vs_constants == vk_eng_bind_vs_constants) vk_eng_bind_vs_constants_ref(s_ar_vsc_copy, a[0]);
++        else b->bind_vs_constants(u, s_ar_vsc_copy, a[0]);
 +        break; }
 +    case AR_PSC: { const u32* a = p; b->bind_ps_constants(u, a + 4, a[0]); break; }
 +    case AR_BTEX: case AR_BVTEX: { const ar_btex* a = p; u32 t[RSX_BE_MAX_TEXTURES];
@@ -12134,7 +12194,7 @@ index db64302e..21dc5b82 100644
  static rsx_backend s_vulkan_backend = {
      .userdata           = &s_vk,
      .set_render_target  = vk_cb_track_state,
-@@ -3907,7 +6497,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3907,7 +6513,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      if (vk_pick_depth_format()) return -1;
      if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -12144,7 +12204,7 @@ index db64302e..21dc5b82 100644
      if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
-@@ -3937,6 +6528,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3937,6 +6544,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      if (vk_submit_and_wait()) return -1;
  
      if (s_vk.windowed) {
@@ -12156,7 +12216,7 @@ index db64302e..21dc5b82 100644
          VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
          if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
              vk_create_swapchain())
-@@ -3961,12 +6557,32 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
+@@ -3961,12 +6573,32 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
       * pipeline from the guest's programs, so without them it has nothing to
       * draw with, and the vtable's fixed-function path stays the default.
       * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
@@ -12190,7 +12250,7 @@ index db64302e..21dc5b82 100644
      VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
      VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
             s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
-@@ -4008,6 +6624,8 @@ void rsx_vulkan_backend_shutdown(void)
+@@ -4008,6 +6640,8 @@ void rsx_vulkan_backend_shutdown(void)
          vk_destroy_image(&s_vk.dummy);
          vk_destroy_image(&s_vk.depth);
          vk_destroy_image(&s_vk.color);
@@ -12199,7 +12259,7 @@ index db64302e..21dc5b82 100644
          vk_destroy_buffer(&s_vk.vertices);
          vk_destroy_buffer(&s_vk.readback);
          if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
-@@ -4025,14 +6643,42 @@ void rsx_vulkan_backend_shutdown(void)
+@@ -4025,14 +6659,42 @@ void rsx_vulkan_backend_shutdown(void)
      memset(&s_vk, 0, sizeof s_vk);
  }
  
@@ -12242,7 +12302,7 @@ index db64302e..21dc5b82 100644
      }
      return quit ? -1 : 0;
  }
-@@ -4040,12 +6686,20 @@ int rsx_vulkan_backend_pump_messages(void)
+@@ -4040,12 +6702,20 @@ int rsx_vulkan_backend_pump_messages(void)
  void rsx_vulkan_backend_present(void)
  {
      rsx_vulkan_backend_present_begin();
@@ -12264,7 +12324,7 @@ index db64302e..21dc5b82 100644
      s_vk.present_split = 1;
      if (s_vk.eng_active) rsx_draw_engine_present();
      else                 vk_cb_present(&s_vk, 0);
-@@ -4055,9 +6709,12 @@ void rsx_vulkan_backend_present_begin(void)
+@@ -4055,9 +6725,12 @@ void rsx_vulkan_backend_present_begin(void)
  void rsx_vulkan_backend_present_finish(void)
  {
      if (!s_vk.device) return;

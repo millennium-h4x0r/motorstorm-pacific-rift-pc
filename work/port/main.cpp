@@ -231,6 +231,36 @@ static void present_guest_frame(void)
     InterlockedIncrement(&g_frames_presented);
 }
 
+/* The vblank beat on a thread of its own (default; PS3RECOMP_VBLANK_THREAD=0
+ * ticks from frame_clock's loop as before). frame_clock also drains the FIFO,
+ * and a drain pass in a 60 fps race runs ~9.5 ms in one call, so a beat due
+ * during it fired up to ~10 ms late: vblank intervals spread over 12-26 ms.
+ * The game's RSX waits on a label its vblank handler releases, so every late
+ * beat was a late frame (60 fps mode: ~10% of frames at ~20 ms). */
+static unsigned long long s_vblank_period_ns;
+static int vblank_thread_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VBLANK_THREAD"); on = !(e && *e == '0'); }
+    return on;
+}
+static DWORD WINAPI vblank_clock(LPVOID)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned long long next = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+    for (;;) {
+        next += s_vblank_period_ns;
+        struct timespec d = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+        if (now > next + 8 * s_vblank_period_ns) next = now;   /* suspended: resync, no burst */
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+    }
+    return 0;
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = getenv("PS3_TITLE");
@@ -260,6 +290,11 @@ static DWORD WINAPI frame_clock(LPVOID)
         return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
     };
     unsigned long long next_tick = mono_ns();
+    const int own_vblank = vblank_thread_on();
+    if (own_vblank) {
+        s_vblank_period_ns = period_ns;
+        CreateThread(NULL, 256u * 1024, vblank_clock, NULL, 0, NULL);
+    }
 
     for (;;) {
         {   /* sleep to the next vblank, or one poll interval, whichever is sooner */
@@ -292,8 +327,10 @@ static DWORD WINAPI frame_clock(LPVOID)
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
-            cellGcmTickVBlank();
-            cellGcmTickFlip();
+            if (!own_vblank) {
+                cellGcmTickVBlank();
+                cellGcmTickFlip();
+            }
             /* Present a pending flip BEFORE draining any further. The flip
              * fires at a get==put frame boundary on the guest thread, so the
              * batch held right now is exactly the completed frame; presenting
