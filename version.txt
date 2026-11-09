@@ -1,4 +1,4 @@
-motorstorm_pacific_port
-version: 0.0.1-skeleton
-date: 2026-11-04
+motorstorm-pacific-rift-recomp
+version: 0.1.0
+date: 2026-11-09
 toolkit: ps3recomp v0.18.0 (4e8f3ca8)
