@@ -73,3 +73,35 @@ void port_frame_dt(ppu_context* ctx)
     }
     if (d > 1u) fpr(ctx, 1) = f1 * (double)d;
 }
+
+/* PS3RECOMP_FPS=60: the chase camera's shake at the rate it was tuned for.
+ * func_0037FB68(camera r3, vehicle r4) steps the shake springs
+ * (CHASE_SHAKE_* in data/camera_config_files/chase_cameras/: per-step max
+ * acceleration and damping) once per call and never reads the frame time.
+ * At 60 fps it took twice as many steps a second, which shook the picture
+ * much harder over rough ground. It now runs once per two vblanks per camera,
+ * the 30 fps cadence, and keeps its last state in between.
+ * PS3RECOMP_SHAKE_60=1 turns this off. Returns nonzero to skip the call. */
+int port_shake_skip(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_FPS");
+        const char* o = getenv("PS3RECOMP_SHAKE_60");
+        on = (e && atoi(e) == 60) && !(o && *o == '1');
+    }
+    if (!on) return 0;
+    static uint32_t cam[8], last[8];
+    const uint32_t obj = (uint32_t)gpr(ctx, 3);
+    const uint32_t tick = cellGcm_vblank_ticks() / 2u;
+    int k = 0;
+    while (k < 8 && cam[k] && cam[k] != obj) k++;
+    if (k == 8) k = (int)(obj >> 4) & 7;          /* full: reuse a slot */
+    static int log = -1; static uint32_t calls, runs;
+    if (log < 0) { const char* e = getenv("PS3RECOMP_DT_LOG"); log = e && *e == '1'; }
+    if (log && (++calls % 600) == 0)
+        fprintf(stderr, "[shake] %u calls, %u stepped\n", calls, runs);
+    if (cam[k] == obj && last[k] == tick) return 1;
+    cam[k] = obj; last[k] = tick; runs++;
+    return 0;
+}

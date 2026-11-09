@@ -30,6 +30,9 @@
 
 /* The lifter's generated header, which declares ppu_context and the function
  * table. It comes first: everything below is written against that struct. */
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include "ppu_recomp.h"
 
 /* The Win32 names -- Sleep, GetTickCount64, CreateThread, InterlockedIncrement,
@@ -518,6 +521,12 @@ static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry,
 
 int main(int argc, char** argv)
 {
+#ifdef __linux__
+    /* PS3RECOMP_PTRACE_ANY=1: let any process of this user attach (gdb -p),
+     * despite Yama ptrace_scope 1. For debugging only. */
+    { const char* e = getenv("PS3RECOMP_PTRACE_ANY");
+      if (e && *e == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0); }
+#endif
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;

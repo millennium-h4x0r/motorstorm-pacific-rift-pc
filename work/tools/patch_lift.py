@@ -33,6 +33,12 @@ PATCHES = [
     ('func_008CF1C0',
      'void func_008CF1C0(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
      '    { void port_frame_dt(ppu_context*); port_frame_dt(ctx); } /* patch_lift.py */\n'),
+    # func_0037FB68 steps the chase camera's shake springs once per call,
+    # with no frame time. port_shake_skip (60 fps mode) lets it run once per
+    # two vblanks per camera, the rate the CHASE_SHAKE_* tuning assumes.
+    ('func_0037FB68',
+     'void func_0037FB68(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
+     '    { int port_shake_skip(ppu_context*); if (port_shake_skip(ctx)) return; } /* patch_lift.py */\n'),
 ]
 
 
