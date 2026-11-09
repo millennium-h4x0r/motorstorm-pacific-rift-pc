@@ -39,6 +39,16 @@ PATCHES = [
     ('func_0037FB68',
      'void func_0037FB68(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
      '    { int port_shake_skip(ppu_context*); if (port_shake_skip(ctx)) return; } /* patch_lift.py */\n'),
+    # func_0042E3F0 is evo::camerasystem::Shake's update: fresh random
+    # offsets from the game RNG (func_00439820) on every call. In 60 fps mode
+    # port_camshake_enter/port_camshake_rand make it replay its draws within
+    # a 30 Hz tick, so the jolts change at the rate the game was made for.
+    ('func_0042E3F0',
+     'void func_0042E3F0(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
+     '    { void port_camshake_enter(ppu_context*); port_camshake_enter(ctx); } /* patch_lift.py */\n'),
+    ('func_00439820',
+     'void func_00439820(ppu_context* ctx) {\n    PPU_MM_SNAP\n',
+     '    { int port_camshake_rand(ppu_context*); if (port_camshake_rand(ctx)) return; } /* patch_lift.py */\n'),
 ]
 
 
