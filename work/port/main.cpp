@@ -675,8 +675,14 @@ int main(int argc, char** argv)
     /* 60 fps mode: the engine's scheduled full texture hash (a change its
      * sparse check misses) every 16 frames instead of 8, the same delay in
      * seconds as at 30 fps; ~0.1 us less per draw on the RSX thread. */
+    /* It also records Vulkan commands on a thread of their own
+     * (VK_ASYNC_RECORD=1, the async backend proxy): at 1440p that takes
+     * 60 fps mode from ~48 to ~57-58 fps. VK_ASYNC_RECORD=0 turns it off. */
     { const char* f = getenv("PS3RECOMP_FPS");
-      if (f && atoi(f) == 60) setenv("PS3RECOMP_ENG_TEXHASH_EVERY", "16", 0); }
+      if (f && atoi(f) == 60) {
+          setenv("PS3RECOMP_ENG_TEXHASH_EVERY", "16", 0);
+          setenv("VK_ASYNC_RECORD", "1", 0);
+      } }
 
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 

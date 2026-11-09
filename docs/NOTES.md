@@ -227,8 +227,10 @@ Status update (later 2026-11-05): with GPU fetch, `SPURS_HOST_SPUS=6` + `SPURS_M
 small RSX-reference wait (func_0072E1E0, usleep(30) on CellGcmControl.ref, 0.15-1.35 ms/frame).
 The frame is main's: ~9.7 ms running (including the func_0050C818 job-counter spin), ~5.8 ms in
 func_0094CC80 (waiting for a job object's two locks), ~2.4 ms on Havok taskset tasks (cellSync
-mutex polls + event_queue_receive). The async backend proxy (`VK_ASYNC_RECORD=1`) works but
-gains nothing now and stays off. Timeline tools: `FTRACE=<prefix> work/tools/bench.sh`
+mutex polls + event_queue_receive). The async backend proxy (`VK_ASYNC_RECORD=1`) gained
+nothing at 30 fps and stays off there. Since 2026-11-09, 60 fps mode turns it on: once
+the vertex pool moved to host memory, 1440p went from ~48 to 58.0 fps (3 rounds, p50 16.7 ms).
+`VK_ASYNC_RECORD=0` turns it off. Timeline tools: `FTRACE=<prefix> work/tools/bench.sh`
 (PS3_FTRACE armed by SIGUSR2 at GO+2 s; header base_ns = CLOCK_MONOTONIC) and
 `PROF_TRIGGER=<file>` for a preloaded sampler.
 
