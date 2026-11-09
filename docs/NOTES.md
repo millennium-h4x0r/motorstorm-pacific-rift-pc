@@ -240,8 +240,13 @@ draw_fetch). It does not use a fixed-address mirror with per-page uploads. Pages
 mirror cannot be rewritten while earlier draws of the same frame still read them: copies
 are not allowed inside a render pass, and the game rewrites its dynamic vertex rings within a
 frame. Instead:
-- Ranges are content-addressed, immutable blocks in a 96 MB pool in the BAR heap
-  (device-local and host-visible, so no copy commands). A block is keyed by the per-frame
+- Ranges are content-addressed, immutable blocks in a 128 MB pool in host-visible
+  memory, so no copy commands are needed. Since 2026-11-09 the pool lives in host memory,
+  not the BAR heap. CPU writes into the BAR ran at about 50 MB/s on the RTX 3090 while the
+  GPU was busy. Copying about 0.2 MB per frame took 3-7 ms of RSX-thread time at 1440p,
+  enough to hold 30 fps mode at about 22 fps. In host memory, 1440p runs at 29.7 fps in
+  30 fps mode and about 37 -> 48 fps in 60 fps mode. `PS3RECOMP_GF_VRAM=1` tries the
+  BAR first. A block is keyed by the per-frame
   range hash the vertex cache uses, including the SPU io_written generations.
 - The pool is a ring. A block is reused only once fetch_serial says every draw that read it
   has completed, and a hot block is copied forward before the head reaches it.
