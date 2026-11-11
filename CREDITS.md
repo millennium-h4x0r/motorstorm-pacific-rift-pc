@@ -18,4 +18,3 @@
 - **[SDL2](https://www.libsdl.org)** (zlib): window, pad and audio.
 - **[glslang](https://github.com/KhronosGroup/glslang)** and the
   **Vulkan** headers and loader (Khronos): shader translation and rendering.
-- Written with AI assistance (Claude).
