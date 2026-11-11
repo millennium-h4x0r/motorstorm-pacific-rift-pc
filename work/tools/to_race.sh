@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drive a running instance from boot to a Free-Play race (Kanaloa Bay, bike) and skip the flyover.
-#   INST=<name> work/tools/to_race.sh        (start the instance first: INST=<name> work/run.sh &)
+#   INST=<name> [TRACK=n] [TOD=n] [VEHICLE=n] work/tools/to_race.sh   (start the instance first: INST=<name> work/run.sh &)
 # Checks the frame dump at the key screens instead of trusting fixed waits:
 #   - presses START until the main menu's help bar is up and "The Festival"/"Wreckreation" is lit,
 #   - moves the cursor until WRECKREATION / FREE-PLAY is the highlighted (yellow) row,
@@ -65,8 +65,19 @@ press 0x4000 7
 for k in $(seq 1 10); do p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] && break
     if [ "$p" = 0 ]; then sleep 1; else press 0x0040 3 4; fi; done
 p=$(probe peak); [ "$p" -ge 207 ] && [ "$p" -le 220 ] || fail "Free-Play not selected (peak $p)"
-# Free-Play -> game setup -> opponent setup (start race) -> vehicle select -> pick the bike
-press 0x4000 6; press 0x4000 6; press 0x4000 7; press 0x4000 3
+# Free-Play -> game setup -> opponent setup (start race) -> vehicle select -> pick the bike.
+# TRACK / TOD / VEHICLE = presses of RIGHT on the Track and Time of Day rows of
+# Game Setup and in Vehicle Select (default 0: Kanaloa Bay, Morning, Bike).
+right() { local i; for i in $(seq 1 "$1"); do press 0x0020 1.2 4; done; }
+press 0x4000 6
+if [ "${TRACK:-0}" != 0 ] || [ "${TOD:-0}" != 0 ]; then
+    press 0x0040 1.2 4; right "${TRACK:-0}"                 # Game Type -> Track
+    press 0x0040 1.2 4; press 0x0040 1.2 4; right "${TOD:-0}"   # -> Laps -> Time of Day
+    sleep 2
+fi
+press 0x4000 6; press 0x4000 7
+right "${VEHICLE:-0}"
+press 0x4000 3
 
 ok=0; for k in $(seq 1 20); do sleep 0.5; [ "$(probe yellow)" -gt 25 ] && { ok=1; break; }; done
 # With the SPIR-V disk cache a warm load can be over before the first probe:

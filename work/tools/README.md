@@ -20,7 +20,9 @@ write only under `work/inst/<name>/`, which is git-ignored.
 | Tool | What it does |
 |---|---|
 | `pad.sh` | Press a pad button through `PAD_FILE`, wait, and save the latest frame dump as a PNG (`INST=<name> work/tools/pad.sh cross 3`). Needs `ffmpeg`. |
-| `to_race.sh` | Drive an instance from boot to a Free-Play race (Kanaloa Bay, bike), checking frame dumps at each screen. |
+| `to_race.sh` | Drive an instance from boot to a Free-Play race (default Kanaloa Bay, bike), checking frame dumps at each screen. `TRACK=n`, `TOD=n` and `VEHICLE=n` press RIGHT that many times on the Track and Time of Day rows and in Vehicle Select (e.g. `TRACK=3 VEHICLE=7`: Cascade Falls, monster truck). |
+| `capture_race.sh` | Boot an instance, race (to_race.sh), hold the throttle from GO, and write every frame of a stretch to numbered PPMs; `SECS=0` only plays, `WINDOW=1` shows it. |
+| `record.sh` | Record the game window (X11) with sound to `recordings/<time>.mp4` with ffmpeg. |
 | `finish_race.sh` | Soak: two full races, results, quit, back to the menu, with screenshots of each step. |
 | `bench.sh` | The standard benchmark: boots an instance per round, races, and reports fps, frame-interval percentiles and CPU ms per frame per thread. The binary must be named `PacificRiftRecomp`. |
 | `fliplog.py` | fps and frame-interval percentiles from a `PS3RECOMP_FLIPLOG` file. |

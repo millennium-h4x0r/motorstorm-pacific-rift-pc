@@ -10,12 +10,24 @@
 
 <p align="center"><b>motorstorm-pacific-rift-pc</b> · native on Linux · PS3 static recompilation · Vulkan · up to 4K · optional 60 fps</p>
 
+<p align="center"><img src="docs/screenshots/cascade-falls-start.jpg" width="900" alt="GO at Cascade Falls: the player's monster truck behind a pack of bikes, ATVs and buggies on a jungle track, race HUD on"></p>
+
 **MotorStorm: Pacific Rift** (PS3, BCES-00129, version 01.00) running natively
 on Linux, without an emulator. The game's code, PowerPC (PPU) and SPU, is
 translated to C ahead of time by static recompilation with
 [ps3recomp](https://github.com/sp00nznet/ps3recomp) and compiled into a
 normal x86-64 program. The PS3 system is reimplemented by the toolkit's
 runtime, and the GPU (RSX) runs the game's own shaders translated to Vulkan.
+
+<p align="center">
+  <img src="docs/screenshots/rain-god-spires-crash.jpg" width="445" alt="A buggy flipping end over end in a crash at Rain God Spires, debris flying">
+  <img src="docs/screenshots/cascade-falls-crash.jpg" width="445" alt="A monster truck crashing under a water tower at Cascade Falls, its fender torn off in mid-air">
+</p>
+<p align="center">
+  <img src="docs/screenshots/caldera-ridge-big-rig.jpg" width="445" alt="A big rig tanker truck on the grid at Caldera Ridge during the countdown">
+  <img src="docs/screenshots/kanaloa-race.jpg" width="445" alt="Racing a bike along the beach at Kanaloa Bay among palm trees">
+</p>
+<p align="center"><i>Cascade Falls, Rain God Spires, Caldera Ridge and Kanaloa Bay at 1440p in 60 fps mode (shown here scaled to 1280×720).</i></p>
 
 > [!IMPORTANT]
 > **No game files come with this project, and none may be added to it.** To
