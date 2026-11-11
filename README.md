@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/code-MIT-blue" alt="Code MIT">
 </p>
 
-<p align="center"><b>motorstorm-pacific-rift-recomp</b> · native on Linux · PS3 static recompilation · Vulkan · up to 4K · optional 60 fps</p>
+<p align="center"><b>motorstorm-pacific-rift-pc</b> · native on Linux · PS3 static recompilation · Vulkan · up to 4K · optional 60 fps</p>
 
 **MotorStorm: Pacific Rift** (PS3, BCES-00129, version 01.00) running natively
 on Linux, without an emulator. The game's code, PowerPC (PPU) and SPU, is
@@ -83,7 +83,15 @@ Technical notes: [docs/NOTES.md](docs/NOTES.md).
 
 ## Setup
 
-### 1. Put the game in place
+### 1. Get the code
+
+```sh
+git clone https://github.com/millennium-h4x0r/motorstorm-pacific-rift-pc.git motorstorm_pacific
+cd motorstorm_pacific
+scripts/install-hooks.sh    # optional: blocks commits of game files
+```
+
+### 2. Put the game in place
 
 `disc/` is git-ignored. The port expects:
 
@@ -98,7 +106,7 @@ disc/PS3_GAME/USRDIR/     the dump's USRDIR files, plus:
 (symlinks for everything, a copy of `EBOOT.elf`, and the `cat` that joins
 `ms2.psarc`) and the expected checksum.
 
-### 2. Get and patch the toolkit
+### 3. Get and patch the toolkit
 
 ```sh
 scripts/setup.sh
@@ -110,7 +118,7 @@ port's changes from `work/patches/ps3recomp.patch`, clones Dear ImGui v1.91.5
 for the menu, and installs the toolkit's Python tools into `.venv/`. Set
 `PS3RECOMP_DIR=<dir>` to keep the toolkit elsewhere (every script honours it).
 
-### 3. Lift your executable
+### 4. Lift your executable
 
 ```sh
 scripts/lift.sh                 # or: scripts/lift.sh path/to/EBOOT.elf
@@ -125,7 +133,7 @@ updating this repository, run `scripts/lift.sh` again, or at least
 `.venv/bin/python work/tools/patch_lift.py` (it is idempotent and fails
 loudly if the lifted code is not what it expects).
 
-### 4. Build
+### 5. Build
 
 ```sh
 scripts/build.sh                # -> work/port/build/PacificRiftRecomp
@@ -143,7 +151,7 @@ cmake -S work/port -B work/port/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build work/port/build
 ```
 
-### 5. Play
+### 6. Play
 
 ```sh
 work/run.sh

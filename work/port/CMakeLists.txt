@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(PacificRiftRecomp
     VERSION 0.1.0
     LANGUAGES C CXX
-    DESCRIPTION "MotorStorm: Pacific Rift (PS3) native PC port, statically recompiled with ps3recomp (motorstorm-pacific-rift-recomp)"
+    DESCRIPTION "MotorStorm: Pacific Rift (PS3) native PC port, statically recompiled with ps3recomp (motorstorm-pacific-rift-pc)"
 )
 
 # ---------------------------------------------------------------------------
