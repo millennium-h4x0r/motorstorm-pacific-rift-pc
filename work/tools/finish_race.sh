@@ -12,7 +12,7 @@
 cd "$(dirname "$0")/../.."
 I="${INST:-fin}"; D=work/inst/$I; F=$D/frame.ppm; FL=$D/flip.txt
 O="${OUT:-$D/shots}"; mkdir -p "$O"
-export BIN="${BIN:-$PWD/work/port/build-perf/PacificRiftRecomp}"
+export BIN="${BIN:-$PWD/work/port/build/PacificRiftRecomp}"
 exec 9>work/inst/.bench.lock; flock 9
 shot(){ cp $F $O/s.ppm 2>/dev/null; ffmpeg -loglevel error -y -i $O/s.ppm -vf scale=480:-1 $O/$1.png 2>/dev/null; echo "  shot $1"; }
 press(){ echo "$1 ${3:-8}" > $D/pad.txt; sleep $2; }
