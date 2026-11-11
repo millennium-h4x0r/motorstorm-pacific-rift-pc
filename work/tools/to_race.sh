@@ -2,6 +2,7 @@
 # Drive a running instance from boot to a Free-Play race (Kanaloa Bay, bike) and skip the flyover.
 #   INST=<name> [TRACK=n] [TOD=n] [VEHICLE=n] work/tools/to_race.sh   (start the instance first: INST=<name> work/run.sh &)
 # Checks the frame dump at the key screens instead of trusting fixed waits:
+#   - on a fresh save, takes the driver offered on "Choose Your Driver",
 #   - presses START until the main menu's help bar is up and "The Festival"/"Wreckreation" is lit,
 #   - moves the cursor until WRECKREATION / FREE-PLAY is the highlighted (yellow) row,
 #   - waits for the yellow loading screen to appear and to go away.
@@ -26,6 +27,15 @@ px = lambda x, y: raw[(y * W + x) * 3:(y * W + x) * 3 + 3]
 if what == 'menu':      # the white help bar along the bottom of every menu screen
     n = sum(1 for y in range(327, 334) for x in range(120, 620) if min(px(x, y)) > 215)
     print('%.2f' % (n / (7 * 500.0)))
+elif what == 'driver':  # first run (no save): "Choose Your Driver", yellow "Player 1" top left
+    n = sum(1 for y in range(52, 70) for x in range(115, 180)
+            if (lambda c: c[0] > 200 and c[1] > 150 and c[2] < 90)(px(x, y)))
+    m = sum(1 for y in range(327, 334) for x in range(120, 620) if min(px(x, y)) > 215) / 3500.0
+    print(1 if n > 60 and m > 0.2 else 0)   # with the help bar: not a bright intro frame
+elif what == 'accept':  # the "Accept Driver?" Yes/No box over it, an option lit yellow mid-screen
+    n = sum(1 for y in range(120, 192) for x in range(285, 355)
+            if (lambda c: c[0] > 200 and c[1] > 150 and c[2] < 90)(px(x, y)))
+    print(1 if n > 100 else 0)
 elif what == 'peak':    # row band with the most highlight-yellow in the menu column
     best = (0, 0)
     for y0 in range(170, 240, 3):
@@ -49,6 +59,13 @@ sleep 20
 # Title / attract -> main menu (The Festival or Wreckreation lit)
 ok=0
 for k in $(seq 1 20); do
+    # a fresh save asks for a driver first: take the one offered
+    # (X asks "Accept Driver?" with No lit: UP to Yes, then X)
+    if [ "$(probe driver)" = 1 ]; then
+        if [ "$(probe accept)" = 1 ]; then echo "to_race: first run, accepting the driver"; press 0x0010 3; press 0x4000 8
+        else echo "to_race: first run, choosing the driver"; press 0x4000 4; fi
+        continue
+    fi
     press 0x0008 6
     m=$(probe menu); p=$(probe peak)
     python3 -c "import sys; sys.exit(0 if 0.2 < float('$m') < 0.98 and 188 <= $p <= 218 else 1)" && { ok=1; break; }
