@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the port. Logs to work/runs/<timestamp>.log as well as the terminal.
-#   work/run.sh [extra env as VAR=val ...]
+#   work/run.sh [--offscreen] [extra env as VAR=val ...]
 #   TIMEOUT=<secs> to stop after that long (for automated runs).
-#   PS3RECOMP_VK_WINDOW=1 to show a window (rendering is offscreen by default).
+#   The game opens a window; --offscreen (or PS3RECOMP_VK_WINDOW=0) renders
+#   offscreen instead. INST runs (below) are offscreen unless
+#   PS3RECOMP_VK_WINDOW=1 is given.
 #
 # Parallel test instances: INST=<name> isolates everything a run writes, so
 # several builds/configurations can run side by side (offscreen):
@@ -15,9 +17,17 @@
 #   Audio goes to SDL's dummy driver unless INST_AUDIO=1.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-for kv in "$@"; do export "$kv"; done
+for kv in "$@"; do
+    case "$kv" in
+        --offscreen) export PS3RECOMP_VK_WINDOW=0 ;;
+        --window)    export PS3RECOMP_VK_WINDOW=1 ;;
+        *=*)         export "$kv" ;;
+        *) echo "run.sh: unknown argument '$kv' (use --offscreen, --window or VAR=value)" >&2; exit 2 ;;
+    esac
+done
 INST="${INST:-}"
 if [ -n "$INST" ]; then
+    export PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-0}"   # test instances: offscreen
     I="$ROOT/work/inst/$INST"
     mkdir -p "$I"
     [ -d "$I/hdd0" ] || { mkdir -p "$ROOT/hdd0"; cp -a "$ROOT/hdd0" "$I/hdd0"; }

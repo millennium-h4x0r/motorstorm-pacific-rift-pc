@@ -153,7 +153,8 @@ extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define RSX_BACKEND_NAME    "Metal"
 #elif defined(PS3RECOMP_RSX_VULKAN)
 /* Linux with the opt-in Vulkan backend (scripts/build.sh turns it on).
- * PS3RECOMP_VK_WINDOW=1 shows a window; PS3RECOMP_VK_DUMP=<file> dumps frames. */
+ * A window by default (main: --offscreen / PS3RECOMP_VK_WINDOW=0 turn it off);
+ * PS3RECOMP_VK_DUMP=<file> dumps frames. */
 extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_vulkan_backend_present(void);
 extern "C" int  rsx_vulkan_backend_pump_messages(void);
@@ -527,8 +528,17 @@ int main(int argc, char** argv)
     { const char* e = getenv("PS3RECOMP_PTRACE_ANY");
       if (e && *e == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0); }
 #endif
+    /* A window is the default. --offscreen (anywhere on the command line) or
+     * PS3RECOMP_VK_WINDOW=0 renders offscreen instead (test instances). */
+    { int n = 1;
+      for (int i = 1; i < argc; i++) {
+          if (strcmp(argv[i], "--offscreen") == 0) setenv("PS3RECOMP_VK_WINDOW", "0", 1);
+          else argv[n++] = argv[i];
+      }
+      argc = n; argv[argc] = nullptr;
+      if (!getenv("PS3RECOMP_VK_WINDOW")) setenv("PS3RECOMP_VK_WINDOW", "1", 1); }
     if (argc < 2) {
-        printf("usage: %s <PPU ELF>\n", argv[0]);
+        printf("usage: %s [--offscreen] <PPU ELF>\n", argv[0]);
         return 2;
     }
 

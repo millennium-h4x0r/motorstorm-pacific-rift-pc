@@ -192,7 +192,7 @@ void page_video(port_settings& s)
     ImGui::Text("Game frame: %u x %u (%dx)", iw, ih, g_boot_scale);
     if (on) ImGui::Text("FSR 1: %u x %u -> %u x %u", iw, ih, ow, oh);
     else if (s.upscaler) hint("FSR 1 is idle: the window is not larger than the game frame.");
-    else ImGui::TextUnformatted("Stretched to the window");
+    else ImGui::TextUnformatted("Fitted to the window, shape kept");
 }
 
 void page_performance(port_settings& s)

@@ -3,6 +3,7 @@
  * lifted game function, before its body, and may adjust the arguments. */
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include "ppu_context.h"
@@ -39,13 +40,17 @@ void port_timer_interval(ppu_context* ctx)
  * crash camera's slow motion) and hands it to the game clock and the other
  * per-frame updates. A frame shown for two vblanks gets twice the step, the
  * 30 fps mode's step, instead of playing in slow motion. At most
- * PS3RECOMP_DT_MAX vblanks (default 2, the step the game ships with) are
- * made up; PS3RECOMP_DT_MAX=1 turns this off. PS3RECOMP_DT_LOG=1 logs it. */
+ * PS3RECOMP_DT_MAX vblanks are made up. Default 1 (off): the made-up step
+ * lands a frame late (the long frame moved one step, the next one jumps two),
+ * so below 60 the car lurched back and forth along the road and the physics
+ * alternated 1/60 and 1/30 steps (riders thrown off). Off, every frame is
+ * 1/60 s and the game runs a little slow while it is below 60 fps;
+ * PS3RECOMP_DT_MAX=2 restores the catch-up. PS3RECOMP_DT_LOG=1 logs it. */
 extern "C" uint32_t cellGcm_vblank_ticks(void);
 static inline double& fpr(ppu_context* c, int i) { return reinterpret_cast<double*>(reinterpret_cast<uint64_t*>(c) + 32)[i]; }
 void port_frame_dt(ppu_context* ctx)
 {
-    static int fps = -1, maxv = 2, log = 0, force = 0;
+    static int fps = -1, maxv = 1, log = 0, force = 0;
     if (fps < 0) {
         const char* e = getenv("PS3RECOMP_FPS");
         fps = (e && atoi(e) == 60) ? 60 : 30;
@@ -75,6 +80,22 @@ void port_frame_dt(ppu_context* ctx)
     if (d > 1u) fpr(ctx, 1) = f1 * (double)d;
 }
 
+extern "C" uint8_t* vm_base;
+static inline uint32_t be32(uint32_t a) { const uint8_t* p = vm_base + a; return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static inline void wbe32(uint32_t a, uint32_t v) { uint8_t* p = vm_base + a; p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+/* Camera shake, off by default (both frame rates); PS3RECOMP_CAMERA_SHAKE=1
+ * keeps the game's own. Two systems shake the picture: the chase camera's
+ * shake springs (port_shake_skip below) and evo::camerasystem::Shake, the
+ * jolts on bumps, landings and impacts (port_camshake_*). With it on, the
+ * 60 fps fixes below keep both at their 30 Hz behaviour. */
+static int camera_shake_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_CAMERA_SHAKE"); on = e && *e == '1'; }
+    return on;
+}
+
 /* PS3RECOMP_FPS=60: the chase camera's shake at the rate it was tuned for.
  * func_0037FB68(camera r3, vehicle r4) steps the shake springs
  * (CHASE_SHAKE_* in data/camera_config_files/chase_cameras/: per-step max
@@ -82,9 +103,19 @@ void port_frame_dt(ppu_context* ctx)
  * At 60 fps it took twice as many steps a second, which shook the picture
  * much harder over rough ground. It now runs once per two vblanks per camera,
  * the 30 fps cadence, and keeps its last state in between.
- * PS3RECOMP_SHAKE_60=1 turns this off. Returns nonzero to skip the call. */
+ * PS3RECOMP_SHAKE_60=1 turns this off. Returns nonzero to skip the call.
+ * Camera shake off: zeroes the shake amounts instead, every call (the camera
+ * reloads them when the vehicle changes). */
 int port_shake_skip(ppu_context* ctx)
 {
+    if (!camera_shake_on()) {
+        /* CHASE_SHAKE_SLOW_AMOUNT (+0x230) and _FAST_AMOUNT (+0x260), x y z:
+         * zero, so the springs settle at rest (verified against the
+         * buggy00 config: 2 2 1 and 7 20 5 at these offsets). */
+        const uint32_t o = (uint32_t)gpr(ctx, 3);
+        for (uint32_t i = 0; i < 12; i += 4) { wbe32(o + 0x230u + i, 0u); wbe32(o + 0x260u + i, 0u); }
+        return 0;
+    }
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("PS3RECOMP_FPS");
@@ -117,17 +148,15 @@ int port_shake_skip(ppu_context* ctx)
  * the tick's first update: each draw is recomputed from the RNG state recorded
  * then, on a scratch copy, so the game's RNG itself is untouched.
  * PS3RECOMP_SHAKE_60=1 turns this off too. */
-extern "C" uint8_t* vm_base;
 uint32_t g_shk_rec_total, g_shk_rep_total;
 namespace {
 struct ShakeRec { uint32_t obj, tick; uint32_t n; uint32_t st[16][2]; };
 ShakeRec g_shk[8];
 ShakeRec* g_shk_cur;      /* the shake whose update is running, or null */
 int g_shk_replay;         /* that update replays its tick's draws */
+int g_shk_off;            /* camera shake off: every draw of the update is neutral */
 uint32_t g_shk_i;         /* the next draw within it */
 }
-static inline uint32_t be32(uint32_t a) { const uint8_t* p = vm_base + a; return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-static inline void wbe32(uint32_t a, uint32_t v) { uint8_t* p = vm_base + a; p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 static int shake_60_on(void)
 {
     static int on = -1;
@@ -141,7 +170,8 @@ static int shake_60_on(void)
 void port_camshake_enter(ppu_context* ctx)
 {
     g_shk_cur = nullptr;
-    if (!shake_60_on()) return;
+    g_shk_off = !camera_shake_on();
+    if (g_shk_off || !shake_60_on()) return;
     const uint32_t obj = (uint32_t)gpr(ctx, 3), tick = cellGcm_vblank_ticks() / 2u;
     int k = 0;
     while (k < 8 && g_shk[k].obj && g_shk[k].obj != obj) k++;
@@ -159,10 +189,25 @@ void port_camshake_enter(ppu_context* ctx)
 /* At func_00439820's entry. Nonzero: f1 holds the draw, skip the body. */
 int port_camshake_rand(ppu_context* ctx)
 {
-    ShakeRec* r = g_shk_cur;
-    if (!r) return 0;
     const uint32_t lr = (uint32_t)ctx->lr;
     if (lr < 0x0042E3F0u || lr >= 0x0042F6E8u) return 0;          /* not a draw of the shake */
+    if (g_shk_off) {
+        /* The shake turns each draw r into 2r - c, c the float at
+         * TOC+0x7010, times its amplitude: r = c/2 is no offset. The real
+         * draw still runs (the wrapper's body), so the game's RNG sequence
+         * is unchanged. */
+        const uint64_t lr0 = ctx->lr;
+        gpr(ctx, 3) = be32((uint32_t)gpr(ctx, 2) + 0x7448u);
+        ctx->lr = 0x00439834u;
+        { void func_00439678(ppu_context*); func_00439678(ctx); }
+        ctx->lr = lr0;
+        const uint32_t cu = be32((uint32_t)gpr(ctx, 2) + 0x7010u);
+        float c; memcpy(&c, &cu, 4);
+        fpr(ctx, 1) = (double)c * 0.5;
+        return 1;
+    }
+    ShakeRec* r = g_shk_cur;
+    if (!r) return 0;
     const uint32_t rng = be32((uint32_t)gpr(ctx, 2) + 0x7448u);
     if (!g_shk_replay) {
         if (r->n < 16) { r->st[r->n][0] = be32(rng); r->st[r->n][1] = be32(rng + 4); r->n++; g_shk_rec_total++; }

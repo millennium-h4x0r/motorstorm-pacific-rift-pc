@@ -120,7 +120,7 @@ This translates the PPU code into `work/src/recomp/` and the SPU images into
 `work/port/spu/` (`work/tools/lift_spu.sh`). It then runs
 `work/tools/patch_lift.py`, which splices the port's hooks into the lifted
 code: the 60 fps timestep, the frame-time compensation and the camera-shake
-rate. Both directories are git-ignored and must never be shared. After
+hooks. Both directories are git-ignored and must never be shared. After
 updating this repository, run `scripts/lift.sh` again, or at least
 `.venv/bin/python work/tools/patch_lift.py` (it is idempotent and fails
 loudly if the lifted code is not what it expects).
@@ -146,15 +146,16 @@ cmake --build work/port/build
 ### 5. Play
 
 ```sh
-work/run.sh PS3RECOMP_VK_WINDOW=1
+work/run.sh
 ```
 
 `work/run.sh` sets up the environment (the `dev_flash` path, `hdd0/` for
 saves), runs `work/port/build/PacificRiftRecomp` on
 `disc/PS3_GAME/USRDIR/EBOOT.elf` and logs to `work/runs/<time>.log`
-(`work/runs/latest.log` points at the newest). Without
-`PS3RECOMP_VK_WINDOW=1` it renders offscreen (used by the test scripts).
-Arguments of the form `VAR=value` are exported to the game.
+(`work/runs/latest.log` points at the newest). The game opens a window;
+`work/run.sh --offscreen` renders offscreen instead (the test scripts' `INST`
+instances are offscreen by default). Arguments of the form `VAR=value` are
+exported to the game.
 
 Use an SDL2-supported game controller. The game ignores SIGINT (Ctrl+C); stop
 it with SIGKILL, for example `pkill -KILL -x PacificRiftReco`.
@@ -171,7 +172,8 @@ it with SIGKILL, for example `pkill -KILL -x PacificRiftReco`.
 
 Every menu change is saved to `user/settings.ini` at once. The upscaler and
 its sharpness apply immediately; the resolution scale and frame rate are read
-at start, and the menu has a *Restart now* button for them.
+at start, and the menu has a *Restart now* button for them. The frame keeps
+its 16:9 shape in any window size, with black bars where needed.
 
 ### user/settings.ini
 
@@ -196,13 +198,15 @@ The ones a player may want (all `PS3RECOMP_*` switches are read at start):
 
 | Variable | Effect |
 |---|---|
-| `PS3RECOMP_VK_WINDOW=1` | Show a window (and read `user/settings.ini`); offscreen otherwise |
+| `PS3RECOMP_VK_WINDOW=0` | Render offscreen, same as `--offscreen` (default: a window, which reads `user/settings.ini`) |
 | `PS3RECOMP_VK_FULLSCREEN=1` | Start full screen |
+| `PS3RECOMP_STRETCH=1` | Stretch the frame to the window (default: keep its shape, black bars) |
 | `PS3RECOMP_RES_SCALE=1..4` | Render-target scale: 2 = 1440p, 3 = 4K |
 | `PS3RECOMP_FSR=1`, `PS3RECOMP_FSR_SHARPNESS=0..1` | AMD FSR 1 upscaling to the window's size |
-| `PS3RECOMP_FPS=60` | 60 fps mode at correct game speed (needs the `patch_lift.py` hooks) |
-| `PS3RECOMP_DT_MAX=<n>` | 60 fps mode: most vblanks a late frame makes up (default 2; 1 = off) |
-| `PS3RECOMP_SHAKE_60=1` | 60 fps mode: step the chase-camera shake every frame (stronger shake) |
+| `PS3RECOMP_FPS=60` | 60 fps mode at correct game speed while it holds 60 (needs the `patch_lift.py` hooks) |
+| `PS3RECOMP_DT_MAX=2` | 60 fps mode: a late frame makes up the lost time (default 1, off: every frame is 1/60 s, so the game runs slightly slow below 60 fps; the catch-up makes the car lurch and riders fall) |
+| `PS3RECOMP_CAMERA_SHAKE=1` | Keep the game's camera shake (default: off, a steady camera at both 30 and 60 fps) |
+| `PS3RECOMP_SHAKE_60=1` | With camera shake on, 60 fps mode: step it every frame (stronger shake) |
 | `PS3_DEV_FLASH=<dir>` | Firmware `dev_flash` (run.sh default: `~/.config/rpcs3/dev_flash`) |
 | `PS3_HDD0_ROOT=<dir>` | Save data (run.sh default: `hdd0/`) |
 | `PS3_USER_DIR=<dir>` | Where `settings.ini` and `shader_cache/` live (default `user/`) |

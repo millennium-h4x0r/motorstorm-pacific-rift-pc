@@ -51,3 +51,6 @@ work/port/build-*.log
 *.at3
 *.bik
 *.spv
+
+# Gameplay recordings (work/tools/record.sh)
+/recordings/

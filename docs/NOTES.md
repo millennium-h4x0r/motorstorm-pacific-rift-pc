@@ -173,8 +173,10 @@ PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the m
 - `sys_lwcond_signal*` now wake `sys_lwcond_wait` immediately (`runtime/ppu/ppu_sysprx.cpp`). It used to be a bare Sleep(1); `PS3_LWCOND_SLEEP=1` restores that.
 - Frame clock (`work/port/main.cpp`): vblank runs at 59.94 Hz on CLOCK_MONOTONIC, with a loop poll of at most 1 ms. It used to be 62.5 Hz with Sleep(4). Knobs: `PS3RECOMP_VBLANK_HZ`, `PS3RECOMP_CLOCK_POLL_US`.
 - Since 2026-11-09 the vblank beat has a thread of its own (`vblank_clock`; `PS3RECOMP_VBLANK_THREAD=0` restores the old tick from frame_clock's loop). frame_clock also drains the FIFO, and in a 60 fps race one drain pass takes ~9.5 ms (p99 13.6). A beat due during a pass fired when the pass ended, so vblank intervals spread over 12-26 ms. The RSX waits on a label the game's vblank handler releases, so every late beat made a late frame. Now intervals are 16.7 ms and 60 fps mode holds 60 fps through the race's opening seconds. It still dips in the crash: SPU job image c9 adds ~1.1 s/s of job time, and main waits ~7.5 ms/frame on JobBatchHandler. PS3_FTRACE logs the beat as kind 22 and the guest vblank handler as kind 23.
-- 60 fps mode keeps game speed when a frame misses (`port_frame_dt`, spliced into func_008CF1C0 by patch_lift.py). func_008CF1C0 runs once a frame with the frame step in f1: 1/60, or 1/20 of that in the crash camera's slow motion, which is the game's own scaling. f1 goes to the game clock and the world update, and the slow motion shows physics follows it. A frame that took two vblanks (cellGcm_vblank_ticks) gets twice the step, which is the 30 fps step the game ships with. Measured: 600 frames with 79 stretched took 11.3 s, and the game advanced 679/60 = 11.3 s. `PS3RECOMP_DT_MAX` is the most vblanks made up (default 2; 1 turns it off). `PS3RECOMP_DT_LOG=1` logs it.
+- 60 fps mode can keep game speed when a frame misses (opt-in since 2026-11-11, `PS3RECOMP_DT_MAX=2`; `port_frame_dt`, spliced into func_008CF1C0 by patch_lift.py). func_008CF1C0 runs once a frame with the frame step in f1: 1/60, or 1/20 of that in the crash camera's slow motion, which is the game's own scaling. f1 goes to the game clock and the world update, and the slow motion shows physics follows it. A frame that took two vblanks (cellGcm_vblank_ticks) gets twice the step, which is the 30 fps step the game ships with. Measured: 600 frames with 79 stretched took 11.3 s, and the game advanced 679/60 = 11.3 s. `PS3RECOMP_DT_MAX` is the most vblanks made up (default 2; 1 turns it off). `PS3RECOMP_DT_LOG=1` logs it.
 - 60 fps mode: chase camera shake. func_0037FB68(camera, vehicle) steps the shake springs once per call and never reads the frame time. CHASE_SHAKE_* in ms2.psarc data/camera_config_files/chase_cameras/*.txt are per-step max acceleration and damping, and the camera object holds them at +0x230..+0x280. At 60 fps the shake took twice as many steps per second, and the picture shook hard over rough ground, at the same moments as rumble. `port_shake_skip` (patch_lift.py) runs it once per two vblanks per camera, the 30 fps cadence (measured: 309 of 600 calls step). `PS3RECOMP_SHAKE_60=1` restores the per-frame step. Found with a gdb read watchpoint on the damping field (`PS3RECOMP_PTRACE_ANY=1` lets gdb -p attach despite Yama ptrace_scope 1). The jolt shake on bumps and landings (also when the pad rumbles) is another one. evo::camerasystem::Shake's update (func_0042E3F0, vtable 0x0103EB48 slot 2) draws fresh offsets from the game RNG (func_00439820 -> func_00439678, an 8-byte TEA state at *(TOC+0x7448)) on every call. In 60 fps mode, `port_camshake_enter/port_camshake_rand` make a shake replay, within one 30 Hz tick, the draws it made at the tick's first update. Each draw is recomputed from the recorded RNG state on a scratch copy below r1, so the game RNG is untouched. Measured: 6105 of 13497 draws replayed. `PS3RECOMP_SHAKE_60=1` turns both shake fixes off; `PS3RECOMP_DT_LOG=1` logs [camshake]/[shake] counts. Other per-frame-tuned code may exist: look for the same pattern if something else looks too fast at 60.
+- Frame-time catch-up (`PS3RECOMP_DT_MAX`) is off by default since 2026-11-11 (default 1, was 2). Below 60 the made-up step lands a frame late (measured on a recording: the long frame moved 0.69x its share, the next 1.36-1.46x), so the car lurched back and forth along the road, and the physics alternated 1/60 and 1/30 steps; the player saw riders thrown off the bike. With every frame 1/60 s the player reports no shaking; the cost is slow motion while below 60. A real fix would run the game update twice with 1/60 for a two-vblank frame, or hold 60.
+- Camera shake is off by default since 2026-11-10, at both frame rates (the player asked for a steady camera; `PS3RECOMP_CAMERA_SHAKE=1` keeps the game's shake and the 60 fps fixes above). Chase shake: port_shake_skip zeroes x/y/z of CHASE_SHAKE_SLOW_AMOUNT (+0x230) and CHASE_SHAKE_FAST_AMOUNT (+0x260) in the camera object on every call (offsets read from a running race: 2 2 1 and 7 20 5, as in buggy00's config), so the springs rest. camerasystem::Shake: each draw r becomes the offset 2r - c, c = the float at TOC+0x7010, so port_camshake_rand returns c/2 (no offset) after running the real draw, which leaves the game RNG's sequence as it was.
 - The remaining 60 fps dips are in the crash camera's slow motion. Its SPU physics jobs fill all 6 job lanes for ~23 ms of a 44 ms frame. Profile: ~80% lifted job code, spread over many modules, and ~15-20% runtime overhead. The lifted SPU code keeps every register in ctx->gpr. Each spu_ls_write128 goes through a byte pointer, so the compiler reloads ctx->ls and the operands after every LS store. Tried and dropped (2026-11-09): a post-pass that made registers C locals and spilled/reloaded all of them around every statement taking ctx. Jobs ran ~2x slower (spills at every call, and register pressure in large functions). Applied to every image, it also stalled the intro. A real fix needs liveness and dirty tracking in the lifter's code generator.
 - `PS3RECOMP_FLIPLOG=<file>` logs one µs timestamp per presented guest frame; `work/tools/fliplog.py <file> [start_s] [secs]` turns it into fps and interval percentiles.
 - Race and flyover: `VK_DRAW_BATCH` is now on by default (`work/port/main.cpp`; `VK_DRAW_BATCH=0` turns it off). Without it every engine draw is a submit plus fence wait and the race ran at 1-3 fps. With it the race runs at 7-9 fps and the flyover at 12-20 fps. Batches are double-buffered (`VK_EB_ASYNC`, default on), and colour snapshots join the batch. `VK_SUBMIT_STATS=1` prints fence-wait time per call site; `VK_EB_OFF=<mask>` keeps clears (1), uploads (2), depth snapshots (4), draws (8) or colour snapshots (16) out of the batch.
@@ -282,3 +284,103 @@ The NVIDIA driver's pipeline disk cache stopped keeping entries at its default s
 few builds of this port fill. Every run then recompiled each race pipeline on the FIFO thread
 (libnvidia-gpucomp 6% of it). main.cpp now sets `__GL_SHADER_DISK_CACHE_SIZE` to 10 GB unless
 it is already set.
+
+## VSync experiment (2026-11-10, rolled back)
+
+Tried and taken out again at the player's request: in play the game felt
+worse (shaking at least as bad, the FPS counter lower). The code is not in the
+tree; these are the findings, for a later attempt.
+
+
+- **What players saw as shaking at 60 fps** was mostly frame pacing. A
+  recording of a 1440p 60 fps race (x11grab, Xwayland window) ran 42-52 fps
+  with frames alternating one and two refreshes; with the 60 fps time step
+  (port_frame_dt) a two-refresh frame moves everything twice as far, so the
+  picture lurched. The game's vblank was also a free 59.94 Hz timer against a
+  59.997 Hz display: a repeated frame every ~17 s, and frames finishing near
+  the compositor's latch landed on alternate refreshes.
+- **Display clock** (libs/video/rsx_vulkan_backend.c, "Display clock"): each
+  window present carries a VK_KHR_present_id; a thread waits on it with
+  VK_KHR_present_wait and timestamps the moment it reached the screen. Only
+  waits that actually blocked count. A small PLL (phase gain 0.15, frequency
+  0.02, period clamped to +-3% of the display mode) turns the samples into the
+  refresh period and phase; `rsx_vulkan_backend_display_clock` returns them
+  once 60 samples agreed and the newest is under 1.5 s old.
+- **Vblank on the display grid** (work/port/main.cpp, `vsync_next_tick`): the
+  vblank thread ticks on the refresh nearest prev + period, slewing at most
+  0.25 ms a tick onto the grid. 120/180/240 Hz tick every n-th refresh; a rate
+  that is no multiple of ~60 Hz keeps the 59.94 Hz timer (the game's speed
+  is tied to the beat). PS3RECOMP_VSYNC_PHASE_US shifts the beat.
+- **Xwayland gives no timing**: on NVIDIA 580 every vkWaitForPresentKHR on an
+  Xwayland (SDL x11) window returned at once, "already shown" (1154 of 1154).
+  The native Wayland window (SDL_VIDEODRIVER=wayland) blocks until the
+  compositor shows the frame, and the clock locks at 59.99-60.00 Hz. main.cpp
+  therefore asks SDL for `wayland,x11` when WAYLAND_DISPLAY is set.
+- **PS3RECOMP_VSYNC_LOG=1** prints every 10 s how many refreshes each shown
+  frame stayed on screen. Windowed 1440p 60 fps race on Wayland, vsync on:
+  579-600 of ~600 frames for one refresh in clean stretches.
+- **Double present**: frame_clock presented a flip at `fc != last_flip`
+  without taking the flip-pending flag, and the next pass's
+  take_flip_pending presented the same frame again (vsync off: 68 presents/s
+  for 44 game frames). Fixed; FIFO had hidden it by blocking.
+- **VSync off** (PS3RECOMP_VSYNC=0, menu): IMMEDIATE (COSMIC offers FIFO,
+  IMMEDIATE and FIFO_LATEST_READY, no MAILBOX, as the Apocalypse port noted),
+  free 59.94 Hz timer. The menu switch is live: the next present makes the
+  swapchain again (after the Apocalypse port's rsx_vulkan_backend_set_vsync).
+- **Aspect**: the window present (and FSR's target) fits the frame in the
+  window with its shape kept and black bars; a 2560x1440 frame in a maximized
+  2560x1305 window had been squashed. PS3RECOMP_STRETCH=1 stretches.
+- **HiDPI**: on a 125% COSMIC desktop SDL2's Wayland window counted its size
+  in desktop units and the compositor stretched a 2048x1152 surface; the
+  window now asks for SDL_WINDOW_ALLOW_HIGHDPI and opens at the frame's
+  pixels (2048x1152 units = 2560x1440 px, swapchain 1:1 with the frame).
+- **The FPS counter used to read high**: it counts presents, and the double
+  present above counted many frames twice (vsync off: 68 presents/s for 44
+  game frames; Xwayland's FIFO did not block, so the X11 window had it too).
+  The game itself never ran more than one frame per vblank.
+- **Kept from the experiment**: the frame keeps its shape in the window
+  (vk_fit_rect, PS3RECOMP_STRETCH=1 stretches), the numbered frame sequence
+  (PS3RECOMP_VK_SEQ + _TRIGGER) and work/tools/capture_race.sh, and
+  PS3RECOMP_DT_LOG=2 (every frame). Removed: the display clock, the vsync
+  setting and menu entry, the native Wayland default, the HiDPI flag, the
+  present-mode switch and the double-present fix (presents are as before).
+- **Shake measurement** (work/tools/capture_race.sh + a phase-correlation
+  script): every frame of a race stretch, offscreen, 60 fps with
+  PS3RECOMP_DT_MAX=1. Camera jitter after removing the 5-frame trend: 0.24 /
+  0.43 px rms (x / y, 720p px), spread over 10-25 Hz, no peak at 30 Hz. The
+  game's own 60 fps motion did not show a shake in that stretch.
+
+## Adaptive 60/30 (2026-11-10, rolled back)
+
+Removed after play testing: after a drop to 30 the race ran at double
+speed (not investigated; most likely the 1/60 step was doubled twice, once
+by the game's own two-vblank handling and once by port_frame_dt). The player prefers a fixed rate, 60 or 30, chosen at
+boot with PS3RECOMP_FPS. The findings below still hold.
+
+
+- **The shaking, measured.** On the player's recording of a 1440p 60 fps
+  race (42-52 fps, ~30% of frames on screen for two refreshes), scenery
+  motion per frame against the frame's time on screen: a two-refresh frame
+  moved 0.69x its share, the one-refresh frame after it 1.36-1.46x. The
+  made-up step of port_frame_dt lands a frame after the long one, so below
+  60 the picture stalls and jumps several times a second, worst in heavy
+  moments (impacts, crashes: when the pad rumbles). Offscreen at a steady
+  60 with PS3RECOMP_DT_MAX=1 the game's own motion showed no shake (0.4 px
+  rms jitter, no 30 Hz component).
+- **Fix** (work/port/port_patches.cpp, fps_adapt): in 60 fps mode, when 3 of
+  the last 30 frames missed a vblank, the frame timer's interval
+  (timer+0x18, recorded from SetInterval's r3) goes back to 2; the vblank gate
+  copies it every frame, so frames are then exactly two vblanks and
+  port_frame_dt doubles the 1/60 step: an even 30. Back to 60 after the hold
+  time (2 s, doubled up to 32 s by a quick fall back, reset by 10 s at 60)
+  once all of the last 60 frames were ready within 0.75 of a vblank.
+  "Ready" is the vblank time minus the RSX's wait on the pre-flip semaphore
+  (cellGcm_acquire_wait_ns, new in cellGcmSys.c).
+- **Measured** (windowed 1440p, race with the crash, x11grab running): at 60,
+  1280 of 1294 frames one vblank; at 30, 719 of 724 two vblanks; frame length
+  changed 0.7 times a second (the switches) against ~8 before. The HUD's
+  target follows (`fps / 30 (adaptive)`). PS3RECOMP_FPS_ADAPT=0 turns it off,
+  PS3RECOMP_FPS_ADAPT_LOG=1 logs each frame's vblanks, wait and ready time.
+- bench.sh's gdb thread snapshots (GO+12.5 s) stall the game for a moment and
+  trip the switch; watch adaptive behaviour with
+  `WINDOW=1 SECS=0 DELAY=45 work/tools/capture_race.sh <dir> ...` instead.
