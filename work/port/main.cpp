@@ -50,6 +50,7 @@
 #include <string.h>
 #include <time.h>     /* clock_gettime: PS3RECOMP_FLIPLOG */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: PRESENT spans */
+#include "ps3emu/host_time.h"    /* ps3_sleep_until_mono_ns */
 #include <string>
 #ifdef _WIN32
 #include <direct.h>   /* _mkdir: the shader cache directory */
@@ -254,8 +255,7 @@ static DWORD WINAPI vblank_clock(LPVOID)
     unsigned long long next = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
     for (;;) {
         next += s_vblank_period_ns;
-        struct timespec d = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
+        ps3_sleep_until_mono_ns(next);
         clock_gettime(CLOCK_MONOTONIC, &ts);
         const unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
         if (now > next + 8 * s_vblank_period_ns) next = now;   /* suspended: resync, no burst */
@@ -323,8 +323,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             if (kick_ev && wake >= now0 + 1000000ull) {
                 WaitForSingleObject(kick_ev, 1);
             } else if (wake > now0) {
-                struct timespec d = { (time_t)(wake / 1000000000ull), (long)(wake % 1000000000ull) };
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
+                ps3_sleep_until_mono_ns(wake);
             }
         }
         unsigned long long now = mono_ns();
@@ -520,8 +519,14 @@ static int run_guest(uint32_t entry, uint32_t stack_top)
 static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
 #endif
 
+/* The command line as the game was started, for the menu's Restart now. */
+extern "C" { char** port_argv = nullptr; }
+static char* s_argv_copy[64];
+
 int main(int argc, char** argv)
 {
+    for (int i = 0; i < argc && i < 63; i++) s_argv_copy[i] = strdup(argv[i]);
+    port_argv = s_argv_copy;
 #ifdef __linux__
     /* PS3RECOMP_PTRACE_ANY=1: let any process of this user attach (gdb -p),
      * despite Yama ptrace_scope 1. For debugging only. */
@@ -537,6 +542,26 @@ int main(int argc, char** argv)
       }
       argc = n; argv[argc] = nullptr;
       if (!getenv("PS3RECOMP_VK_WINDOW")) setenv("PS3RECOMP_VK_WINDOW", "1", 1); }
+#if defined(__APPLE__)
+    /* The Metal backend's own names for what the scripts and the docs ask for
+     * with the Vulkan backend's: offscreen, and the frame dump. */
+    { const char* w = getenv("PS3RECOMP_VK_WINDOW");
+      if (w && w[0] == '0') {
+          setenv("PS3RECOMP_METAL_HEADLESS", "1", 0);
+          /* paced like a window: an offscreen present does not wait for the GPU */
+          setenv("PS3RECOMP_METAL_HEADLESS_ASYNC", "1", 0);
+      }
+      const char* fsn = getenv("PS3RECOMP_VK_FULLSCREEN");
+      if (fsn && *fsn) setenv("PS3RECOMP_METAL_FULLSCREEN", fsn, 0);
+      const char* d = getenv("PS3RECOMP_VK_DUMP");
+      if (d && *d) setenv("PS3RECOMP_METAL_FRAME_DUMP", d, 0);
+      const char* n = getenv("PS3RECOMP_VK_DUMP_EVERY");
+      if (n && *n) setenv("PS3RECOMP_METAL_FRAME_DUMP_EVERY", n, 0);
+      const char* sq = getenv("PS3RECOMP_VK_SEQ");
+      if (sq && *sq) setenv("PS3RECOMP_METAL_FRAME_SEQ", sq, 0);
+      const char* st = getenv("PS3RECOMP_VK_SEQ_TRIGGER");
+      if (st && *st) setenv("PS3RECOMP_METAL_FRAME_SEQ_TRIGGER", st, 0); }
+#endif
     if (argc < 2) {
         printf("usage: %s [--offscreen] <PPU ELF>\n", argv[0]);
         return 2;
@@ -672,6 +697,11 @@ int main(int argc, char** argv)
 #else
             mkdir(dir.c_str(), 0755); mkdir(cache.c_str(), 0755);
             setenv("PS3RECOMP_SPIRV_CACHE", cache.c_str(), 1);
+#if defined(__APPLE__)
+            /* The Metal backend's translated shaders (rsx_shader_msl.cpp)
+             * live in the same directory, as .msl files. */
+            setenv("PS3RECOMP_MSL_CACHE", cache.c_str(), 0);
+#endif
 #endif
         }
     }
@@ -724,7 +754,7 @@ int main(int argc, char** argv)
           port_settings_export(ps);
           printf("[settings] %s %s: fullscreen %d, scale %d, upscaler %s, fps %d, FPS counter %d\n",
                  had ? "read" : "defaults, no", port_settings_path(), ps->fullscreen, ps->scale,
-                 ps->upscaler ? "fsr" : "off", ps->fps, ps->fps_counter);
+                 ps->upscaler ? "on" : "off", ps->fps, ps->fps_counter);
           port_ui_init();
       } }
 

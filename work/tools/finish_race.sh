@@ -13,7 +13,8 @@ cd "$(dirname "$0")/../.."
 I="${INST:-fin}"; D=work/inst/$I; F=$D/frame.ppm; FL=$D/flip.txt
 O="${OUT:-$D/shots}"; mkdir -p "$O"
 export BIN="${BIN:-$PWD/work/port/build/PacificRiftRecomp}"
-exec 9>work/inst/.bench.lock; flock 9
+. work/tools/lib.sh
+bench_lock work/inst/.bench.lock
 shot(){ cp $F $O/s.ppm 2>/dev/null; ffmpeg -loglevel error -y -i $O/s.ppm -vf scale=480:-1 $O/$1.png 2>/dev/null; echo "  shot $1"; }
 press(){ echo "$1 ${3:-8}" > $D/pad.txt; sleep $2; }
 bar(){ cp $F $O/b.ppm 2>/dev/null; python3 -I - $O/b.ppm <<'PY'
@@ -52,7 +53,7 @@ quit_to_menus(){ # $1 tag: the results overlay hides itself into the replay (dra
 }
 mkdir -p $D; rm -f $FL
 INST=$I TIMEOUT=3600 PS3RECOMP_VK_DUMP_EVERY=5 PS3RECOMP_FLIPLOG=$PWD/$FL work/run.sh >/dev/null 2>&1 9>&- &
-sleep 3; INST=$I timeout 600 work/tools/to_race.sh 9>&- | tail -1; shot r1_start
+sleep 3; INST=$I work/tools/to_race.sh 9>&- | tail -1; shot r1_start
 race_to_results r1 || exit 1
 quit_to_menus r1
 # Game Setup: laps 3 -> 1, then opponents -> start -> vehicle (bike) -> load -> skip flyover
@@ -70,4 +71,4 @@ alive=$(pgrep -f "$BIN /" >/dev/null && echo yes || echo no); echo "alive at end
 grep -ciE "fatal|abort|segfault|assert|unhandled" $D/run.log | sed 's/^/error-like log lines: /'
 cp $D/run.log $O/run.log; cp $FL $O/flip.txt
 for p in $(pgrep -f "$BIN /"); do kill -9 $p; done
-flock -u 9; echo DONE
+bench_unlock; echo DONE

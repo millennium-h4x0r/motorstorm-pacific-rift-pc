@@ -18,8 +18,9 @@ typedef struct port_settings {
     int fullscreen;     /* 0 window, 1 full screen (PS3RECOMP_VK_FULLSCREEN) */
     int scale;          /* render scale: 1 (720p), 2 (1440p), 3 (4K) (PS3RECOMP_RES_SCALE);
                          * read at start only */
-    int upscaler;       /* 0 off, 1 AMD FSR 1 to the window's size (PS3RECOMP_FSR) */
-    float fsr_sharpness;/* FSR's RCAS sharpening, 0..1, 1 sharpest (PS3RECOMP_FSR_SHARPNESS) */
+    int upscaler;       /* 0 off, 1 upscale to the window's size (PS3RECOMP_FSR): AMD FSR 1 on the
+                         * Vulkan backend, MetalFX on the Metal one */
+    float fsr_sharpness;/* the upscaler's sharpening, 0..1, 1 sharpest (PS3RECOMP_FSR_SHARPNESS) */
     int fps;            /* 30 (the game's own) or 60 (PS3RECOMP_FPS, port_patches.cpp); read at start only */
     /* [performance] */
     int fps_counter;    /* the HUD drawn by the UI (F10 cycles): 0 off, 1 detailed (default), 2 compact */

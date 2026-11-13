@@ -9,6 +9,8 @@
 # Prints fps, pack fps, frame-interval p50/p90 and CPU ms per frame for main,
 # the FIFO/RSX thread, the three busiest SPURS job workers and the MultiStream
 # SPU thread, then the mean over the rounds. Extra VAR=val args go to the game.
+# The per-thread CPU figures need Linux (/proc and gdb); elsewhere (macOS) the
+# line has the frame figures only.
 # Kills the instance with SIGKILL after each round (the game ignores SIGINT).
 # FTRACE=<prefix>: also record a PS3_FTRACE timeline of the window into
 # <prefix>_r<round>.txt (ps3recomp/tools/ftrace_report.py).
@@ -26,16 +28,9 @@ D="$ROOT/work/inst/$I"; F="$D/frame.ppm"; FL="$D/flip.txt"; OUT="$D/bench.txt"
 mkdir -p "$D"; : > "$OUT"
 cd "$ROOT"
 
-kill_inst() {
-    for p in $(pgrep -x PacificRiftReco); do
-        tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qx "PAD_FILE=$D/pad.txt" && kill -KILL $p
-    done
-}
-inst_pid() {
-    for p in $(pgrep -x PacificRiftReco); do
-        tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qx "PAD_FILE=$D/pad.txt" && echo $p
-    done | tail -1
-}
+. "$ROOT/work/tools/lib.sh"
+kill_inst() { kill_inst_dir "$D"; }
+inst_pid() { inst_pids "$D" | tail -1; }
 # timer_sig: a signature of the race timer box (top right); it changes once the race clock runs
 timer_sig() {
     python3 -I - "$F" <<'EOF2'
@@ -64,6 +59,7 @@ EOF
 # MultiStream (the MultiStream SPU image 0e193327 / ms_dsp plugins)
 classify() {
     local pid=$1
+    [ -d "/proc/$pid/task" ] && command -v gdb >/dev/null || return 0   # Linux only
     for k in 1 2 3 4; do
         timeout 20 gdb -p "$pid" -batch -nx -ex 'set pagination off' -ex 'thread apply all bt 30' 2>/dev/null
         sleep 0.2
@@ -78,18 +74,17 @@ classify() {
 # work/inst/.bench.lock from boot to kill (concurrent instances skew results).
 LOCK="$ROOT/work/inst/.bench.lock"
 for r in $(seq 1 "$N"); do
-    exec 9>"$LOCK"
-    if ! flock -n 9; then echo "bench: waiting for $LOCK (another bench round is running)" >&2; flock 9; fi
+    bench_lock "$LOCK"
     ok=0
     for try in 1 2 3; do                      # to_race.sh can miss a menu step: boot again
         kill_inst; wait 2>/dev/null; rm -f "$FL"; : > "$D/run.log"
         FT=(); [ -n "${FTRACE:-}" ] && { rm -f "${FTRACE}_r$r.txt"; FT=(PS3_FTRACE="-1:10:${FTRACE}_r$r.txt"); }
         env "$@" "${FT[@]}" INST="$I" TIMEOUT=900 PS3RECOMP_VK_DUMP_EVERY=10 PS3RECOMP_FLIPLOG="$FL" work/run.sh >/dev/null 2>&1 9>&- &
         sleep 3
-        if INST="$I" timeout 600 work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
+        if INST="$I" work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
         echo "round $r try $try: $(tail -1 "$D/to_race.txt")" >&2
     done
-    [ $ok = 1 ] || { echo "round $r: to_race failed 3 times" | tee -a "$OUT"; kill_inst; wait; flock -u 9; continue; }
+    [ $ok = 1 ] || { echo "round $r: to_race failed 3 times" | tee -a "$OUT"; kill_inst; wait; bench_unlock; continue; }
     pid=$(inst_pid)
     # GO: the race timer lights up (countdown is ~4 s after the flyover skip)
     # the timer box shows 00:00.00 during the countdown: GO is when its digits start changing
@@ -98,9 +93,9 @@ for r in $(seq 1 "$N"); do
         go=0; s0=$(timer_sig)
         for k in $(seq 1 80); do sleep 0.2; s1=$(timer_sig); [ "$s1" != "$s0" ] && { go=1; break; }; done
     fi
-    [ $go = 1 ] || { echo "round $r: GO not seen" | tee -a "$OUT"; kill_inst; wait; flock -u 9; continue; }
+    [ $go = 1 ] || { echo "round $r: GO not seen" | tee -a "$OUT"; kill_inst; wait; bench_unlock; continue; }
     echo "0x0200 100000" > "$D/pad.txt"          # hold R2 from GO: stay with the pack
-    t_go=$(date +%s.%N)
+    t_go=$(now_s)
     # Thread roles come from gdb backtraces, which stop the game for a second or two: take
     # them after the measurement windows (GO+12.5 s), not in the lead-in the pack window uses.
     rm -f "$D/cls.txt"; ( sleep 12.5; classify "$pid" > "$D/cls.tmp"; mv "$D/cls.tmp" "$D/cls.txt" ) &
@@ -110,8 +105,10 @@ pid, fl, t_go, rnd, clsf = int(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sy
 mono_us = lambda: time.clock_gettime(time.CLOCK_MONOTONIC) * 1e6   # the clock PS3RECOMP_FLIPLOG uses
 go_mono = mono_us() - (time.time() - t_go) * 1e6
 hz = os.sysconf('SC_CLK_TCK')
+have_proc = os.path.isdir('/proc/%d/task' % pid)
 def cpu():
     d = {}
+    if not have_proc: return d
     for t in os.listdir('/proc/%d/task' % pid):
         try:
             f = open('/proc/%d/task/%s/stat' % (pid, t)).read().rsplit(')', 1)[1].split()
@@ -137,7 +134,7 @@ p = lambda q: iv[min(n - 1, int(q * n))] if n else 0.0
 # camera vary per round and swing the full window by about +-5 fps). Steadier for A/Bs.
 pw = [t for t in ts if go_mono + 0.5e6 <= t <= go_mono + 3.5e6]
 pack = (len(pw) - 1) / 3.0 if len(pw) > 1 else 0.0
-for k in range(300):                              # thread roles (taken after the window)
+for k in range(300 if have_proc else 0):          # thread roles (taken after the window)
     if os.path.exists(clsf): break
     time.sleep(0.1)
 roles = {}
@@ -156,7 +153,10 @@ parts.append('jobs ' + '/'.join('%.1f' % ms(t) for t in jobs))
 rec = [t for t, r in roles.items() if r == 'rec']
 if rec: parts.append('rec %.1f' % ms(rec[0]))
 parts.append('ms %.1f' % (ms(msth[0]) if msth else -1))
-print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | pack %.1f fps | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), pack, ', '.join(parts)))
+if have_proc:
+    print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | pack %.1f fps | cpu ms/frame: %s' % (rnd, fps, p(.5), p(.9), pack, ', '.join(parts)))
+else:
+    print('round %s: %.1f fps  p50 %.1f p90 %.1f ms | pack %.1f fps' % (rnd, fps, p(.5), p(.9), pack))
 EOF
     ffmpeg -loglevel error -y -i "$F" -vf scale=640:-1 "$D/bench_r$r.png"
     if [ -n "${FTRACE:-}" ]; then                     # the game writes the trace once the window closes
@@ -164,7 +164,7 @@ EOF
         sleep 1
     fi
     kill_inst; wait
-    flock -u 9
+    bench_unlock
 done
 python3 -I - "$OUT" <<'EOF'
 import re, sys
@@ -175,6 +175,7 @@ keys = [('fps', r'([\d.]+) fps'), ('pack', r'pack ([\d.]+) fps'), ('p50', r'p50 
         ('main', r'main ([\d.]+)'), ('fifo', r'fifo (-?[\d.]+)'), ('ms', r'ms (-?[\d.]+)$')]
 out = []
 for k, pat in keys:
+    if not all(re.search(pat, l.strip()) for l in rows): continue   # no per-thread CPU off Linux
     v = [num(pat, l.strip()) for l in rows]
     out.append('%s %.1f' % (k, sum(v) / len(v)))
 print('bench mean over %d round(s): %s' % (len(rows), ', '.join(out)))

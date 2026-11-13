@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Configure and build the port into work/port/build.
-#   JOBS=<n>  PORT_BUILD_MEM=<size>  (defaults 14 jobs, 80G memory scope)
-#   PORT_VULKAN=ON|OFF  (default ON)
+#   JOBS=<n>  PORT_BUILD_MEM=<size>  (defaults 14 jobs, 80G memory scope; macOS: one
+#   job per performance core)
+#   PORT_VULKAN=ON|OFF  (default ON on Linux; macOS builds the Metal backend)
 #   BUILD_DIR=<dir>  SPU_DIR=<dir>  (defaults work/port/build, work/port/spu)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,6 +10,11 @@ DIR="${PS3RECOMP_DIR:-$ROOT/ps3recomp}"
 PORT="$ROOT/work/port"
 BUILD="${BUILD_DIR:-$PORT/build}"
 SPU_DIR="${SPU_DIR:-$PORT/spu}"
+if [ "$(uname -s)" = Darwin ]; then
+    # macOS: the toolkit's Metal backend (the Vulkan one is Linux-only).
+    PORT_VULKAN=OFF
+    JOBS="${JOBS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu)}"
+fi
 JOBS="${JOBS:-14}"
 # Compiler: clang-20 when installed (+2 full / +4 pack fps over clang-18 on the
 # same tree in an interleaved bench), else clang. Override with CC=/CXX=.

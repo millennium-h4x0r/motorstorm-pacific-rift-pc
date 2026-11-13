@@ -17,11 +17,8 @@ I="${INST:-cap}"; SECS="${SECS:-6}"; DELAY="${DELAY:-2}"
 D="$ROOT/work/inst/$I"; F="$D/frame.ppm"; TRIG="$D/seq.on"
 mkdir -p "$D" "$OUTD"; rm -f "$TRIG" "$OUTD"/f*.ppm
 cd "$ROOT"
-kill_inst() {
-    for p in $(pgrep -x PacificRiftReco); do
-        tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -qx "PAD_FILE=$D/pad.txt" && kill -KILL $p
-    done
-}
+. "$ROOT/work/tools/lib.sh"
+kill_inst() { kill_inst_dir "$D"; }
 timer_sig() {
     python3 -I - "$F" <<'EOF'
 import sys, subprocess, hashlib
@@ -44,8 +41,7 @@ for y in range(12, 50):
 print(n)
 EOF
 }
-exec 9>"$ROOT/work/inst/.bench.lock"
-flock -n 9 || { echo "capture: waiting for the bench lock" >&2; flock 9; }
+bench_lock "$ROOT/work/inst/.bench.lock"
 ok=0
 for try in 1 2 3; do
     kill_inst; : > "$D/run.log"
@@ -53,7 +49,7 @@ for try in 1 2 3; do
         PS3RECOMP_VK_SEQ="$OUTD/f%06u.ppm" PS3RECOMP_VK_SEQ_TRIGGER="$TRIG" \
         work/run.sh $([ "${WINDOW:-0}" = 1 ] && echo --window || echo --offscreen) >/dev/null 2>&1 9>&- &
     sleep 3
-    if INST="$I" timeout 600 work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
+    if INST="$I" work/tools/to_race.sh > "$D/to_race.txt" 2>&1; then ok=1; break; fi
     echo "capture try $try: $(tail -1 "$D/to_race.txt")" >&2
 done
 [ $ok = 1 ] || { echo "capture: to_race failed" >&2; kill_inst; exit 1; }

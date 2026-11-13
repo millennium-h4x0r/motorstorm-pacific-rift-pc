@@ -48,13 +48,26 @@ fi
 BIN="${BIN:-$ROOT/work/port/build/PacificRiftRecomp}"
 mkdir -p "$ROOT/hdd0" "$ROOT/gamedata"
 export PS3_TITLE="${PS3_TITLE:-MotorStorm: Pacific Rift}"
+# dev_flash: ./dev_flash when it is there, else RPCS3's copy (Linux, macOS).
+if [ -z "${PS3_DEV_FLASH:-}" ]; then
+    for d in "$ROOT/dev_flash" "$HOME/.config/rpcs3/dev_flash" "$HOME/Library/Application Support/rpcs3/dev_flash"; do
+        [ -d "$d" ] && { PS3_DEV_FLASH="$d"; break; }
+    done
+fi
 export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$HOME/.config/rpcs3/dev_flash}"
 export PS3_HDD0_ROOT="${PS3_HDD0_ROOT:-$ROOT/hdd0}"
 export PS3_STDIO_UNBUFFERED=1
 export PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}"
 cd "$ROOT"
 if [ -n "${TIMEOUT:-}" ]; then
-    timeout -s INT -k 5 "$TIMEOUT" "$BIN" "$ROOT/disc/PS3_GAME/USRDIR/EBOOT.elf" 2>&1 | tee "$log"
+    # timeout(1) is coreutils: gtimeout from Homebrew on macOS, else a watchdog.
+    TO=$(command -v timeout || command -v gtimeout || true)
+    if [ -n "$TO" ]; then
+        "$TO" -s INT -k 5 "$TIMEOUT" "$BIN" "$ROOT/disc/PS3_GAME/USRDIR/EBOOT.elf" 2>&1 | tee "$log"
+    else
+        ( "$BIN" "$ROOT/disc/PS3_GAME/USRDIR/EBOOT.elf" 2>&1 & pid=$!
+          ( sleep "$TIMEOUT"; kill -KILL "$pid" 2>/dev/null ) & wait "$pid" ) | tee "$log"
+    fi
 else
     "$BIN" "$ROOT/disc/PS3_GAME/USRDIR/EBOOT.elf" 2>&1 | tee "$log"
 fi

@@ -15,6 +15,10 @@
   (`libs/video/vulkan/fsr1/`, with AMD's license).
 - **[Dear ImGui](https://github.com/ocornut/imgui)** (MIT), v1.91.5, cloned by
   `scripts/setup.sh`: the in-game menu and performance HUD.
-- **[SDL2](https://www.libsdl.org)** (zlib): window, pad and audio.
+- **[SDL2](https://www.libsdl.org)** (zlib): window (Linux), pad and audio.
 - **[glslang](https://github.com/KhronosGroup/glslang)** and the
   **Vulkan** headers and loader (Khronos): shader translation and rendering.
+- **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)** (Apache-2.0):
+  on macOS, the game's shaders from SPIR-V to the Metal Shading Language.
+- **Metal** and **MetalFX** (Apple): rendering and upscaling on macOS. The
+  Metal backend is ps3recomp's, extended by this port's patch.

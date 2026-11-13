@@ -38,13 +38,16 @@ cat "$SRC"/USRDIR/ms2.psarc.666* > disc/PS3_GAME/USRDIR/ms2.psarc   # 4,811,608,
 
 The game opens files under `/dev_flash` (system fonts, the firmware MP3
 decoder that MultiStream loads). The port serves them from a real `dev_flash`
-tree: `$PS3_DEV_FLASH`, which `work/run.sh` sets to RPCS3's copy,
-`~/.config/rpcs3/dev_flash`, unless you set it yourself. Install the official
-PS3 firmware (`PS3UPDAT.PUP` from Sony) in RPCS3 (*File → Install Firmware*)
-to get it. `work/tools/lift_ms_dsp.py` also lifts `sys/external/flashMP3.pic`
+tree: `$PS3_DEV_FLASH`. Unless you set it yourself, `work/run.sh` takes
+`./dev_flash` (git-ignored) when that directory exists, else RPCS3's copy:
+`~/.config/rpcs3/dev_flash` on Linux, `~/Library/Application
+Support/rpcs3/dev_flash` on macOS. Install the official PS3 firmware
+(`PS3UPDAT.PUP` from Sony) in RPCS3 (*File → Install Firmware*) to get it; a
+`dev_flash` made on another machine can simply be copied to `./dev_flash`. `work/tools/lift_ms_dsp.py` also lifts `sys/external/flashMP3.pic`
 from it during `scripts/lift.sh`; without it that decoder runs interpreted.
 
 ## Where the port writes
 
 All git-ignored, at the repository root: `hdd0/` (saves), `user/`
-(`settings.ini`, `shader_cache/`), `gamedata/`, `work/runs/` (logs).
+(`settings.ini`, `shader_cache/`), `gamedata/`, `work/runs/` (logs), and
+`dev_flash/` if you keep the firmware files there.

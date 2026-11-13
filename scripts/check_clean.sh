@@ -27,7 +27,7 @@ for f in $files; do
     esac
     # Size: nothing here should be large; lifted code and dumps are. The
     # toolkit patch is the one big text file.
-    size=$(stat -c %s "$f")
+    size=$(wc -c < "$f" | tr -d ' ')
     limit=1048576
     case "$f" in work/patches/*.patch) limit=8388608 ;; esac
     # The README's screenshots: small JPEGs in one place, the only binaries

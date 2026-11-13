@@ -14,7 +14,8 @@ EXPECT=bbb7fe2545e54847483439f59cda54e907db23a111d7afe9a1b655624886b287
 
 [ -f "$ELF" ] || { echo "no decrypted executable at $ELF (see docs/REQUIRED_FILES.md)" >&2; exit 1; }
 [ -d "$DIR/tools" ] || { echo "no toolkit at $DIR -- run scripts/setup.sh" >&2; exit 1; }
-got=$(sha256sum "$ELF" | cut -c1-64)
+if command -v sha256sum >/dev/null; then got=$(sha256sum "$ELF" | cut -c1-64)
+else got=$(shasum -a 256 "$ELF" | cut -c1-64); fi
 if [ "$got" != "$EXPECT" ]; then
     echo "warning: $ELF is not the BCES-00129 01.00 executable this port was made for" >&2
     echo "         (sha256 $got); the lift may build but the port will not run it" >&2

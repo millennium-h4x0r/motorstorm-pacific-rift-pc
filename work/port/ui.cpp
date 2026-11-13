@@ -9,7 +9,8 @@
  * While the menu is open the game gets a neutral pad (cellPad.c). Every change
  * is written to user/settings.ini at once (settings.h) and applies now.
  * The resolution scale and frame rate (Video page) are read at start, so they
- * take effect after a restart (the page has a Restart now button); the FSR 1 upscaler and its sharpness apply at once.
+ * take effect after a restart (the page has a Restart now button); the upscaler
+ * (FSR 1 on Vulkan, MetalFX on Metal) and its sharpness apply at once.
  * The Apocalypse start screen, languages, VSync, FPS limit and mods pages are
  * not here: this port's backend has none of those knobs. */
 #include "settings.h"
@@ -34,10 +35,32 @@
 extern char** environ;
 #endif
 
+#include <sys/resource.h>   /* getrusage: the HUD's CPU figure */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>    /* _NSGetExecutablePath: Restart now */
+#endif
+
 extern "C" unsigned ppu_boot_frames_presented(void);       /* main.cpp */
+extern "C" char** port_argv;                               /* main.cpp: as the game was started */
+/* The backend's side: draws in the last frame, the upscaler's switch and what
+ * it is doing. FSR 1 on the Vulkan backend, MetalFX on the Metal one. */
+#ifdef __APPLE__
+extern "C" unsigned rsx_metal_backend_guest_draws(void);
+extern "C" void rsx_metal_backend_set_upscaler(int on, float sharpness);
+extern "C" int  rsx_metal_backend_upscaler_state(unsigned* in_w, unsigned* in_h, unsigned* out_w, unsigned* out_h);
+#define rsx_backend_guest_draws    rsx_metal_backend_guest_draws
+#define rsx_backend_set_upscaler   rsx_metal_backend_set_upscaler
+#define rsx_backend_upscaler_state rsx_metal_backend_upscaler_state
+#define PORT_UPSCALER_NAME "MetalFX"
+#else
 extern "C" unsigned rsx_vulkan_backend_guest_draws(void);  /* draws in the last frame */
 extern "C" void rsx_vulkan_backend_set_fsr(int on, float sharpness);
 extern "C" int  rsx_vulkan_backend_fsr_state(unsigned* in_w, unsigned* in_h, unsigned* out_w, unsigned* out_h);
+#define rsx_backend_guest_draws    rsx_vulkan_backend_guest_draws
+#define rsx_backend_set_upscaler   rsx_vulkan_backend_set_fsr
+#define rsx_backend_upscaler_state rsx_vulkan_backend_fsr_state
+#define PORT_UPSCALER_NAME "FSR 1"
+#endif
 
 namespace {
 
@@ -117,11 +140,7 @@ void restart_now(const port_settings& s)
 {
     save();
     std::vector<std::string> args;
-    { FILE* f = fopen("/proc/self/cmdline", "rb");
-      if (!f) return;
-      std::string a; int c;
-      while ((c = fgetc(f)) != EOF) { if (c) a += (char)c; else { args.push_back(a); a.clear(); } }
-      fclose(f); }
+    for (char** a = port_argv; a && *a; a++) args.push_back(*a);
     if (args.empty()) return;
     std::vector<std::string> env;
     for (char** e = environ; *e; e++)
@@ -133,9 +152,14 @@ void restart_now(const port_settings& s)
     for (auto& e : env) ev.push_back(&e[0]);
     av.push_back(nullptr); ev.push_back(nullptr);
     char self[4096];
+#ifdef __APPLE__
+    { uint32_t sz = sizeof self;
+      if (_NSGetExecutablePath(self, &sz) != 0) return; }
+#else
     const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
     if (n <= 0) return;
     self[n] = 0;
+#endif
     fprintf(stderr, "[ui] restarting: resolution %dx, %d fps\n", s.scale, s.fps);
     fflush(stderr); fflush(stdout);
     execve(self, av.data(), ev.data());
@@ -156,7 +180,11 @@ void page_video(port_settings& s)
 {
     /* The window as it is: F11 changes it without the menu. */
     bool b = rsx_ui_fullscreen();
+#ifdef __APPLE__
+    if (ImGui::Checkbox("Fullscreen  (F11, Option+Return)", &b)) {
+#else
     if (ImGui::Checkbox("Fullscreen  (F11, Alt+Enter)", &b)) {
+#endif
         s.fullscreen = b; rsx_ui_set_fullscreen(b); save();
     }
     /* Render scale: every render target N times the game's 1280x720. */
@@ -169,29 +197,36 @@ void page_video(port_settings& s)
     if (s.fps != g_boot_fps)
         hint("Takes effect after a restart.");
     if (s.scale != g_boot_scale || s.fps != g_boot_fps) restart_button(s);
-    /* AMD FSR 1: upscales the presented frame to the window, applies now. */
+    /* The upscaler (AMD FSR 1 on Vulkan, MetalFX on Metal): takes the
+     * presented frame to the window's size, applies now. */
+#ifdef __APPLE__
+    const char* const up_label = "MetalFX upscaling";
+#else
+    const char* const up_label = "AMD FSR 1 upscaling";
+#endif
     bool fsr = s.upscaler != 0;
-    if (ImGui::Checkbox("AMD FSR 1 upscaling", &fsr)) {
+    if (ImGui::Checkbox(up_label, &fsr)) {
         s.upscaler = fsr ? 1 : 0;
-        rsx_vulkan_backend_set_fsr(s.upscaler, s.fsr_sharpness);
+        rsx_backend_set_upscaler(s.upscaler, s.fsr_sharpness);
         save();
     }
     if (s.upscaler) {
         float sh = s.fsr_sharpness;
-        if (ImGui::SliderFloat("FSR sharpness", &sh, 0.0f, 1.0f, "%.2f")) {
+        if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f")) {
             s.fsr_sharpness = sh;
-            rsx_vulkan_backend_set_fsr(1, sh);
+            rsx_backend_set_upscaler(1, sh);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) save();
     }
     ImGui::Separator();
     const ImGuiIO& io = ImGui::GetIO();
     unsigned iw = 0, ih = 0, ow = 0, oh = 0;
-    const int on = rsx_vulkan_backend_fsr_state(&iw, &ih, &ow, &oh);
-    ImGui::Text("Window: %.0f x %.0f", io.DisplaySize.x, io.DisplaySize.y);
+    const int on = rsx_backend_upscaler_state(&iw, &ih, &ow, &oh);
+    ImGui::Text("Window: %.0f x %.0f", io.DisplaySize.x * io.DisplayFramebufferScale.x,
+                io.DisplaySize.y * io.DisplayFramebufferScale.y);
     ImGui::Text("Game frame: %u x %u (%dx)", iw, ih, g_boot_scale);
-    if (on) ImGui::Text("FSR 1: %u x %u -> %u x %u", iw, ih, ow, oh);
-    else if (s.upscaler) hint("FSR 1 is idle: the window is not larger than the game frame.");
+    if (on) ImGui::Text(PORT_UPSCALER_NAME ": %u x %u -> %u x %u", iw, ih, ow, oh);
+    else if (s.upscaler) hint(PORT_UPSCALER_NAME " is idle: the window is not larger than the game frame.");
     else ImGui::TextUnformatted("Fitted to the window, shape kept");
 }
 
@@ -203,11 +238,17 @@ void page_performance(port_settings& s)
     ImGui::Separator();
     ImGui::Text("Frame rate: %.1f fps", g_fps);
     ImGui::Text("Frames presented: %u", ppu_boot_frames_presented());
-    ImGui::Text("Draws in the last frame: %u", rsx_vulkan_backend_guest_draws());
+    ImGui::Text("Draws in the last frame: %u", rsx_backend_guest_draws());
 }
+
+extern "C" volatile int g_pad_sdl_ready;   /* cellPad.c: SDL's controller subsystem is up */
 
 void page_controller()
 {
+    if (!g_pad_sdl_ready) {     /* SDL's joystick calls are not safe before the game's cellPadInit */
+        ImGui::TextUnformatted("Controller: the game has not started its pads yet");
+        return;
+    }
     SDL_GameController* gc = nullptr;
     /* Under SDL's joystick lock: cellPad polls the same pads from the game's
      * threads (see rsx_ui_frame). */
@@ -237,7 +278,11 @@ void page_keys()
 {
     ImGui::TextUnformatted("F1          this menu (or Select+Start held)");
     ImGui::TextUnformatted("F10         the performance HUD: detailed, compact, off");
+#ifdef __APPLE__
+    ImGui::TextUnformatted("F11         full screen (or Option+Return)");
+#else
     ImGui::TextUnformatted("F11         full screen (or Alt+Enter)");
+#endif
     ImGui::TextUnformatted("Escape      close this menu; with it closed, quit the game");
 }
 
@@ -249,8 +294,12 @@ void draw_menu()
     const float fs = ImGui::GetFontSize();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
+    /* Tall enough for the Video page's rows: the text scales with the window,
+     * the padding around each row does not. */
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float want_h = fs * 14.0f + 10.0f * (st.FramePadding.y * 2.0f + st.ItemSpacing.y) + st.WindowPadding.y * 2.0f;
     ImGui::SetNextWindowSize(ImVec2(fs * 34.0f < io.DisplaySize.x * 0.92f ? fs * 34.0f : io.DisplaySize.x * 0.92f,
-                                    fs * 22.0f < io.DisplaySize.y * 0.9f ? fs * 22.0f : io.DisplaySize.y * 0.9f),
+                                    want_h < io.DisplaySize.y * 0.92f ? want_h : io.DisplaySize.y * 0.92f),
                              ImGuiCond_Always);
     ImGui::Begin("MotorStorm: Pacific Rift  ·  Options", nullptr,
                  ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -303,20 +352,12 @@ void hud_sample(double dt)
     static double acc = 0.0, last_cpu = -1.0;
     acc += dt;
     if (acc >= 0.5) {
-        FILE* fp = fopen("/proc/self/stat", "r");
-        if (fp) {
-            char buf[1024];
-            const size_t n = fread(buf, 1, sizeof buf - 1, fp);
-            fclose(fp);
-            buf[n] = 0;
-            const char* q = strrchr(buf, ')');
-            unsigned long ut = 0, st = 0;
-            /* fields after the name: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
-            if (q && sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2) {
-                const double t = (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
-                if (last_cpu >= 0.0) g_cpu = (t - last_cpu) / acc * 100.0;
-                last_cpu = t;
-            }
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            const double t = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 +
+                             (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+            if (last_cpu >= 0.0) g_cpu = (t - last_cpu) / acc * 100.0;
+            last_cpu = t;
         }
         acc = 0.0;
     }
@@ -409,13 +450,13 @@ void draw_fps_detailed()
 
     /* what is being rendered */
     unsigned iw = 0, ih = 0, ow = 0, oh = 0;
-    const int fsr = rsx_vulkan_backend_fsr_state(&iw, &ih, &ow, &oh);
+    const int fsr = rsx_backend_upscaler_state(&iw, &ih, &ow, &oh);
     if (iw && ih) {
-        if (fsr) ImGui::TextDisabled("%ux%u  FSR 1 -> %ux%u", iw, ih, ow, oh);
+        if (fsr) ImGui::TextDisabled("%ux%u  " PORT_UPSCALER_NAME " -> %ux%u", iw, ih, ow, oh);
         else     ImGui::TextDisabled("%ux%u  (%dx)", iw, ih, g_boot_scale);
     }
-    if (g_cpu >= 0.0) ImGui::TextDisabled("%u draws   CPU %.0f%%", rsx_vulkan_backend_guest_draws(), g_cpu);
-    else              ImGui::TextDisabled("%u draws", rsx_vulkan_backend_guest_draws());
+    if (g_cpu >= 0.0) ImGui::TextDisabled("%u draws   CPU %.0f%%", rsx_backend_guest_draws(), g_cpu);
+    else              ImGui::TextDisabled("%u draws", rsx_backend_guest_draws());
 
     ImGui::End();
     ImGui::PopStyleVar(3);

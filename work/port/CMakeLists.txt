@@ -221,7 +221,11 @@ if(SPU_SOURCES)
         elseif(PORT_HAS_MSSE41)
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1")
         else()
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+            # arm64 (Apple Silicon): NEON is the baseline and spu_helpers.h has
+            # its NEON forms; FMA is always there, so the same no-contraction
+            # rule as above keeps the exact scalar fallbacks exact.
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS
+                "${PORT_SPU_OPT};-ffp-contract=off")
         endif()
     endif()
 endif()
@@ -231,9 +235,22 @@ endif()
 # checkout, -DPS3RECOMP_UI not OFF). The define and the include directory go on
 # ui.cpp alone: on the whole target they would rebuild every lifted TU.
 if(PS3RECOMP_UI_ACTIVE)
+    # ui.cpp reads the pad through SDL for its Controller page; Homebrew's
+    # headers are not on the compiler's default path.
+    set(PORT_UI_INCLUDES "${PS3RECOMP_IMGUI_DIR}")
+    find_package(SDL2 QUIET)
+    if(TARGET SDL2::SDL2)
+        get_target_property(PORT_SDL2_INC SDL2::SDL2 INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(d IN LISTS PORT_SDL2_INC)
+            if(d)
+                get_filename_component(dp "${d}" DIRECTORY)
+                list(APPEND PORT_UI_INCLUDES "${d}" "${dp}")
+            endif()
+        endforeach()
+    endif()
     set_source_files_properties(ui.cpp PROPERTIES
         COMPILE_DEFINITIONS PS3RECOMP_UI
-        INCLUDE_DIRECTORIES "${PS3RECOMP_IMGUI_DIR}")
+        INCLUDE_DIRECTORIES "${PORT_UI_INCLUDES}")
     message(STATUS "In-game menu:    on (F1, F10)")
 else()
     message(STATUS "In-game menu:    off")
@@ -261,6 +278,23 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ps3recomp_runtime
 )
+
+# macOS coalesces timers: the port's own sources and the scaffold sleep through
+# the runtime's precise sleeps, as the runtime library does (ps3emu/host_time.h).
+# Set per source: on the whole target it would rebuild every lifted TU.
+if(APPLE)
+    set_source_files_properties(main.cpp settings.cpp ui.cpp stubs.cpp port_patches.cpp
+        ${PS3RECOMP_SCAFFOLD} PROPERTIES
+        COMPILE_OPTIONS "-include;${PS3RECOMP_DIR}/include/ps3emu/host_time.h")
+endif()
+
+# spu_fastpaths.c names the lifted body of a wrapped function as a weak
+# reference, which is null in a lift made without --wrap-func. ELF leaves such
+# a reference undefined at link time; Mach-O needs to be told it may be.
+if(APPLE AND SPU_SOURCES)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "LINKER:-U,_jobmod_e8d076563401_e0F90_spu_func_00004310_lifted")
+endif()
 
 # The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
 # link language from the generated C would leave the C++ standard library out.

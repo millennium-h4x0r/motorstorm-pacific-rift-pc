@@ -1,23 +1,26 @@
-<h1 align="center">MotorStorm: Pacific Rift — native PC port (Linux, Vulkan)</h1>
+<h1 align="center">MotorStorm: Pacific Rift — native PC port (Linux: Vulkan · macOS: Metal)</h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-playable-brightgreen" alt="Status: playable">
   <img src="https://img.shields.io/badge/platform-Linux%20x86--64-1793D1?logo=linux&logoColor=white" alt="Linux x86-64">
+  <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white" alt="macOS on Apple Silicon">
   <img src="https://img.shields.io/badge/GPU-Vulkan-AC162C?logo=vulkan&logoColor=white" alt="Vulkan">
+  <img src="https://img.shields.io/badge/GPU-Metal-8A8A8A?logo=apple&logoColor=white" alt="Metal">
   <img src="https://img.shields.io/badge/PS3-BCES00129-003791?logo=playstation&logoColor=white" alt="PS3 BCES00129">
   <img src="https://img.shields.io/badge/code-MIT-blue" alt="Code MIT">
 </p>
 
-<p align="center"><b>motorstorm-pacific-rift-pc</b> · native on Linux · PS3 static recompilation · Vulkan · up to 4K · optional 60 fps</p>
+<p align="center"><b>motorstorm-pacific-rift-pc</b> · native on Linux and macOS · PS3 static recompilation · Vulkan / Metal · up to 4K · optional 60 fps</p>
 
 <p align="center"><img src="docs/screenshots/cascade-falls-start.jpg" width="900" alt="GO at Cascade Falls: the player's monster truck behind a pack of bikes, ATVs and buggies on a jungle track, race HUD on"></p>
 
 **MotorStorm: Pacific Rift** (PS3, BCES-00129, version 01.00) running natively
-on Linux, without an emulator. The game's code, PowerPC (PPU) and SPU, is
-translated to C ahead of time by static recompilation with
-[ps3recomp](https://github.com/sp00nznet/ps3recomp) and compiled into a
-normal x86-64 program. The PS3 system is reimplemented by the toolkit's
-runtime, and the GPU (RSX) runs the game's own shaders translated to Vulkan.
+on Linux (x86-64) and on macOS (Apple Silicon), without an emulator. The
+game's code, PowerPC (PPU) and SPU, is translated to C ahead of time by static
+recompilation with [ps3recomp](https://github.com/sp00nznet/ps3recomp) and
+compiled into a normal x86-64 or arm64 program. The PS3 system is
+reimplemented by the toolkit's runtime, and the GPU (RSX) runs the game's own
+shaders translated to Vulkan on Linux and to Metal on macOS.
 
 <p align="center">
   <img src="docs/screenshots/rain-god-spires-crash.jpg" width="445" alt="A buggy flipping end over end in a crash at Rain God Spires, debris flying">
@@ -46,17 +49,26 @@ runtime, and the GPU (RSX) runs the game's own shaders translated to Vulkan.
 | Audio (MultiStream, 7.1 folded to the output device) | ✅ |
 | Game speed: 30 fps, as the game ships | ✅ correct speed, holds 30 fps |
 | 60 fps mode (opt-in, game timestep patched, correct speed) | ✅ holds 60 fps in races at 1440p; dips in the slow-motion crash replay |
-| Render scale (720p / 1440p / 4K) and AMD FSR 1 upscaling | ✅ |
+| Render scale (720p / 1440p / 4K) and upscaling (AMD FSR 1 on Vulkan, MetalFX on Metal) | ✅ |
 | In-game menu (F1), performance HUD (F10), settings file | ✅ |
 | Pad (SDL2 game controller) | ✅ |
 | Saves, other modes and tracks | 🔧 not checked end to end |
 | Online play | ❌ not planned (the servers are gone) |
-| Windows / macOS | ❌ this port builds the toolkit's Linux-only Vulkan backend |
+| macOS (Apple Silicon, Metal) | ✅ everything above; 30 fps holds, 60 fps mode does not reach 60 on an M1 Max (see below) |
+| Windows | ❌ not built or tested |
 
 Measured on a Ryzen 9 5950X with an RTX 3090 on Linux. **Known issue:** in 60
 fps mode the frame rate dips in the crash camera's slow-motion replay, where
 the game's SPU physics jobs fill every job lane (see
 [docs/NOTES.md](docs/NOTES.md), *Performance*).
+
+On macOS the port was brought up on an M1 Max (macOS 27). 30 fps mode holds
+30 in races at 720p (frame interval p50 33.3 ms, p90 36 ms). 60 fps mode ran
+at about 40 fps in the pack (p50 21.5 ms); that figure is from before the last
+round of arm64 work (NEON forms of the SPU conversion instructions, interactive
+thread QoS) and from a machine busy with other work, so it is a lower bound,
+not a careful benchmark. GPU time is 5-7 ms a frame at 720p: the limit is on
+the CPU side ([docs/NOTES.md](docs/NOTES.md), *macOS / Metal*).
 
 Technical notes: [docs/NOTES.md](docs/NOTES.md).
 
@@ -73,7 +85,7 @@ Technical notes: [docs/NOTES.md](docs/NOTES.md).
 - The PS3 firmware installed in RPCS3 (*File → Install Firmware*), which
   provides the `dev_flash` the game reads.
 
-**PC:**
+**PC (Linux):**
 
 - Linux x86-64. The lifted code is built for `x86-64-v3` (AVX2/FMA) by
   default; set the CMake cache variables `PORT_PPU_ARCH` and `PORT_SPU_ARCH`
@@ -92,6 +104,23 @@ Technical notes: [docs/NOTES.md](docs/NOTES.md).
   ```
 
   `ffmpeg` is only needed by the test scripts in `work/tools/`.
+
+**Mac:**
+
+- An Apple Silicon Mac. macOS 13 or later for MetalFX upscaling; the rest
+  needs only Metal. Developed on an M1 Max.
+- Xcode's command line tools (`xcode-select --install`) and, from
+  [Homebrew](https://brew.sh):
+
+  ```sh
+  brew install cmake ninja sdl2 glslang spirv-cross
+  ```
+
+  glslang and spirv-cross translate the game's shaders to Metal's language;
+  without them the build has no guest shaders and the game does not render.
+  `ffmpeg` and `coreutils` are only needed by the test scripts.
+- 64 GB of RAM builds comfortably with the default job count (one per
+  performance core); lower `JOBS` on a smaller machine.
 
 ## Setup
 
@@ -152,7 +181,7 @@ scripts/build.sh                # -> work/port/build/PacificRiftRecomp
 ```
 
 This configures `work/port/CMakeLists.txt` with Ninja, a Release build and the
-Vulkan backend, and builds it. It accepts `JOBS=<n>`, `PORT_BUILD_MEM=<size>`,
+Vulkan backend (Linux) or the Metal backend (macOS), and builds it. It accepts `JOBS=<n>`, `PORT_BUILD_MEM=<size>`,
 `BUILD_DIR=<dir>`, `SPU_DIR=<dir>`, `CC=`/`CXX=`. To run CMake yourself:
 
 ```sh
@@ -163,14 +192,17 @@ cmake -S work/port -B work/port/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build work/port/build
 ```
 
+On macOS leave `-DPS3RECOMP_RSX_VULKAN=ON` out: the Metal backend is always
+built there.
+
 ### 6. Play
 
 ```sh
 work/run.sh
 ```
 
-`work/run.sh` sets up the environment (the `dev_flash` path, `hdd0/` for
-saves), runs `work/port/build/PacificRiftRecomp` on
+`work/run.sh` sets up the environment (the `dev_flash` path: `./dev_flash`
+when it exists, else RPCS3's copy; `hdd0/` for saves), runs `work/port/build/PacificRiftRecomp` on
 `disc/PS3_GAME/USRDIR/EBOOT.elf` and logs to `work/runs/<time>.log`
 (`work/runs/latest.log` points at the newest). The game opens a window;
 `work/run.sh --offscreen` renders offscreen instead (the test scripts' `INST`
@@ -178,7 +210,9 @@ instances are offscreen by default). Arguments of the form `VAR=value` are
 exported to the game.
 
 Use an SDL2-supported game controller. The game ignores SIGINT (Ctrl+C); stop
-it with SIGKILL, for example `pkill -KILL -x PacificRiftReco`.
+it with SIGKILL, for example `pkill -KILL -x PacificRiftReco` (on macOS the
+process name is not cut short: `pkill -KILL -x PacificRiftRecomp`, or Cmd+Q
+in the window).
 
 ## Settings
 
@@ -188,10 +222,10 @@ it with SIGKILL, for example `pkill -KILL -x PacificRiftReco`.
 |---|---|
 | **F1**, or Select+Start held half a second | Port menu (Escape closes it); the game sees a neutral pad while it is open |
 | **F10** | Performance HUD: detailed, compact, off |
-| **F11** or **Alt+Enter** | Full screen and back |
+| **F11** or **Alt+Enter** (macOS: **Option+Return**, or the green button) | Full screen and back |
 
-Every menu change is saved to `user/settings.ini` at once. The upscaler and
-its sharpness apply immediately; the resolution scale and frame rate are read
+Every menu change is saved to `user/settings.ini` at once. The upscaler (FSR 1
+on Linux, MetalFX on macOS) and its sharpness apply immediately; the resolution scale and frame rate are read
 at start, and the menu has a *Restart now* button for them. The frame keeps
 its 16:9 shape in any window size, with black bars where needed.
 
@@ -204,8 +238,8 @@ environment variable that is already set wins over the file.
 [video]
 fullscreen = 0
 scale = 1            ; 1 = 720p, 2 = 1440p, 3 = 4K render targets (restart)
-upscaler = off       ; off, or fsr (AMD FSR 1 to the window's size)
-fsr_sharpness = 0.80 ; 0..1, 1 = sharpest
+upscaler = off       ; off, or fsr (Linux: AMD FSR 1) / metalfx (macOS), to the window's size
+fsr_sharpness = 0.80 ; the upscaler's sharpening, 0..1, 1 = sharpest
 fps = 30             ; 30 (original) or 60 (restart)
 
 [performance]
@@ -214,7 +248,9 @@ fps_counter = 1      ; HUD: 0 = off, 1 = detailed, 2 = compact
 
 ### Environment variables
 
-The ones a player may want (all `PS3RECOMP_*` switches are read at start):
+The ones a player may want (all `PS3RECOMP_*` switches are read at start). The
+names with `VK` in them are the Vulkan backend's; on macOS the port passes
+each one on to the Metal backend's own switch, so the table holds for both.
 
 | Variable | Effect |
 |---|---|
@@ -222,15 +258,15 @@ The ones a player may want (all `PS3RECOMP_*` switches are read at start):
 | `PS3RECOMP_VK_FULLSCREEN=1` | Start full screen |
 | `PS3RECOMP_STRETCH=1` | Stretch the frame to the window (default: keep its shape, black bars) |
 | `PS3RECOMP_RES_SCALE=1..4` | Render-target scale: 2 = 1440p, 3 = 4K |
-| `PS3RECOMP_FSR=1`, `PS3RECOMP_FSR_SHARPNESS=0..1` | AMD FSR 1 upscaling to the window's size |
+| `PS3RECOMP_FSR=1`, `PS3RECOMP_FSR_SHARPNESS=0..1` | Upscaling to the window's size: AMD FSR 1 (Vulkan), MetalFX spatial scaling plus sharpening (Metal) |
 | `PS3RECOMP_FPS=60` | 60 fps mode at correct game speed while it holds 60 (needs the `patch_lift.py` hooks) |
 | `PS3RECOMP_DT_MAX=2` | 60 fps mode: a late frame makes up the lost time (default 1, off: every frame is 1/60 s, so the game runs slightly slow below 60 fps; the catch-up makes the car lurch and riders fall) |
 | `PS3RECOMP_CAMERA_SHAKE=1` | Keep the game's camera shake (default: off, a steady camera at both 30 and 60 fps) |
 | `PS3RECOMP_SHAKE_60=1` | With camera shake on, 60 fps mode: step it every frame (stronger shake) |
-| `PS3_DEV_FLASH=<dir>` | Firmware `dev_flash` (run.sh default: `~/.config/rpcs3/dev_flash`) |
+| `PS3_DEV_FLASH=<dir>` | Firmware `dev_flash` (run.sh default: `./dev_flash`, else RPCS3's: `~/.config/rpcs3/dev_flash`, on macOS `~/Library/Application Support/rpcs3/dev_flash`) |
 | `PS3_HDD0_ROOT=<dir>` | Save data (run.sh default: `hdd0/`) |
 | `PS3_USER_DIR=<dir>` | Where `settings.ini` and `shader_cache/` live (default `user/`) |
-| `PS3RECOMP_SPIRV_CACHE=<dir>` or `0` | Translated-shader cache (default `user/shader_cache`) or none |
+| `PS3RECOMP_SPIRV_CACHE=<dir>` or `0` | Translated-shader cache (default `user/shader_cache`) or none; on macOS it also holds the translated Metal shaders and the pipeline list the next start prewarms |
 | `PS3RECOMP_FLIPLOG=<file>` | Log a timestamp per presented frame (`work/tools/fliplog.py` reads it) |
 
 The port also changes some toolkit defaults for speed (`work/port/main.cpp`).
@@ -244,7 +280,7 @@ described in [docs/NOTES.md](docs/NOTES.md).
 | Path | What |
 |---|---|
 | `work/port/` | The port: `main.cpp` (boot, frame clock, defaults), `port_patches.cpp` (hooks called from the lifted code), `settings.cpp`, `ui.cpp`, `spu_fastpaths.c`, `CMakeLists.txt` |
-| `work/patches/ps3recomp.patch` | This port's changes to ps3recomp (regenerate with `scripts/make_patch.sh`) |
+| `work/patches/ps3recomp.patch` | This port's changes to ps3recomp, the Metal backend's among them (regenerate with `scripts/make_patch.sh`) |
 | `work/tools/` | Lift helpers, test drivers and profilers ([work/tools/README.md](work/tools/README.md)) |
 | `work/run.sh` | Run the game, or isolated test instances (`INST=<name>`) |
 | `scripts/` | `setup.sh`, `lift.sh`, `build.sh`, `make_patch.sh`, `check_clean.sh`, `install-hooks.sh` |
@@ -265,7 +301,8 @@ changes are made in `ps3recomp/` and committed here as the regenerated patch
 
 ps3recomp by Ned Heller (sp00nznet) and contributors; RPCS3 for decrypting
 the executable and installing the firmware; AMD FidelityFX Super Resolution 1;
-Dear ImGui; SDL2; glslang and Vulkan. Details in [CREDITS.md](CREDITS.md).
+Dear ImGui; SDL2; glslang, SPIRV-Cross, Vulkan and Metal. Details in
+[CREDITS.md](CREDITS.md).
 
 ## License
 

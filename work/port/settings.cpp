@@ -64,7 +64,7 @@ int port_settings_load(port_settings* s, const char* path)
             const int n = atoi(v);
             if (n >= 1 && n <= 3) s->scale = n;
         } else if (!strcmp(section, "video") && !strcmp(k, "upscaler")) {
-            if (!strcmp(v, "fsr") || !strcmp(v, "fsr1")) s->upscaler = 1;
+            if (!strcmp(v, "fsr") || !strcmp(v, "fsr1") || !strcmp(v, "metalfx") || !strcmp(v, "on")) s->upscaler = 1;
             else if (!strcmp(v, "off") || !strcmp(v, "none")) s->upscaler = 0;
         } else if (!strcmp(section, "video") && !strcmp(k, "fps")) {
             const int n = atoi(v);
@@ -108,12 +108,22 @@ int port_settings_save(const port_settings* s, const char* path)
             "\n[video]\n"
             "fullscreen = %d\n"
             "scale = %d          ; 1 = 720p, 2 = 1440p, 3 = 4K (takes effect after a restart)\n"
+#ifdef __APPLE__
+            "upscaler = %s  ; off, or metalfx (MetalFX: upscales the frame to the window)\n"
+#else
             "upscaler = %s      ; off, or fsr (AMD FSR 1: upscales the frame to the window)\n"
-            "fsr_sharpness = %.2f ; 0..1, 1 = sharpest\n"
+#endif
+            "fsr_sharpness = %.2f ; the upscaler's sharpening, 0..1, 1 = sharpest\n"
             "fps = %d            ; 30 (original) or 60 (takes effect after a restart)\n"
             "\n[performance]\n"
             "fps_counter = %d      ; HUD (F10 cycles): 0 = off, 1 = detailed, 2 = compact\n",
-            s->fullscreen ? 1 : 0, s->scale, s->upscaler ? "fsr" : "off", (double)s->fsr_sharpness,
+            s->fullscreen ? 1 : 0, s->scale,
+#ifdef __APPLE__
+            s->upscaler ? "metalfx" : "off",
+#else
+            s->upscaler ? "fsr" : "off",
+#endif
+            (double)s->fsr_sharpness,
             s->fps == 60 ? 60 : 30, s->fps_counter);
     return fclose(f) == 0 ? 0 : -1;
 }
@@ -131,7 +141,10 @@ static void export_var(const char* name, const char* value)
 void port_settings_export(const port_settings* s)
 {
     char b[32];
-    if (s->fullscreen) export_var("PS3RECOMP_VK_FULLSCREEN", "1");
+    if (s->fullscreen) {
+        export_var("PS3RECOMP_VK_FULLSCREEN", "1");
+        export_var("PS3RECOMP_METAL_FULLSCREEN", "1");     /* the Metal backend's name */
+    }
     if (s->scale > 1) { snprintf(b, sizeof b, "%d", s->scale); export_var("PS3RECOMP_RES_SCALE", b); }
     if (s->upscaler) export_var("PS3RECOMP_FSR", "1");
     if (s->fps == 60) export_var("PS3RECOMP_FPS", "60");
