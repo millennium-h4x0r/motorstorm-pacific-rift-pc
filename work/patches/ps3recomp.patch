@@ -123,10 +123,10 @@ index 3bbabf62..515d3825 100644
  Without a GPU, Mesa's lavapipe runs every check, e.g.
 diff --git a/include/ps3emu/host_time.h b/include/ps3emu/host_time.h
 new file mode 100644
-index 00000000..108b25e2
+index 00000000..eb0d9dd5
 --- /dev/null
 +++ b/include/ps3emu/host_time.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,107 @@
 +/*
 + * ps3recomp - host timing primitives that differ between Linux and macOS.
 + *
@@ -180,6 +180,20 @@ index 00000000..108b25e2
 +#endif
 +#ifndef PS3_NO_PTHREAD_CREATE_MACRO
 +#define pthread_create ps3_pthread_create
++#endif
++/* ...and sched_yield() to a yield that does not give the processor away to
++ * lower-priority work (same file): Darwin's sched_yield depresses the
++ * caller's priority, so on a busy machine every spin-wait in the runtime
++ * handed a whole time slice to some other process. */
++#ifdef __cplusplus
++extern "C" {
++#endif
++int ps3_sched_yield(void);
++#ifdef __cplusplus
++}
++#endif
++#ifndef PS3_NO_SCHED_YIELD_MACRO
++#define sched_yield ps3_sched_yield
 +#endif
 +#endif
 +
@@ -3169,7 +3183,7 @@ index 3dcd91d5..d0587369 100644
  void spu_lockline_unlock(void) {}
  int main(void)
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c6..2f63ec19 100644
+index 82ea66c6..e2236717 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -18,6 +18,11 @@
@@ -3403,7 +3417,41 @@ index 82ea66c6..2f63ec19 100644
  static DWORD WINAPI spurs_pm_worker(LPVOID p)
  {
      struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
-@@ -1729,12 +1853,22 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1723,18 +1847,56 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+ #endif
+     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
++    /* SPURS_PM_SPIN_US=<us>: a lane that has just run looks for its next run
++     * for that long before it parks. The WWS job manager hands a lane ~3000
++     * short runs a second in a race, and waking a parked thread costs tens of
++     * microseconds each time (more on macOS than a futex wake on Linux): the
++     * lanes sat parked 64% of a 60 fps frame while the main thread waited on
++     * their jobs. Default 80 on macOS, 0 (park at once) elsewhere. */
++    static int spin_us = -1;
++    if (spin_us < 0) {
++        const char* e = getenv("SPURS_PM_SPIN_US");
++#if defined(__APPLE__)
++        spin_us = e ? atoi(e) : 80;
++#else
++        spin_us = e ? atoi(e) : 0;
++#endif
++        if (spin_us < 0) spin_us = 0;
++    }
++    int ran = 0;
+     AcquireSRWLockExclusive(&si->lock);
+     for (;;) {
++        if (ran && spin_us && !slot->busy && !si->stopping) {
++            ReleaseSRWLockExclusive(&si->lock);
++            const unsigned long long end = spurs_now_ns() + (unsigned long long)spin_us * 1000ull;
++            const volatile int* busy = (const volatile int*)&slot->busy;
++            while (!*busy && !si->stopping) {
++                for (int k = 0; k < 32; k++) YieldProcessor();
++                if (spurs_now_ns() >= end) break;
++            }
++            AcquireSRWLockExclusive(&si->lock);
++        }
++        ran = 1;
+         while (!slot->busy && !si->stopping)
              SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
          if (si->stopping && !slot->busy) break;
          ReleaseSRWLockExclusive(&si->lock);
@@ -3426,7 +3474,7 @@ index 82ea66c6..2f63ec19 100644
          if (si->active[wid]) si->active[wid]--;
          spu_lockline_lock();
          vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
-@@ -1742,7 +1876,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1742,7 +1904,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
          if (polls) si->idle[wid] = 0;
          else if (si->idle[wid] < 4) si->idle[wid]++;
          slot->busy = 0;
@@ -3435,7 +3483,7 @@ index 82ea66c6..2f63ec19 100644
      }
      ReleaseSRWLockExclusive(&si->lock);
      ps3_tprof_thread_exit();
-@@ -1767,7 +1901,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1767,7 +1929,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
              kick_pass = ++kick_run < 16;
          } else {
@@ -3445,7 +3493,7 @@ index 82ea66c6..2f63ec19 100644
              /* This full pass reads the line after any commit that woke it. */
              (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
          }
-@@ -1778,7 +1913,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1778,7 +1941,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          AcquireSRWLockExclusive(&s_workload_registry_lock);
          if (!kick_pass) si->pass_no++;
          u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
@@ -3454,7 +3502,7 @@ index 82ea66c6..2f63ec19 100644
              struct SpursPmSlot* slot = &si->slots[sn];
              if (slot->busy) continue;
              for (u32 checked = 0; checked < 16; checked++) {
-@@ -1788,7 +1923,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1788,7 +1951,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                      vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
                      !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
                      continue;
@@ -3463,7 +3511,7 @@ index 82ea66c6..2f63ec19 100644
                      continue; /* priority zero makes this physical lane ineligible */
                  u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
                  if (!maxcont || si->active[wid] >= maxcont) continue;
-@@ -1812,11 +1947,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1812,11 +1975,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  slot->pm_size = s_workloads[wid].sizePm;
                  slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
                  slot->wid = wid; slot->ea = ea;
@@ -3482,7 +3530,7 @@ index 82ea66c6..2f63ec19 100644
                  WakeAllConditionVariable(&si->wake);
                  break;
              }
-@@ -1835,7 +1977,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1835,7 +2005,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
        g_spu_line_commit_hook = spurs_commit_hook; }
      memset(si->active, 0, sizeof(si->active));
      memset(si->idle, 0, sizeof(si->idle));
@@ -3491,7 +3539,7 @@ index 82ea66c6..2f63ec19 100644
          struct SpursPmSlot* slot = &si->slots[sn];
          memset(slot, 0, sizeof(*slot));
          slot->instance = si; slot->spu_num = sn;
-@@ -1847,9 +1989,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1847,9 +2017,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
      return CELL_OK;
  failed:
      AcquireSRWLockExclusive(&si->lock);
@@ -3503,7 +3551,7 @@ index 82ea66c6..2f63ec19 100644
          HANDLE h = si->slots[sn].thread;
          if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
      }
-@@ -1866,10 +2008,10 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
+@@ -1866,10 +2036,10 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
      if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
      for (u32 wid = 0; wid < 16; wid++)
          if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
@@ -3516,7 +3564,7 @@ index 82ea66c6..2f63ec19 100644
          HANDLE h = si->slots[sn].thread;
          if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
      }
-@@ -1910,6 +2052,8 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
+@@ -1910,6 +2080,8 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
      s_workloads[wid].readyCount = value;
      /* The real store: the instance byte the kernel (poll thread) watches. */
      vm_write8(si->ea + SPURS_WKL_READY1 + wid, (u8)value);
@@ -3525,7 +3573,7 @@ index 82ea66c6..2f63ec19 100644
      {   static int _n = 0;
          if (_n < 32)
              printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
-@@ -2257,7 +2401,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
+@@ -2257,7 +2429,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
  s32 _cellSpursSendSignal(void* taskset, u32 taskId)
  {
      uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
@@ -3535,7 +3583,7 @@ index 82ea66c6..2f63ec19 100644
      /* Real delivery now that SPU tasks execute (comment was stale). */
      if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
      return CELL_OK;
-@@ -3405,38 +3550,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3405,38 +3578,49 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
      return CELL_OK;
  }
  
@@ -3549,19 +3597,22 @@ index 82ea66c6..2f63ec19 100644
 - *
 - *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
 - *   rdch MFC_RdAtomicStat ; brnz -> retry
-+/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
-  *
+- *
 - * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
 - * bytes in guest memory ARE the interface, and they have to be the real
 - * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
++/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
+  *
+- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
 + * Ported from the MotorStorm Apocalypse port (its toolkit patch), where the
 + * layout and protocol were read out of the libspurs task-side LFQueue code
 + * linked into an SPU zlib task. The consumer is recompiled SPU task code that
 + * works on the queue line in main memory with GETLLAR/PUTLLC, so the bytes ARE
 + * the interface. The PPU push is the pop protocol mirrored.
   *
-- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
-- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
+- * The title's own call corroborates the size: it passes q=0x4059FD00 with
+- * buffer=0x4059FD80, exactly 128 bytes later.
 + *   +0x00 u16 pop  done index      +0x08 u16 push done index
 + *   +0x02 u16 pop  done bitmap     +0x0A u16 push done bitmap
 + *   +0x04 u16 pop  waiters (dir 3) +0x0C u16 push waiters (dir 3)
@@ -3572,9 +3623,6 @@ index 82ea66c6..2f63ec19 100644
 + *   +0x50 u16 push waiters  +0x52 u16 push waiter ids[15]
 + *   +0x70 u64 owner (taskset, or SPURS|1)
   *
-- * The title's own call corroborates the size: it passes q=0x4059FD00 with
-- * buffer=0x4059FD80, exactly 128 bytes later.
-- *
 - * NOTE: libs/sync/cellSync.c has a CellSyncLFQueue too, but that one is a
 - * HOST-native struct (atomic_uint, a 64-bit host buffer pointer). It is fine
 - * for a queue both of whose ends are HLE, and completely wrong here -- writing
@@ -3614,7 +3662,7 @@ index 82ea66c6..2f63ec19 100644
  s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                  u32 size, u32 depth, u32 direction)
  {
-@@ -3445,30 +3601,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+@@ -3445,30 +3629,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
  
      uint32_t q = (uint32_t)queue_ea;
      for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
@@ -3651,7 +3699,7 @@ index 82ea66c6..2f63ec19 100644
                 (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
      return CELL_OK;
  }
-@@ -3479,3 +3622,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3479,3 +3650,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
      return CELL_OK;
  }
@@ -7519,7 +7567,7 @@ index e55bcc19..855c0f71 100644
  /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
   * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index ad8db0b5..5d1dd726 100644
+index ad8db0b5..43ef320e 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -60,6 +60,7 @@
@@ -8015,7 +8063,7 @@ index ad8db0b5..5d1dd726 100644
      pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
      pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
      /* nv40 COLOR_MASK byte layout: B=[0:7] G=[8:15] R=[16:23] A=[24:31], any
-@@ -3449,20 +3673,285 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+@@ -3449,20 +3673,287 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
      id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
      if (!ds) return 0;
  
@@ -8147,6 +8195,8 @@ index ad8db0b5..5d1dd726 100644
 +    /* Below the game's threads: the compiles themselves run in Metal's
 +     * compiler service, this thread only feeds it. */
 +    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++    { struct sched_param sp = { .sched_priority = 20 };      /* the runtime starts threads at 45 */
++      pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp); }
 +    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 +    u32 ok = 0, bad = 0;
 +    for (u32 i = 0; i < s_eng_warm_recs; i++) @autoreleasepool {
@@ -8312,7 +8362,7 @@ index ad8db0b5..5d1dd726 100644
      return slot + 1;
  }
  
-@@ -3564,15 +4053,41 @@ static void eng_bind_pipeline(void* user, u32 pipeline)
+@@ -3564,15 +4055,41 @@ static void eng_bind_pipeline(void* user, u32 pipeline)
  static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
  {
      (void)user;
@@ -8354,7 +8404,7 @@ index ad8db0b5..5d1dd726 100644
  }
  
  static void eng_bind_textures(void* user, const u32* textures,
-@@ -3598,15 +4113,17 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
+@@ -3598,15 +4115,17 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
  static void eng_set_viewport(void* user, float x, float y, float w, float h)
  {
      (void)user;
@@ -8376,7 +8426,7 @@ index ad8db0b5..5d1dd726 100644
  }
  
  static void eng_set_stencil_ref(void* user, u32 ref)
-@@ -3621,7 +4138,8 @@ static void eng_set_stencil_ref(void* user, u32 ref)
+@@ -3621,7 +4140,8 @@ static void eng_set_stencil_ref(void* user, u32 ref)
  static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
  {
      (void)user;
@@ -8386,7 +8436,7 @@ index ad8db0b5..5d1dd726 100644
      s_eng_pending.depth_bias  = depth_bits == 16u ? units * 256.0f : units;
  }
  
-@@ -3631,15 +4149,26 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3631,15 +4151,26 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
  {
      (void)user;
      if (!vertex_count || !stride) return;
@@ -8413,7 +8463,7 @@ index ad8db0b5..5d1dd726 100644
      r->kind         = ENG_REC_DRAW;
      r->topology     = topo_to_metal(topology);
      r->vb_off       = vb_off;
-@@ -3649,6 +4178,62 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3649,6 +4180,62 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      r->index_count  = indices ? index_count : 0;
  }
  
@@ -8476,7 +8526,7 @@ index ad8db0b5..5d1dd726 100644
  static void eng_clear_color(void* user, u32 surface, const float rgba[4])
  {
      (void)user;
-@@ -3658,6 +4243,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
+@@ -3658,6 +4245,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                     ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
                     ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
                      (u32)(rgba[2] * 255.0f + 0.5f);
@@ -8484,7 +8534,7 @@ index ad8db0b5..5d1dd726 100644
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
      memset(r, 0, sizeof *r);
-@@ -3671,6 +4257,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -3671,6 +4259,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                      float depth_value, u8 stencil)
  {
      (void)user;
@@ -8492,7 +8542,7 @@ index ad8db0b5..5d1dd726 100644
      if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
      EngRecord* r = &s_eng_rec[s_eng_rec_count++];
      memset(r, 0, sizeof *r);
-@@ -3686,8 +4273,9 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -3686,8 +4275,9 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
   * load action, which would clear the whole attachment. */
  static void eng_clear_rect_into(EngRecord* r, u32 x, u32 y, u32 w, u32 h)
  {
@@ -8504,7 +8554,7 @@ index ad8db0b5..5d1dd726 100644
  }
  
  static void eng_clear_color_rect(void* user, u32 surface, const float rgba[4],
-@@ -3713,39 +4301,105 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
+@@ -3713,39 +4303,105 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
  
  /* ---- replay -------------------------------------------------------------- */
  
@@ -8633,7 +8683,7 @@ index ad8db0b5..5d1dd726 100644
      /* An indexed draw is really indexed here: the index buffer is what keeps a
       * strip's shared vertices from being fetched and uploaded per triangle.
       * Only a rebuilt triangle list is ever indexed; points and lines arrive as
-@@ -3761,6 +4415,137 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -3761,6 +4417,137 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                  vertexStart:0 vertexCount:r->vertex_count];
  }
  
@@ -8771,7 +8821,7 @@ index ad8db0b5..5d1dd726 100644
  /* Is this record aimed at exactly these colour attachments, in this order? */
  static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
  {
-@@ -3927,8 +4712,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3927,8 +4714,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->rt[0]);
              id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -8784,7 +8834,7 @@ index ad8db0b5..5d1dd726 100644
                  s_eng_dropped++; continue;
              }
              id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
-@@ -3936,12 +4723,22 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3936,12 +4725,22 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              s_ft_copies++;
              [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
                     sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -8808,7 +8858,7 @@ index ad8db0b5..5d1dd726 100644
          if (s_eng_rec[i].kind == ENG_REC_DEPTH_COLOR) {
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->depth);
-@@ -4004,10 +4801,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -4004,10 +4803,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          u32 cd = 0, ds_flags = 0;
          float cdepth = 1.0f;
          u8 cstencil = 0;
@@ -8821,7 +8871,7 @@ index ad8db0b5..5d1dd726 100644
                 !eng_record_is_rect_clear(&s_eng_rec[i])) {
              const EngRecord* r = &s_eng_rec[i];
              if (r->kind == ENG_REC_CLEAR_COLOR) {
-@@ -4133,11 +4928,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -4133,11 +4930,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              continue;
          }
          s_ft_passes++;
@@ -8838,7 +8888,7 @@ index ad8db0b5..5d1dd726 100644
              i++;
          }
          [enc endEncoding];
-@@ -4197,11 +4996,124 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+@@ -4197,11 +4998,124 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
   * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
   * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
   * fails is skipped. */
@@ -8963,7 +9013,7 @@ index ad8db0b5..5d1dd726 100644
      if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
      if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
          MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-@@ -4217,21 +5129,42 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -4217,21 +5131,42 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
          }
          s_eng_blit_pso_fmt = [dst pixelFormat];
      }
@@ -9009,7 +9059,7 @@ index ad8db0b5..5d1dd726 100644
            { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
        [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-@@ -4248,15 +5181,44 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -4248,15 +5183,44 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
   * in-flight semaphore instead, the same bound the vtable path uses, because
   * waiting on every frame is the one pattern where a driver cannot hide its
   * encoding work. */
@@ -9057,7 +9107,7 @@ index ad8db0b5..5d1dd726 100644
          { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
            if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
            if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
-@@ -4291,9 +5253,32 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -4291,9 +5255,32 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
          }
          const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
          const u32 ft_nrec = s_eng_rec_count;
@@ -9091,7 +9141,7 @@ index ad8db0b5..5d1dd726 100644
          if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
          if (windowed_present) {
              dispatch_semaphore_t sem = s_inflight;
-@@ -4305,11 +5290,23 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -4305,11 +5292,23 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              }];
              eng_stage_hand_off(cb, stage);
              [cb commit];
@@ -9115,7 +9165,7 @@ index ad8db0b5..5d1dd726 100644
              if (ft_w0) {
                  const uint64_t w1 = ps3_ft_now();
                  ps3_ft_span(PS3_FT_GPU_WAIT, 0, present_dst ? 1u : 0u,
-@@ -4340,42 +5337,73 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -4340,42 +5339,73 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
          }
          s_eng_rec_count  = 0;
          s_eng_stage_used = 0;
@@ -9209,7 +9259,7 @@ index ad8db0b5..5d1dd726 100644
      }
      free(rgba);
  }
-@@ -4387,17 +5415,78 @@ static void eng_present(void* user, u32 surface)
+@@ -4387,17 +5417,78 @@ static void eng_present(void* user, u32 surface)
       * PS3RECOMP_METAL_FPS "guest" figure (and the launcher's title). */
      rsx_metal_backend_note_guest_frame();
      id<MTLTexture> src = eng_obj(surface);
@@ -9290,7 +9340,7 @@ index ad8db0b5..5d1dd726 100644
      if (x + w > [t width] || y + h > [t height]) return;
      const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
      [t getBytes:out bytesPerRow:out_pitch
-@@ -4413,49 +5502,60 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -4413,49 +5504,60 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                                float* out, u32 out_pitch)
  {
      id<MTLTexture> src = eng_obj(depth);
@@ -9367,7 +9417,7 @@ index ad8db0b5..5d1dd726 100644
          }
          eng_obj_release(user, snap);
          return ok ? 0 : -1;
-@@ -4480,6 +5580,7 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -4480,6 +5582,7 @@ static const rsx_draw_backend s_engine_backend = {
      .depth_snapshot       = eng_depth_snapshot,
      .depth_readback       = eng_depth_readback,
      .color_snapshot       = eng_color_snapshot,
@@ -9375,7 +9425,7 @@ index ad8db0b5..5d1dd726 100644
      .depth_as_color       = eng_depth_as_color,
      .pipeline_create      = eng_pipeline_create,
      .pipeline_release     = eng_pipeline_release,
-@@ -4500,6 +5601,14 @@ static const rsx_draw_backend s_engine_backend = {
+@@ -4500,6 +5603,14 @@ static const rsx_draw_backend s_engine_backend = {
      .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
      .present              = eng_present,
      .readback             = eng_readback,
@@ -9390,7 +9440,7 @@ index ad8db0b5..5d1dd726 100644
  };
  
  /* ---- public API ---------------------------------------------------------- */
-@@ -4670,6 +5779,29 @@ static int pump_messages_impl(void)
+@@ -4670,6 +5781,29 @@ static int pump_messages_impl(void)
                                                  inMode:NSDefaultRunLoopMode
                                                 dequeue:YES];
              if (!ev) break;
@@ -9420,7 +9470,7 @@ index ad8db0b5..5d1dd726 100644
              /* Cmd+Q quits. The host turns a plain run loop with no app menu,
               * so AppKit has no Quit item to send it to and nothing happened.
               * It ends the game the way the console's Quit Game does
-@@ -4684,6 +5816,10 @@ static int pump_messages_impl(void)
+@@ -4684,6 +5818,10 @@ static int pump_messages_impl(void)
              }
              [NSApp sendEvent:ev];
          }
@@ -21094,10 +21144,10 @@ index 6e79ec31..3c66fda1 100644
   * live in runtime/ppu/ppu_loader.cpp -- which CMake excludes from the runtime
 diff --git a/runtime/platform/darwin_precise_sleep.c b/runtime/platform/darwin_precise_sleep.c
 new file mode 100644
-index 00000000..b138ba3e
+index 00000000..2dcc390b
 --- /dev/null
 +++ b/runtime/platform/darwin_precise_sleep.c
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,185 @@
 +/*
 + * ps3recomp - sleeps that end when asked, on macOS (include/ps3emu/host_time.h).
 + *
@@ -21130,6 +21180,31 @@ index 00000000..b138ba3e
 +#undef nanosleep
 +#undef usleep
 +#undef pthread_create
++#undef sched_yield
++#include <mach/mach_traps.h>
++
++/* A yield for spin-waits. sched_yield() on Darwin is swtch_pri(): it lowers
++ * the caller to the bottom priority until it next runs, so anything runnable
++ * on the machine, a background process included, gets the processor for a
++ * time slice (10 ms). The runtime's waits are full of short yield loops (the
++ * tail of a sleep, sub-20 us guest usleeps, lock back-offs, the guest's own
++ * thread yields): with twelve busy processes beside it the intro ran at 4.5
++ * frames a second. swtch() only switches to a thread of the same or a higher
++ * priority, which for these threads (user-interactive) means the game's own
++ * or something that should run first anyway. With nothing to switch to, a
++ * few pause instructions stand in for the yield. */
++int ps3_sched_yield(void)
++{
++    if (!swtch())
++        for (int i = 0; i < 16; i++) {
++#if defined(__aarch64__)
++            __asm__ __volatile__("yield" ::: "memory");
++#else
++            __builtin_ia32_pause();
++#endif
++        }
++    return 0;
++}
 +
 +static pthread_key_t  s_kq_key;
 +static pthread_once_t s_kq_once = PTHREAD_ONCE_INIT;
@@ -21166,7 +21241,7 @@ index 00000000..b138ba3e
 +        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 +        if (now >= deadline) return;
 +        const uint64_t left = deadline - now;
-+        if (left <= PS3_PRECISE_SPIN_NS) { sched_yield(); continue; }
++        if (left <= PS3_PRECISE_SPIN_NS) { ps3_sched_yield(); continue; }
 +        const int kq = thread_kq();
 +        if (kq < 0) {
 +            struct timespec d = { (time_t)(left / 1000000000ull), (long)(left % 1000000000ull) };
@@ -21186,7 +21261,7 @@ index 00000000..b138ba3e
 +
 +void ps3_precise_sleep_ns(uint64_t ns)
 +{
-+    if (!ns) { sched_yield(); return; }
++    if (!ns) { ps3_sched_yield(); return; }
 +    ps3_precise_sleep_until_uptime_ns(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + ns);
 +}
 +
@@ -21216,6 +21291,7 @@ index 00000000..b138ba3e
 +#include <stdlib.h>
 +#include <string.h>
 +
++#define PS3_THREAD_PRIORITY 45
 +typedef struct { void* (*start)(void*); void* arg; } ps3_thread_start;
 +
 +static int thread_qos_on(void)
@@ -21230,6 +21306,17 @@ index 00000000..b138ba3e
 +    const ps3_thread_start s = *(ps3_thread_start*)p;
 +    free(p);
 +    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    /* The class alone is not enough: for a process that is not the
++     * foreground application (started from a terminal, or with no window)
++     * a user-interactive thread still runs at the default priority, 31
++     * (ps -M). An explicit priority is honoured: 45 of the 15..47 a user
++     * thread may ask for, above ordinary processes and below the system's
++     * own interactive work. */
++    { struct sched_param sp; int policy = SCHED_OTHER;
++      if (pthread_getschedparam(pthread_self(), &policy, &sp) == 0 && sp.sched_priority < PS3_THREAD_PRIORITY) {
++          sp.sched_priority = PS3_THREAD_PRIORITY;
++          pthread_setschedparam(pthread_self(), policy, &sp);
++      } }
 +    return s.start(s.arg);
 +}
 +

@@ -1,5 +1,9 @@
 # tsample: per-thread CPU sampler
 
+Linux only (perf_event_open, /proc). On macOS use the system's sampler,
+`/usr/bin/sample <pid> 4 1 -file out.txt`, which gives every thread's call
+tree with symbols.
+
 Samples one thread's user-space instruction pointer, with the frame-pointer
 callchain where there is one, through perf_event_open's task clock. No root
 and no `perf` binary needed: it works with perf_event_paranoid=2 on any

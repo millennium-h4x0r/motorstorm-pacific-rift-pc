@@ -1,5 +1,7 @@
 # jobbench: replay benchmark for lifted SPU functions
 
+The capture step drives gdb on Linux; it has not been adapted to lldb on macOS.
+
 Frame-level benches (`work/tools/bench.sh`) can't resolve a few-percent change in SPU job code:
 other threads swing the frame by ±25% between rounds. jobbench times one lifted SPU function on
 real inputs, without the game running:

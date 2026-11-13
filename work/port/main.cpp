@@ -300,6 +300,19 @@ static DWORD WINAPI frame_clock(LPVOID)
         CreateThread(NULL, 256u * 1024, vblank_clock, NULL, 0, NULL);
     }
 
+    /* A guest flip is presented once. The flip sets a pending flag and bumps
+     * the request count; presenting on either one separately showed (and
+     * counted) a frame twice whenever the flip was reached in the drain right
+     * before the count check: the count branch presented, and the flag was
+     * still up for the next pass. In a window that made the FPS counter read
+     * up to twice the game's real rate (30 shown while the race ran slow).
+     * The count alone decides; the flag is only cleared. */
+    auto present_if_flipped = [&]() {
+        cellGcm_take_flip_pending();
+        const unsigned fc = cellGcm_flip_request_count();
+        if (fc != last_flip) { present_guest_frame(); last_flip = fc; }
+    };
+
     for (;;) {
         {   /* sleep to the next vblank, or one poll interval, whichever is sooner */
             unsigned long long now0 = mono_ns();
@@ -339,10 +352,7 @@ static DWORD WINAPI frame_clock(LPVOID)
              * batch held right now is exactly the completed frame; presenting
              * after the drain races the guest's next-frame writes and shows a
              * mixed one. */
-            if (rsx_ok && cellGcm_take_flip_pending()) {
-                present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
+            if (rsx_ok) present_if_flipped();
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
@@ -357,10 +367,7 @@ static DWORD WINAPI frame_clock(LPVOID)
          * those at 16 ms apiece paces the guest into single-figure frame rates.
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
-            if (cellGcm_take_flip_pending()) {
-                present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
+            present_if_flipped();
             cellGcm_rsx_process_fifo();
 
             if (rsx_backend_pump() != 0) {
@@ -373,13 +380,8 @@ static DWORD WINAPI frame_clock(LPVOID)
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
              * present freely, so the window is not blank during boot. */
-            unsigned fc = cellGcm_flip_request_count();
-            if (fc != last_flip) {
-                present_guest_frame();
-                last_flip = fc;
-            } else if (fc == 0) {
-                rsx_backend_present();
-            }
+            present_if_flipped();
+            if (cellGcm_flip_request_count() == 0) rsx_backend_present();
         }
     }
     return 0;
@@ -655,7 +657,17 @@ int main(int argc, char** argv)
      * waking main's back-off on the poller's pass (PS3_USLEEP_PASSWAKE) both
      * measured below the cap (sys_timer.c). PS3_USLEEP_CAP= (empty) restores
      * the 200 us poll. */
+#if defined(__APPLE__)
+    /* macOS: also cap the main thread's own back-off while it waits for
+     * JobBatchHandler (250 us at lr 0x0094CCA8, func_004B63F0) at 60 us.
+     * With sleeps that end on time there (darwin_precise_sleep.c) the shorter
+     * poll is a gain, where on Linux it measured as a loss: 60 fps mode
+     * ~40 -> ~45 fps on an M1 Max, ~53 with the SPURS lanes' spin
+     * (SPURS_PM_SPIN_US, cellSpurs.c). */
+    setenv("PS3_USLEEP_CAP", "4af6d0:50,94cca8:60", 0);
+#else
     setenv("PS3_USLEEP_CAP", "4af6d0:50", 0);
+#endif
 #endif
 
     /* Game speed. The game paces itself at 30 fps: its vblank handler

@@ -2,3 +2,4 @@ motorstorm-pacific-rift-pc
 version: 0.1.0
 date: 2026-11-09
 toolkit: ps3recomp v0.18.0 (4e8f3ca8)
+platforms: Linux x86-64 (Vulkan), macOS Apple Silicon (Metal)

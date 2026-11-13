@@ -1,5 +1,13 @@
 # Technical notes
 
+The port runs on Linux (x86-64, Vulkan) and macOS (Apple Silicon, Metal). The
+sections up to *Adaptive 60/30* were written while the port was Linux-only:
+their findings about the game, the lift and the runtime hold on both systems,
+but the `VK_*` switches, the gdb and `/proc` recipes and the fps figures in
+them are the Linux/Vulkan build's. Everything specific to the Mac (the Metal
+backend's side of each feature, timers, thread priority, arm64 code, how to
+measure) is in [macOS / Metal](#macos--metal-2026-11-13) at the end.
+
 ## EBOOT.elf (BCES-00129 01.00), first pass with ps3recomp v0.18.0
 
 - PPU ELF64 big-endian, stripped, 2 load segments:
@@ -130,6 +138,8 @@ Audio goes to the SDL dummy driver unless `INST_AUDIO=1`. `BIN` defaults to `wor
 PAD_FILE holds (`libs/input/cellPad.c`): a line `<mask> [reports]` presses the mask for that many pad reports (default 40), and the file is read again only after the hold has run out. A long hold such as `0x0200 100000` therefore swallows every later press for about half an hour, and a `0` mask is not a release. To keep a button held while still being able to send menu input, rewrite a short hold periodically (`echo "0x0200 300" > pad.txt` every ~4 s) and let the last one drain (~5 s) before the next press. `work/tools/finish_race.sh` does this. It is also why the post-race replay can look hung: START brings back the results, X continues, and Retry Race / Quit Race appears a few seconds later.
 
 `perf` isn't installed. As a sampling profiler, run gdb `thread apply all bt 1` in a loop and count the top frames.
+
+On macOS the same instances work (`work/run.sh` maps the dump and offscreen switches onto the Metal backend's). The process is named `PacificRiftRecomp` there, not cut to 15 characters; `work/tools/lib.sh` finds and kills instances on both systems. Saves go to `gamedata/dev_hdd0` under the repository root and are shared by every instance. The profiler is `/usr/bin/sample <pid> 4 1`.
 
 ## Performance
 
@@ -445,6 +455,11 @@ order it was found:
   blit. Keys are read in the backend's event pump (F1, F10, F11 /
   Option+Return, Escape). `PS3RECOMP_UI_SHOT=<file.ppm>` writes the window's
   frame with the UI once (`PS3RECOMP_UI_SHOT_AFTER`, default 120 UI frames).
+- **One present per flip** (`work/port/main.cpp`, `present_if_flipped`): the
+  frame clock presented on the flip-pending flag and, separately, on the flip
+  count, so a flip reached in the drain just before the count check was
+  presented twice. In a window that doubled the HUD's frame rate (52 "fps"
+  in the 30 fps intro; 30 shown while a race ran slow). The count decides now.
 - **Frame dumps**: `PS3RECOMP_METAL_FRAME_DUMP` + `_EVERY`, and
   `PS3RECOMP_METAL_FRAME_SEQ` + `_SEQ_TRIGGER`; `main.cpp` maps the
   `PS3RECOMP_VK_*` names (window, full screen, dump, sequence) onto them, so
@@ -502,17 +517,43 @@ sixth of their time in `_pthread_rwlock_lock_wait` on their instance's lock;
   finite single, i.e. an operand is an extended-range word. Its DSP code runs
   whole vectors where some lanes hold such words. Not changed.
 
-### Thread QoS
+### Thread priority and yields (why the game slowed down on a busy Mac)
 
-A thread made with a bare `pthread_create` runs at the default QoS class:
-behind anything interactive on the machine, and as eligible for the
-efficiency cores as for the performance ones. On Apple the runtime's
-`pthread_create` is redirected (`host_time.h`,
-`darwin_precise_sleep.c`: `ps3_pthread_create`) to start every thread at
-user-interactive; the prewarm thread lowers itself to utility.
-`PS3_THREAD_QOS=default` keeps the system's choice. Back to back on the M1 Max
-while it was busy with other work (load average ~25): 60 fps mode 12.7 fps
-with it, 3.5 fps without.
+Two things made the game collapse whenever other processes wanted the CPU
+(the intro at 5 fps with twelve busy processes beside it, races swinging
+between 14 and 41 fps with the machine's own load):
+
+- **Priority.** A thread made with a bare `pthread_create` runs at the
+  default priority, 31, like every other process. The QoS class does not help
+  here: for a process that is not the foreground application (started from a
+  terminal, or offscreen) a user-interactive thread still shows 31 in
+  `ps -M`. An explicit `pthread_setschedparam` is honoured. On Apple the
+  runtime's `pthread_create` is redirected (`host_time.h`,
+  `darwin_precise_sleep.c`: `ps3_pthread_create`) and every thread starts at
+  user-interactive and priority 45 (of the 15..47 a user thread may ask for);
+  the prewarm thread lowers itself to 20. `PS3_THREAD_QOS=default` keeps the
+  system's choice.
+- **Yields.** Darwin's `sched_yield` is `swtch_pri`: it drops the caller to
+  the bottom priority until it next runs, so each of the runtime's many short
+  yield loops handed a 10 ms time slice to any other process. It is
+  redirected to `ps3_sched_yield`: `swtch()`, which only switches to a thread
+  of the same or a higher priority, then a few pause instructions.
+
+With both, the intro holds 30 fps beside the same twelve busy processes, and
+race rounds repeat within a few fps at a load average of 20.
+
+### The job wait (60 fps mode ~40 -> ~53 fps)
+
+After the above the frame was the main thread's wait for its job batches
+(33% of it in `sys_timer_usleep`) while the six SPURS lanes sat parked 64% of
+the time: latency, not work. Two changes, both macOS defaults:
+
+- `PS3_USLEEP_CAP` also caps main's own back-off (250 us at lr 0x0094CCA8) at
+  60 us (`work/port/main.cpp`). On Linux a shorter poll there measured as a
+  loss; with sleeps that end on time it is a gain: ~40 -> ~45 fps.
+- `SPURS_PM_SPIN_US=80` (`cellSpurs.c`, `spurs_pm_worker`): a lane that has
+  just run looks for its next run for 80 us before it parks on its condition
+  variable. ~48 -> ~53 fps (p50 19.7 -> 18.1 ms), same poll settings.
 
 ### Measuring on macOS
 
@@ -524,16 +565,16 @@ commits, passes, copies and draws. A race frame is ~5-7 ms of GPU time on the
 M1 Max at 720p, in one command buffer with no waits: the GPU is not the limit.
 
 The numbers in this section were taken on a machine that was also running a
-virtual machine, a backup and other work (load average 10-40 on 10 cores), and
-they moved with that load far more than with any change here: rounds of the
-same build ranged from 14 to 41 fps in 60 fps mode. Take them as the order of
-things; a quiet-machine benchmark is still to be done.
+virtual machine, a backup and other work (load average 10-40 on 10 cores).
+Until the priority and yield fixes below they moved with that load far more
+than with any change (14 to 41 fps for one build in 60 fps mode); the later
+ones (the job wait) repeat within a few fps.
 
 ### Open on macOS
 
-- 60 fps mode does not hold 60 on the M1 Max. With the RSX thread idle 40% of
-  a frame and the GPU at 5-7 ms, the frame is the main thread's: ~49% running,
-  ~42% in `sys_timer_usleep` waiting for JobBatchHandler and the SPU jobs.
+- 60 fps mode does not quite hold 60 on the M1 Max (~53 fps in the pack).
+  The RSX thread is now the busiest (two thirds of a frame: per-draw engine
+  work and encoding ~3800 draws), then the main thread.
   The Linux-only `PS3_USLEEP_WAKE` / `PS3_USLEEP_PASSWAKE` (futex) variants
   have no macOS form yet (`__ulock_wait` / `os_sync_wait_on_address` would do).
 - Timed condition waits (`pthread_cond_timedwait` behind `WaitForSingleObject`

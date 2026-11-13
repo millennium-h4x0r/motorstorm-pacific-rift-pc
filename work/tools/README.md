@@ -1,6 +1,8 @@
 # work/tools
 
-Helpers for lifting, testing and profiling the port. Paths are relative to the
+Helpers for lifting, testing and profiling the port, on Linux and macOS unless
+a row says otherwise (the scripts need bash, python3 and, for the frame
+checks, `ffmpeg`; on macOS `brew install ffmpeg`). Paths are relative to the
 repository root; every script finds the root itself. Most test scripts drive
 an offscreen instance started with `INST=<name> work/run.sh` (see the
 *Parallel test instances* section of [docs/NOTES.md](../../docs/NOTES.md)) and

@@ -54,7 +54,7 @@ shaders translated to Vulkan on Linux and to Metal on macOS.
 | Pad (SDL2 game controller) | ✅ |
 | Saves, other modes and tracks | 🔧 not checked end to end |
 | Online play | ❌ not planned (the servers are gone) |
-| macOS (Apple Silicon, Metal) | ✅ everything above; 30 fps holds, 60 fps mode does not reach 60 on an M1 Max (see below) |
+| macOS (Apple Silicon, Metal) | ✅ everything above; 30 fps holds, 60 fps mode runs at about 50 on an M1 Max (see below) |
 | Windows | ❌ not built or tested |
 
 Measured on a Ryzen 9 5950X with an RTX 3090 on Linux. **Known issue:** in 60
@@ -63,12 +63,12 @@ the game's SPU physics jobs fill every job lane (see
 [docs/NOTES.md](docs/NOTES.md), *Performance*).
 
 On macOS the port was brought up on an M1 Max (macOS 27). 30 fps mode holds
-30 in races at 720p (frame interval p50 33.3 ms, p90 36 ms). 60 fps mode ran
-at about 40 fps in the pack (p50 21.5 ms); that figure is from before the last
-round of arm64 work (NEON forms of the SPU conversion instructions, interactive
-thread QoS) and from a machine busy with other work, so it is a lower bound,
-not a careful benchmark. GPU time is 5-7 ms a frame at 720p: the limit is on
-the CPU side ([docs/NOTES.md](docs/NOTES.md), *macOS / Metal*).
+30 in races at 720p (29.9 fps over a 10 s race window, frame interval p50
+33.4 ms). 60 fps mode runs at about 50 fps there (54 in the pack, p50
+17.9 ms): close to, but not yet, a steady 60. Both were measured while the
+machine was busy with other work, which the game's threads now outrank. GPU
+time is 5-7 ms a frame at 720p: the limit is on the CPU side
+([docs/NOTES.md](docs/NOTES.md), *macOS / Metal*).
 
 Technical notes: [docs/NOTES.md](docs/NOTES.md).
 
@@ -124,6 +124,16 @@ Technical notes: [docs/NOTES.md](docs/NOTES.md).
 
 ## Setup
 
+The steps are the same on Linux and macOS; where they differ it is said in
+the step. On a Mac, in short, once the game files are in `disc/` and the
+firmware's `dev_flash` is in `./dev_flash` (or installed in RPCS3):
+
+```sh
+brew install cmake ninja sdl2 glslang spirv-cross
+scripts/setup.sh && scripts/lift.sh && scripts/build.sh
+work/run.sh
+```
+
 ### 1. Get the code
 
 ```sh
@@ -145,7 +155,10 @@ disc/PS3_GAME/USRDIR/     the dump's USRDIR files, plus:
 
 [docs/REQUIRED_FILES.md](docs/REQUIRED_FILES.md) has the exact commands
 (symlinks for everything, a copy of `EBOOT.elf`, and the `cat` that joins
-`ms2.psarc`) and the expected checksum.
+`ms2.psarc`), the expected checksum, and where the firmware's `dev_flash` is
+looked for on each system. RPCS3 runs on macOS too, so the executable can be
+decrypted and the firmware installed there; files prepared on another machine
+can simply be copied over.
 
 ### 3. Get and patch the toolkit
 
@@ -269,6 +282,16 @@ each one on to the Metal backend's own switch, so the table holds for both.
 | `PS3RECOMP_SPIRV_CACHE=<dir>` or `0` | Translated-shader cache (default `user/shader_cache`) or none; on macOS it also holds the translated Metal shaders and the pipeline list the next start prewarms |
 | `PS3RECOMP_FLIPLOG=<file>` | Log a timestamp per presented frame (`work/tools/fliplog.py` reads it) |
 
+macOS only:
+
+| Variable | Effect |
+|---|---|
+| `PS3_THREAD_QOS=default` | Leave the game's threads at the system's default priority (default: user-interactive at priority 45, so other work on the Mac does not slow the game) |
+| `SPURS_PM_SPIN_US=<us>` | How long an SPU job lane looks for its next job before it sleeps (default 80; 0 = sleep at once, less CPU, lower frame rate in 60 fps mode) |
+| `PS3RECOMP_METAL_PREWARM=0` | Do not rebuild the previous runs' render pipelines in the background at start (default: on, from `user/shader_cache/pipelines.bin`; the first run of a track still compiles as it goes) |
+| `PS3RECOMP_METAL_STATS=1` | Log GPU time, passes and draws per frame every 120 frames |
+| `PS3RECOMP_UI_SHOT=<file.ppm>` | Write the window's frame, menu and HUD included, once (`PS3RECOMP_UI_SHOT_AFTER=<frames>`, default 120) |
+
 The port also changes some toolkit defaults for speed (`work/port/main.cpp`).
 Two of them deviate from the PS3 and are the first thing to turn off when
 something looks wrong: `SPURS_HOST_SPUS=5 SPURS_MAXCONT_MIN=1` restores
@@ -290,6 +313,10 @@ Everything else (the dump, the lift, builds, logs, saves, the toolkit
 checkout) is ignored: `.gitignore` is an allowlist.
 
 ## Contributing
+
+Both systems build from the same tree: a change to shared code (the port's
+sources, the toolkit patch's runtime and draw engine) should be built on Linux
+and on macOS, or say in the commit which one it was not built on.
 
 Run `scripts/install-hooks.sh` once. It installs pre-commit and pre-push hooks
 that run `scripts/check_clean.sh`, which refuses game file types, lifted code,
